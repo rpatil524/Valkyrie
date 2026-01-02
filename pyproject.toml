@@ -12,7 +12,11 @@ dependencies = [
   "pytest>=9.0.1",
   "pytest-asyncio>=1.3.0",
   "daytona>=0.123.0",
+  "click>=8.1.0",
 ]
+
+[project.scripts]
+harness = "cli.main:cli"
 
 [dependency-groups]
 dev = [
@@ -22,7 +26,6 @@ dev = [
   "basedpyright",
   "pypdf2"
 ]
-
 
 submodules = [
   "ioi-agent",
@@ -47,8 +50,6 @@ reportAny = false
 reportMissingTypeStubs = false
 enableTypeIgnoreComments = true
 
-include = ["src", "contracts"]
-
 exclude = [
   "submodules/**",
 ]
@@ -61,7 +62,7 @@ build-backend = "hatchling.build"
 allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/agentic_harness", "contracts", "datasets"]
+packages = ["src/agentic_harness", "contracts", "datasets", "cli"]
 
 [tool.pytest.ini_options]
 minversion = "8.0"

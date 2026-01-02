@@ -12,6 +12,7 @@ name = "agentic-harness"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "click" },
     { name = "daytona" },
     { name = "model-library" },
     { name = "pypandoc" },
@@ -35,6 +36,7 @@ submodules = [
 
 [package.metadata]
 requires-dist = [
+    { name = "click", specifier = ">=8.1.0" },
     { name = "daytona", specifier = ">=0.123.0" },
     { name = "model-library" },
     { name = "pypandoc" },
