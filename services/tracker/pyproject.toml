@@ -1,12 +1,14 @@
 [project]
 name = "tracker"
 version = "0.1.0"
-description = "Add your description here"
+description = "Tracking service for agentic harness"
 authors = [
     { name = "Omar Almatov", email = "52346350+oalmatov@users.noreply.github.com" }
 ]
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+    "fastapi[standard]>=0.127.1",
+]
 
 [build-system]
 requires = ["hatchling"]

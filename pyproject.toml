@@ -78,10 +78,3 @@ finance-agent = { path = "submodules/finance_agent" }
 # point these paths to your local repos
 model-libary = { path = "../platform/backend/model-library" }
 valsai = { path = "../platform/sdk" }
-
-[tool.uv.workspace]
-members = [
-    ".",
-    "services/tracker",
-    "cli",
-]

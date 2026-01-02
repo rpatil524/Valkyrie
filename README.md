@@ -9,6 +9,29 @@ python runner.py --config config/ioi.yaml
 **Setup:** `make install`
 **Style:** `make style`
 
+## Virtual Environment Setup
+
+This project uses separate virtual environments for different components:
+
+- **Root workspace** (`.venv`): Contains the main harness framework and shared dependencies
+  - Install with: `make install`
+  
+- **Services** (isolated venvs): Each service maintains its own virtual environment. You might have to switch your venv depending on the service you are working on.
+  - Tracker service: `make tracker-install` (creates `services/tracker/.venv`)
+  - SWE-bench service: `make swebench-install` (creates `services/benchmarks/swebench/.venv`)
+
+### Running Services
+
+```bash
+# Start tracker service (development mode)
+make tracker-dev
+
+# Start swebench service (development mode)
+make swebench-dev
+```
+
+Each service uses only the dependencies declared in its own `pyproject.toml`.
+
 ### Additional setup steps
 
 if you are developing locally and need to test changes to the sdk
