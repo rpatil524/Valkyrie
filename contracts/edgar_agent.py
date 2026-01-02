@@ -1,18 +1,20 @@
-from typing_extensions import override
-from src.base.contract import AgentContract
 from typing import Any, cast
+
 from model_library.base import QueryResult, QueryResultMetadata
 from model_library.registry_utils import get_registry_model
-from src.base.types import AgentConfig, Task
+from typing_extensions import override
+
+from agentic_harness.base.contract import AgentContract
+from agentic_harness.base.types import AgentConfig, Task
+from agentic_harness.utils import setup_environment
+from submodules.finance_agent.agent import Agent as EdgarAgent
 from submodules.finance_agent.tools import (
-    GoogleWebSearch,
-    RetrieveInformation,
-    ParseHtmlPage,
     EDGARSearch,
+    GoogleWebSearch,
+    ParseHtmlPage,
+    RetrieveInformation,
     Tool,
 )
-from submodules.finance_agent.agent import Agent as EdgarAgent
-from src.utils import setup_environment
 
 setup_environment()
 
@@ -29,7 +31,7 @@ class EdgarAgentContract(AgentContract):
         if self._config.model is None:
             raise ValueError("`model` is required")
 
-        if max_turns := self._config.extra.get("max_turns", None):
+        if max_turns := self._config.kwargs.get("max_turns", None):
             self._max_turns = max_turns
 
         return self._config

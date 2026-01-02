@@ -1,7 +1,8 @@
 from abc import ABC, abstractmethod
 
 from model_library.base import QueryResult
-from src.base.types import Task, AgentConfig
+
+from agentic_harness.base.types import AgentConfig, Task
 
 
 class AgentContract(ABC):
@@ -19,6 +20,23 @@ class AgentContract(ABC):
     @property
     def config(self) -> AgentConfig:
         return self._config
+
+    @property
+    def environment_variables(self) -> dict[str, str]:
+        """
+        Override this method to inject additional environment variables into the sandbox that allow the agent to function
+
+
+        Example:
+        ```python
+        import os
+
+        return {
+            "ANTHROPIC_API_KEY": os.getenv("ANTHROPIC_API_KEY"),
+        }
+        ```
+        """
+        return {}
 
     @abstractmethod
     async def run(self, task: Task) -> QueryResult:

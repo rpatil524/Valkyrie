@@ -8,8 +8,27 @@ python runner.py --config config/ioi.yaml
 
 **Setup:** `make install`
 **Style:** `make style`
+**Type Check:** `make typecheck`
 
-### Additional setup steps
+## Virtual Environment Setup
+
+This project uses separate virtual environments for different components:
+
+- **Root workspace** (`.venv`): Contains the main harness framework and shared dependencies
+  - Install with: `make install`
+  
+- **Services** (isolated venvs): Each service maintains its own virtual environment. You might have to switch your venv depending on the service you are working on.
+  - Tracker service: `make tracker-install` (creates `services/tracker/.venv`)
+  - SWE-bench service: `make swebench-install` (creates `services/benchmarks/swebench/.venv`)
+
+### Running Tracker Service Locally
+
+```bash
+# Start tracker service (development mode)
+make tracker-dev
+```
+
+### Additional Setup Steps
 
 if you are developing locally and need to test changes to the sdk
 
@@ -37,17 +56,4 @@ We are using the privated model-proxy now in case we need to make changes while 
 override-dependencies = [
   "model-library @ git+https://github.com/vals-ai/model-proxy.git@dev",
 ]
-```
-
-Update the required python package version at the top
-
-```
-requires-python = ">=3.13"
-```
-
-After that you will need to reinstall the dependencies
-
-```
-# Use this command below to reinstall packages
-uv sync --reinstall-package package name, ex. model-library
 ```

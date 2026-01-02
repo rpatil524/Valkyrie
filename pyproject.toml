@@ -12,7 +12,12 @@ dependencies = [
   "pytest>=9.0.1",
   "pytest-asyncio>=1.3.0",
   "daytona>=0.123.0",
+  "click>=8.1.0",
+  "wonderwords>=3.0.1",
 ]
+
+[project.scripts]
+harness = "agentic_harness.cli.main:cli"
 
 [dependency-groups]
 dev = [
@@ -23,7 +28,6 @@ dev = [
   "pypdf2"
 ]
 
-
 submodules = [
   "ioi-agent",
   "finance-agent",
@@ -32,6 +36,7 @@ submodules = [
 [tool.ruff]
 line-length = 120
 target-version = "py311"
+extend-exclude = ["submodules", "services/benchmarks/swebench"]
 
 [tool.ruff.format]
 quote-style = "double"
@@ -45,12 +50,12 @@ reportExplicitAny = false
 reportAny = false
 reportMissingTypeStubs = false
 enableTypeIgnoreComments = true
-reportImplicitRelativeImport = true
 
 include = ["src", "contracts"]
 
 exclude = [
   "submodules/**",
+  "services/benchmarks/swebench",
 ]
 
 [build-system]
@@ -61,7 +66,7 @@ build-backend = "hatchling.build"
 allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
-packages = ["src"]
+packages = ["src/agentic_harness", "contracts"]
 
 [tool.pytest.ini_options]
 minversion = "8.0"
@@ -70,6 +75,9 @@ testpaths = ["tests"]
 # Async test configuration
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "session"
+filterwarnings = [
+    "ignore::DeprecationWarning"
+]
 
 
 [tool.uv.sources]
