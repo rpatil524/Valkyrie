@@ -8,6 +8,7 @@ python runner.py --config config/ioi.yaml
 
 **Setup:** `make install`
 **Style:** `make style`
+**Type Check:** `make typecheck`
 
 ## Virtual Environment Setup
 
@@ -20,19 +21,14 @@ This project uses separate virtual environments for different components:
   - Tracker service: `make tracker-install` (creates `services/tracker/.venv`)
   - SWE-bench service: `make swebench-install` (creates `services/benchmarks/swebench/.venv`)
 
-### Running Services
+### Running Tracker Service Locally
 
 ```bash
 # Start tracker service (development mode)
 make tracker-dev
-
-# Start swebench service (development mode)
-make swebench-dev
 ```
 
-Each service uses only the dependencies declared in its own `pyproject.toml`.
-
-### Additional setup steps
+### Additional Setup Steps
 
 if you are developing locally and need to test changes to the sdk
 
@@ -60,17 +56,4 @@ We are using the privated model-proxy now in case we need to make changes while 
 override-dependencies = [
   "model-library @ git+https://github.com/vals-ai/model-proxy.git@dev",
 ]
-```
-
-Update the required python package version at the top
-
-```
-requires-python = ">=3.13"
-```
-
-After that you will need to reinstall the dependencies
-
-```
-# Use this command below to reinstall packages
-uv sync --reinstall-package package name, ex. model-library
 ```

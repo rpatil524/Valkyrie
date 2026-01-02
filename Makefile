@@ -7,7 +7,6 @@ PYTHON_VERSION := 3.11
 SWEBENCH_PYTHON_VERSION := 3.12
 
 TRACKER_PORT ?= 8000
-SWEBENCH_PORT ?= 8001
 
 help:
 	@echo "Makefile for agentic-harness"
@@ -25,7 +24,6 @@ help:
 	@echo ""
 	@echo "Services (development mode):"
 	@echo "  make tracker-dev         Start tracker service on port $(TRACKER_PORT)"
-	@echo "  make swebench-dev        Start swebench service on port $(SWEBENCH_PORT)"
 
 install:
 	uv venv --python $(PYTHON_VERSION)
@@ -78,7 +76,3 @@ swebench-install:
 	@cd services/benchmarks/swebench && uv venv --python $(SWEBENCH_PYTHON_VERSION)
 	@cd services/benchmarks/swebench && uv sync
 	@echo "✓ SWE-bench service installed at services/benchmarks/swebench/.venv"
-
-swebench-dev:
-	@echo "Starting swebench service (development mode on port $(SWEBENCH_PORT))..."
-	@cd services/benchmarks/swebench && uv run fastapi dev main.py --port $(SWEBENCH_PORT)
