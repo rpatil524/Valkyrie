@@ -25,7 +25,6 @@ dev = [
   "pytest-asyncio",
   "ruff",
   "basedpyright",
-  "pypdf2"
 ]
 
 submodules = [
@@ -85,4 +84,4 @@ ioi-agent = { path = "submodules/ioi_agent" }
 finance-agent = { path = "submodules/finance_agent" }
 # point these paths to your local repos
 model-libary = { path = "../platform/backend/model-library" }
-valsai = { path = "../platform/sdk" }
+valsai = { path = "/Users/jarettforzano/Documents/Vals/platform-be/sdk" }
