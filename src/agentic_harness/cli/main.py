@@ -1,6 +1,10 @@
+"""CLI views/commands for the agentic harness."""
+
 from pathlib import Path
 
 import click
+
+from agentic_harness.cli.utils import upload_to_tracker
 
 
 @click.group()
@@ -42,6 +46,9 @@ def run(
     click.echo(f"Running benchmark: {benchmark}")
     click.echo(f"Agent: {agent}")
     click.echo(f"Contract: {contract}")
+    click.echo()
+
+    upload_to_tracker(agent, contract)
 
     # TODO: Implement actual benchmark execution
     click.echo("\n[TODO] Execute benchmark with agent and contract")
