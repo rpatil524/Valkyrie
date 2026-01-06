@@ -14,6 +14,7 @@ source = { editable = "." }
 dependencies = [
     { name = "click" },
     { name = "daytona" },
+    { name = "httpx" },
     { name = "model-library" },
     { name = "pypandoc" },
     { name = "pytest" },
@@ -38,6 +39,7 @@ submodules = [
 requires-dist = [
     { name = "click", specifier = ">=8.1.0" },
     { name = "daytona", specifier = ">=0.123.0" },
+    { name = "httpx", specifier = ">=0.28.1" },
     { name = "model-library" },
     { name = "pypandoc" },
     { name = "pytest", specifier = ">=9.0.1" },
