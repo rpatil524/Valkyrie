@@ -11,6 +11,7 @@ dependencies = [
     "daytona>=0.128.1",
     "fastapi[standard]>=0.127.1",
     "requests>=2.32.5",
+    "sqlmodel>=0.0.31",
 ]
 
 [dependency-groups]
@@ -26,6 +27,8 @@ build-backend = "hatchling.build"
 [tool.basedpyright]
 reportMissingTypeStubs=false
 reportUnknownMemberType=false
+reportExplicitAny=false
+reportAny=false
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
