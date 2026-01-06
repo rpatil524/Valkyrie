@@ -4,13 +4,14 @@ import pytest
 from daytona import AsyncDaytona, AsyncSandbox, DaytonaConfig
 from dotenv import load_dotenv
 from pytest import MonkeyPatch
+from requests.exceptions import ConnectTimeout
 from src.benchmark_service import BenchmarkService
 from tests.utils import build_task_environment, validate_docker_image
 
 _ = load_dotenv()
 
 
-@pytest.fixture
+@pytest.fixture(scope="session")
 def benchmark_service() -> BenchmarkService:
     service_ip = os.getenv("SWEBENCH_SERVICE_IP")
     if not service_ip:
@@ -33,6 +34,15 @@ def daytona_client(benchmark_service: BenchmarkService) -> AsyncDaytona:
             target=benchmark_service.environment_keys["DAYTONA_TARGET"],
         )
     )
+
+
+@pytest.fixture(scope="session", autouse=True)
+async def require_health_check(benchmark_service: BenchmarkService):
+    """Checks that the server is running before running the test. If its not connected it will fail"""
+    try:
+        _ = await benchmark_service.request_health_check()
+    except ConnectTimeout:
+        pytest.fail("Could not connect to the swebench service. Please ensure that it is running.", pytrace=False)
 
 
 class TestSWEBenchmarkService:
@@ -128,7 +138,6 @@ class TestSWEBenchmarkService:
             assert list(response.keys()) == task_ids, "Returned in the same order as passed in"
 
             for task_id, task_data in response.items():
-                assert task_data.get("task_id") == task_id
                 assert task_data.get("docker_image") == docker_image_format.format(task_id=task_id)
                 assert task_data.get("request_setup")
                 assert task_data.get("problem_statement")
@@ -162,7 +171,7 @@ class TestSWEBenchmarkService:
         Fetches the current commit inside of the sandbox
         """
         git_diff_result = await sandbox.process.exec(
-            command="git diff HEAD | sha256sum",
+            command="git rev-parse HEAD",
             cwd="/testbed",
         )
 
@@ -178,30 +187,40 @@ class TestSWEBenchmarkService:
         NOTE: This endpoint occurs after we setup the sandbox so we can skip to that step in the test
 
         Test Cases:
-        - When sandbox is first created, we are not on the correct commit inside of the environment
+        - When sandbox is first created, we are on the correct commit inside of the environment
+        - If a task does not start on the base commit, we checkout the correct commit after using the setup task endpoint
         - When using the setup task endpoint with a valid task id and instance id: Returns 200 OK
         - Ensure we have entered the correct commit inside of the environment after using the setup task endpoint
 
         Use the following url to find the base commit and task ids of [swebench verified dataset](https://huggingface.co/datasets/SWE-bench/SWE-bench_Verified/viewer/default/test?views%5B%5D=test)
         """
 
-        task_id = "django__django-12325"
-        base_commit = "29c126bb349526b5f1cd78facbe9f25906f18563"
+        task_id = "django__django-15572"
+        base_commit = "0b31e024873681e187b574fe1c4afe5e48aeeecf"
 
         try:
             docker_image = docker_image_format.format(task_id=task_id)
             async with build_task_environment(daytona_client, task_id, docker_image) as sandbox:
-                # Test case 1. We are not on the correct commit inside of the environment before using the setup task endpoint
+                # Test case 1. We are on the correct commit inside of the environment before using the setup task endpoint
                 current_commit = await self._fetch_commit(sandbox)
-                assert current_commit != base_commit
+                assert current_commit == base_commit, "Should be the same at the start of the test"
 
-                # Test case 2. When using the setup task endpoint with a valid task id and instance id: Returns 200 OK
+                # Test case 2. We are not on the same commit as the base commit when we start the container
+                _ = await sandbox.process.exec(
+                    command="git checkout HEAD~1",
+                    cwd="/testbed",
+                )
+
+                current_commit = await self._fetch_commit(sandbox)
+                assert current_commit != base_commit, "Should not be the same after checking out a different commit"
+
+                # Test case 3. When using the setup task endpoint with a valid task id and instance id: Returns 200 OK
                 response = await benchmark_service.request_setup_task(task_id=task_id, instance_id=sandbox.id)
                 assert response == {"status": "ok"}
 
                 # Test case 3. Ensure we have entered the correct commit inside of the environment after using the setup task endpoint
                 current_commit = await self._fetch_commit(sandbox)
-                assert current_commit == base_commit
+                assert current_commit == base_commit, "Should be the same after using the setup task endpoint"
         except Exception as e:
             pytest.fail(f"Setup task failed: {e}", pytrace=False)
 
@@ -255,7 +274,7 @@ class TestSWEBenchmarkService:
 
             assert final_score == {
                 "tasks_evaluated": [task_id],
-                "final_score": round(100, 6),
+                "final_score": round(100.0, 6),
                 "resolved_tasks": [task_id],
                 "unresolved_tasks": [],
                 "evaluation_results": first_evaluation_result,

@@ -1,6 +1,6 @@
 import logging
 import os
-from typing import Any
+from typing import Any, cast
 
 import requests
 
@@ -89,7 +89,7 @@ class BenchmarkService:
         if response.status_code != 200:
             raise Exception(f"Retrieve tasks failed with status code {response.status_code}, response: {response.text}")
 
-        return response.json()
+        return cast(dict[str, dict[str, str]], response.json())
 
     async def request_setup_task(self, task_id: str, instance_id: str) -> dict[str, str]:
         """
@@ -112,7 +112,7 @@ class BenchmarkService:
         if response.status_code != 200:
             raise Exception(f"Setup task failed with status code {response.status_code}, response: {response.text}")
 
-        return response.json()
+        return cast(dict[str, str], response.json())
 
     async def request_evaluate_instance(self, task_id: str, instance_id: str) -> dict[str, str]:
         """
@@ -137,7 +137,7 @@ class BenchmarkService:
                 f"Evaluate instance failed with status code {response.status_code}, response: {response.text}"
             )
 
-        return response.json()
+        return cast(dict[str, str], response.json())
 
     async def request_final_score(self, evaluation_results: dict[str, dict[str, Any]]) -> dict[str, Any]:
         """
@@ -154,4 +154,4 @@ class BenchmarkService:
         if response.status_code != 200:
             raise Exception(f"Final score failed with status code {response.status_code}, response: {response.text}")
 
-        return response.json()
+        return cast(dict[str, Any], response.json())
