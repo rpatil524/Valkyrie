@@ -1,10 +1,10 @@
+import logging
 import os
+from typing import Any
 
 import requests
 
-from agentic_harness.logger import get_logger
-
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 
 class BenchmarkService:
@@ -16,6 +16,10 @@ class BenchmarkService:
         self._name = name
         self._url = url
         self._environment_keys = self.daytona_keys()
+
+    @property
+    def environment_keys(self) -> dict[str, str]:
+        return self._environment_keys
 
     @staticmethod
     def daytona_keys() -> dict[str, str]:
@@ -50,13 +54,16 @@ class BenchmarkService:
 
         return response.json()
 
-    async def request_verify_task_ids(self, task_ids: list[str]) -> dict[str, list[str]]:
+    async def request_verify_task_ids(self, task_ids: list[str] | None) -> dict[str, list[str]]:
         """
         Requests verify task ids from benchmark service
         """
 
-        query_params = "&".join([f"task_ids={task_id}" for task_id in task_ids])
-        response = requests.get(f"{self._url}/verify-task-ids?{query_params}")
+        params: dict[str, list[str]] = {}
+        if task_ids is not None:
+            params["task_ids"] = task_ids
+
+        response = requests.get(f"{self._url}/verify-task-ids", params=params)
 
         logger.info(f"Verify task ids response: {response.json()}")
 
@@ -132,7 +139,7 @@ class BenchmarkService:
 
         return response.json()
 
-    async def request_final_score(self, evaluation_results: dict[str, dict[str, str]]) -> dict[str, str]:
+    async def request_final_score(self, evaluation_results: dict[str, dict[str, Any]]) -> dict[str, Any]:
         """
         Requests final score from benchmark service
         """
