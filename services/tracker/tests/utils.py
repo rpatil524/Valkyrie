@@ -2,7 +2,7 @@ import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
-from daytona import AsyncDaytona, AsyncSandbox, CreateSandboxFromImageParams, Image, Resources
+from daytona import AsyncDaytona, AsyncSandbox, CreateSandboxFromImageParams, DaytonaNotFoundError, Image, Resources
 
 
 async def validate_docker_image(image_name: str) -> bool:
@@ -50,4 +50,12 @@ async def build_task_environment(
     try:
         yield sandbox
     finally:
-        await daytona.delete(sandbox)
+        try:
+            await daytona.delete(sandbox)
+        except Exception:
+            try:
+                sandbox = await daytona.get(task_id)
+
+                await daytona.delete(sandbox)
+            except DaytonaNotFoundError:
+                pass

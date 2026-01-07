@@ -1,9 +1,9 @@
 import logging
 import traceback
 import uuid
-from asyncio import create_subprocess_exec
-from itertools import batched
+from asyncio import Semaphore, create_subprocess_exec, gather
 from pathlib import Path
+from random import sample
 from typing import Any, cast
 from uuid import UUID
 
@@ -251,6 +251,7 @@ class TestDatabaseIntegration:
             - Create a benchmark row to initiate a benchmark
             - Apply concurrency to tasks and ensure that the tasks are correctly being added to the database
             - As evaluation results come in, ensure that we are correclty adding them to the database
+            - The metadata from the final evaluation can be fetched from the database
         """
 
         try:
@@ -271,9 +272,9 @@ class TestDatabaseIntegration:
             assert task_ids is not None
             assert len(task_ids) == 500
 
-            # NOTE: For testing we only are going to use the first 50 task ids
-            # Also to mimic limits we are going to apply a concurrency limit of 10
-            task_ids = task_ids[1:2]
+            # NOTE: For testing we only are going to random sample the dataset
+            # Also to mimic limits we are going to apply a concurrency limit
+            task_ids = sample(task_ids, 10)
 
             logger.info(f"Sample of task ids returned: {task_ids[:10]}")
 
@@ -285,30 +286,25 @@ class TestDatabaseIntegration:
 
             logger.info(f"Sample of task row mapping: {str(list(task_row_mapping.values())[:250])}")
 
-            concurrency = 10
-
-            # Batch the task ids into groups of the concurrency limit
-            task_id_batches = list(batched(task_ids, concurrency))
-
+            semaphore = Semaphore(5)
             evaluation_results: dict[str, dict[str, Any]] = {}
-            for task_id_batch in task_id_batches:
-                # Fetch the docker image info for all the tasks inside of the batch
-                task_information = await benchmark_service.request_retrieve_tasks(task_ids=list(task_id_batch))
 
-                for task_id, task_data in task_information.items():
+            task_information = await benchmark_service.request_retrieve_tasks(task_ids=task_ids)
+
+            async def process_task(task_id: str, task_data: dict[str, str]) -> None:
+                async with semaphore:
                     task_row = task_row_mapping[task_id]
-
                     evaluation_result = await self._evaluate_instance(
                         database_session, benchmark_service, daytona_client, task_row, task_data
                     )
-
-                    # Push evaluation to the database and update the task status to finished
                     evaluation_result_row = await self._create_evaluation_result(
                         database_session, task_row, evaluation_result
                     )
                     evaluation_results[task_id] = evaluation_result_row.result
 
-            logger.info(f"Sample of evaluation results: {str(list(evaluation_results.values())[:250])}")
+            _ = await gather(*[process_task(task_id, task_data) for task_id, task_data in task_information.items()])
+
+            logger.info(f"Sample of evaluation results: {str(list(evaluation_results.values())[:100])}")
 
             # When all tasks have been evaluated, we can make a request to get the final evaluation score
             response = await benchmark_service.request_final_score(evaluation_results=evaluation_results)
@@ -324,12 +320,17 @@ class TestDatabaseIntegration:
             results = fetched_evaluation_results.all()
             assert len(results) == len(list(evaluation_results.keys()))
 
-            logger.info(f"Sample of fetched evaluation results: {str(results[:250])}")
+            logger.info(f"Sample of fetched evaluation results: {str(results[:100])}")
 
-            for evaluation_result_row in results:
-                task_row = database_session.get(Task, evaluation_result_row.task_id)
+            for evaluation_result in results:
+                task_row = database_session.get(Task, evaluation_result.task_id)
                 assert task_row is not None
                 assert evaluation_results.get(task_row.task_id)
+
+            # Verify that the final evaluation row matches what we have in the database
+            assert evaluation_result_row.final_score == response["final_score"]
+            assert evaluation_result_row.resolved_tasks == response["resolved_tasks"]
+            assert evaluation_result_row.unresolved_tasks == response["unresolved_tasks"]
 
         except Exception as e:
             pytest.fail(f"End to end test failed: {e}", pytrace=False)
