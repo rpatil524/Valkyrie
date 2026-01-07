@@ -5,12 +5,13 @@ description = "Tracking service for agentic harness"
 authors = [
     { name = "Omar Almatov", email = "52346350+oalmatov@users.noreply.github.com" }
 ]
-requires-python = ">=3.11"
+requires-python = "==3.12.*"
 dependencies = [
     "boto3>=1.42.20",
     "daytona>=0.128.1",
     "fastapi[standard]>=0.127.1",
     "requests>=2.32.5",
+    "sqlmodel>=0.0.31",
 ]
 
 [dependency-groups]
@@ -26,8 +27,9 @@ build-backend = "hatchling.build"
 [tool.basedpyright]
 reportMissingTypeStubs=false
 reportUnknownMemberType=false
+reportExplicitAny=false
+reportAny=false
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
 asyncio_mode = "auto"
-
