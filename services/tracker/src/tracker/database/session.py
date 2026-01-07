@@ -1,12 +1,13 @@
+import os
 from collections.abc import Generator
 from typing import Any
 
 from sqlmodel import Session, SQLModel, create_engine
-from src.tracker.database.models import Benchmark, EvaluationResult, Task
+from tracker.database.models import Benchmark, EvaluationResult, Task
 
 _exposed_models: list[type[SQLModel]] = [Benchmark, EvaluationResult, Task]
 
-_DATABASE_LOCATION = "src/tracker/database/tracker.db"
+_DATABASE_LOCATION = os.getenv("TEST_DATABASE_LOCATION", "src/tracker/database/tracker.db")
 engine = create_engine(f"sqlite:///{_DATABASE_LOCATION}")
 
 

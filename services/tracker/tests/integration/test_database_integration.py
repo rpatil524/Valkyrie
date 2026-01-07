@@ -1,5 +1,39 @@
+import traceback
+import uuid
+from asyncio import create_subprocess_exec
+from pathlib import Path
+from typing import Any, cast
+from uuid import UUID
+
+import pytest
+from pytest import MonkeyPatch
+from sqlmodel import Session, col, create_engine, inspect, select
+from tracker.database.models import Benchmark, BenchmarkStatus, EvaluationResult, Task, TaskStatus
+
+
 class TestDatabaseIntegration:
-    def test_create_tables(self):
+    async def _create_task(self, database_session: Session, task_id: str, benchmark_id: UUID) -> Task:
+        task_row = Task(task_id=task_id, benchmark_id=benchmark_id)
+        database_session.add(task_row)
+
+        return task_row
+
+    async def _create_evaluation_result(
+        self, database_session: Session, task_row: Task, evaluation_result: dict[str, Any]
+    ) -> EvaluationResult:
+        instance_id = evaluation_result["instance_id"]
+        evaluation_result_row = EvaluationResult(
+            task_id=cast(UUID, task_row.id), instance_id=instance_id, result=evaluation_result
+        )
+        database_session.add(evaluation_result_row)
+
+        task_row.status = TaskStatus.FINISHED
+        database_session.add(task_row)
+        database_session.flush()
+
+        return evaluation_result_row
+
+    async def test_create_tables(self, monkeypatch: MonkeyPatch, tmp_path: Path):
         """
         Test that the session.py file creates the database and tables when ran
 
@@ -7,9 +41,77 @@ class TestDatabaseIntegration:
         - When the session.py file is ran, the tracker.db file is created where expected
         - More than one table is created in the tracker.db file
         """
-        ...
 
-    def test_database_integrity(self):
+        try:
+            database_location = tmp_path / "tracker.db"
+            monkeypatch.setattr("tracker.database.session._DATABASE_LOCATION", str(database_location))
+            monkeypatch.setenv("TEST_DATABASE_LOCATION", str(database_location))
+
+            result = await create_subprocess_exec(
+                "uv",
+                "run",
+                "python",
+                "-m",
+                "tracker.database.session",
+            )
+            stdout, stderr = await result.communicate()
+            return_code = result.returncode
+
+            if return_code != 0:
+                pytest.fail(
+                    f"Failed to create tables: {(stdout or b'').decode('utf-8')}: {(stderr or b'').decode('utf-8')}",
+                )
+
+            assert database_location.exists(), "Database file exists in location specified"
+
+            engine = create_engine(f"sqlite:///{database_location}")
+
+            inspector = inspect(engine)
+            tables = inspector.get_table_names()
+            assert len(tables) > 0, "Tables were not created in the database as expected"
+        except Exception as e:
+            pytest.fail(
+                f"Failed to create tables: {e}: {traceback.format_exc()}",
+            )
+
+    async def test_database_integrity(self, database_session: Session):
+        """
+        Test the integrity of the database
+
+        Test Cases:
+            - Benchmark table finished_at timestamp is automatically set when the status is updated to finished
+            - Task table finished_at timestamp is automatically set when the status is updated to finished
+        """
+
+        # Test the benchmark table
+        benchmark_row = Benchmark(name="SWEBench benchmark")
+        database_session.add(benchmark_row)
+
+        # When created its in pending status
+        assert benchmark_row.status == BenchmarkStatus.IN_PROGRESS
+        assert benchmark_row.finished_at is None
+
+        # When the status is updated to finished, the finished_at timestamp should be set
+        benchmark_row.status = BenchmarkStatus.FINISHED
+        database_session.add(benchmark_row)
+        database_session.flush()
+        assert benchmark_row.finished_at, "Should be auto generated when the status is updated to finished"
+
+        # Test the task table
+        task_row = Task(task_id="task_id_1", benchmark_id=cast(UUID, benchmark_row.id))
+        database_session.add(task_row)
+
+        # When created its in starting status
+        assert task_row.status == TaskStatus.STARTING
+        assert task_row.finished_at is None
+
+        # When the status is updated to finished, the finished_at timestamp should be set
+        task_row.status = TaskStatus.FINISHED
+        database_session.add(task_row)
+        database_session.flush()
+        assert task_row.finished_at, "Should be auto generated when the status is updated to finished"
+
+    async def test_database_relations(self, database_session: Session):
         """
         Test the relationships between the tables and ensure that they are correctly being built
 
@@ -18,7 +120,75 @@ class TestDatabaseIntegration:
             - Task table is created and a row can be pushed to the database
             - EvaluationResult table is created and a row can be pushed to the database
         """
-        ...
+
+        # Add a new benchmark row to the database
+        benchmark_name = "SWEBench benchmark"
+        benchmark_row = Benchmark(name=benchmark_name)
+        database_session.add(benchmark_row)
+
+        # Can fetch it using the same id that it was created with
+        fetched_benchmark_row = database_session.get(Benchmark, benchmark_row.id)
+
+        # Base test cases
+        assert fetched_benchmark_row
+        assert fetched_benchmark_row.name == benchmark_row.name
+        assert fetched_benchmark_row.started_at is not None
+        assert fetched_benchmark_row.finished_at is None
+        assert fetched_benchmark_row.status == BenchmarkStatus.IN_PROGRESS
+
+        task_ids = ["task_id_1", "task_id_2", "task_id_3"]
+        for task_id in task_ids:
+            _ = await self._create_task(database_session, task_id, cast(UUID, benchmark_row.id))
+
+        # Can fetch the tasks based off the benchmark id and that the tasks are created as expected
+        fetch_tasks_query = (
+            select(Task).where(Task.benchmark_id == benchmark_row.id).order_by(col(Task.started_at).asc())
+        )
+        fetched_tasks = database_session.exec(fetch_tasks_query).all()
+
+        # Base test cases
+        assert len(fetched_tasks) == len(task_ids)
+        for task_id, task_row in zip(task_ids, fetched_tasks):
+            assert task_row.task_id == task_id
+            assert task_row.benchmark_id == benchmark_row.id
+            assert task_row.status == TaskStatus.STARTING
+            assert task_row.started_at is not None
+            assert task_row.finished_at is None
+
+        # Can add an evaluation result to the task when it is finished
+        simulated_evaluation_results: dict[str, dict[str, Any]] = {
+            task_id: {
+                "task_id": task_id,
+                "instance_id": str(uuid.uuid4()),
+                "patch_successfully_applied": True,
+                "resolved": True,
+                "resolution_status": "FULL",
+            }
+            for task_id in task_ids
+        }
+
+        for task_id, evaluation_result in simulated_evaluation_results.items():
+            # Fetch the task row based off of the human readable task_id and the benchmark foreign key
+            task_row_query = (
+                select(Task).where(Task.task_id == task_id and Task.benchmark_id == benchmark_row.id).limit(1)
+            )
+            task_row = database_session.exec(task_row_query).first()
+
+            assert task_row is not None
+
+            # Create the evaluation result row
+            _ = await self._create_evaluation_result(database_session, task_row, evaluation_result)
+
+        # Once the evaluation is completed, we can check if the task rows have been updated with the finished_at timestamp and status
+        fetch_tasks_query = select(Task).where(Task.benchmark_id == benchmark_row.id)
+        fetched_tasks = database_session.exec(fetch_tasks_query).all()
+
+        assert len(fetched_tasks) == len(task_ids)
+        for task_row in fetched_tasks:
+            assert task_row.status == TaskStatus.FINISHED
+            assert task_row.finished_at, (
+                "Finished at timestamp should be auto generated when the task status has been updated"
+            )
 
     def test_end_to_end(self):
         """

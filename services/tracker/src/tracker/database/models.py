@@ -4,7 +4,10 @@ from typing import Any
 from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
 
-from sqlmodel import JSON, Column, Field, SQLModel
+from sqlalchemy import Connection, event
+from sqlalchemy.orm import Mapper
+from sqlmodel import JSON, CheckConstraint, Column, Field, SQLModel
+from tracker.database.utils import has_field_changed
 
 
 class BenchmarkStatus(str, Enum):
@@ -20,6 +23,13 @@ class TaskStatus(str, Enum):
 
 
 class Benchmark(SQLModel, table=True):
+    __table_args__: tuple[CheckConstraint, ...] = (
+        CheckConstraint(
+            "(status != 'FINISHED') OR (finished_at IS NOT NULL)",
+            name="benchmark_finished_requires_timestamp",
+        ),
+    )
+
     id: UUID | None = Field(default_factory=uuid4, primary_key=True)
     name: str
     started_at: datetime = Field(default_factory=lambda: datetime.now(ZoneInfo("UTC")))
@@ -27,13 +37,62 @@ class Benchmark(SQLModel, table=True):
     status: BenchmarkStatus = Field(default=BenchmarkStatus.IN_PROGRESS)
 
 
+@event.listens_for(Benchmark, "before_insert")
+@event.listens_for(Benchmark, "before_update")
+def set_finished_at_when_benchmark_finished(_mapper: Mapper[Benchmark], _connection: Connection, target: Benchmark):
+    """
+    Automatically set the finished_at timestamp when the benchmark is finished.
+
+    Prevents situations where the benchmark can be finished but we never set the finished_at timestamp.
+
+    Related Documentation:
+        - https://docs.sqlalchemy.org/en/20/orm/events.html#mapper-events
+        - https://docs.sqlalchemy.org/en/13/orm/session_api.html#sqlalchemy.orm.attributes.get_history
+    """
+
+    # Benchmark statuses we want the finished_at timestamp to be set when updated to
+    finished_states = [BenchmarkStatus.FINISHED]
+
+    # Check that the status has actually changed between the current and previous state
+    status_changed = has_field_changed(target, "status")
+
+    # If the status has changed and the new status is in a finished state, set the finished_at timestamp
+    if status_changed and target.status in finished_states:
+        target.finished_at = datetime.now(ZoneInfo("UTC"))
+
+
 class Task(SQLModel, table=True):
+    __table_args__: tuple[CheckConstraint, ...] = (
+        CheckConstraint(
+            "(status != 'FINISHED') OR (finished_at IS NOT NULL)",
+            name="task_finished_requires_timestamp",
+        ),
+    )
+
     id: UUID | None = Field(default_factory=uuid4, primary_key=True)
-    task_id: UUID = Field(unique=True)
+    task_id: str = Field(unique=True)
     status: TaskStatus = Field(default=TaskStatus.STARTING)
     started_at: datetime = Field(default_factory=lambda: datetime.now(ZoneInfo("UTC")))
     finished_at: datetime | None = None
     benchmark_id: UUID = Field(foreign_key="benchmark.id")
+
+
+@event.listens_for(Task, "before_insert")
+@event.listens_for(Task, "before_update")
+def set_finished_at_when_task_finished(_mapper: Mapper[Task], _connection: Connection, target: Task):
+    """
+    Serves the same purpose as @set_finished_at_when_benchmark_finished, but for the task model.
+    """
+
+    # Task statuses we want the finished_at timestamp to be set when updated to
+    finished_states = [TaskStatus.FINISHED]
+
+    # Check that the status has actually changed between the current and previous state
+    status_changed = has_field_changed(target, "status")
+
+    # If the status has changed and the new status is in a finished state, set the finished_at timestamp
+    if status_changed and target.status in finished_states:
+        target.finished_at = datetime.now(ZoneInfo("UTC"))
 
 
 class EvaluationResult(SQLModel, table=True):
