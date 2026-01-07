@@ -4,9 +4,9 @@ from typing import Any
 from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import Connection, event
+from sqlalchemy import Connection, ScalarResult, event
 from sqlalchemy.orm import Mapper
-from sqlmodel import JSON, CheckConstraint, Column, Field, SQLModel
+from sqlmodel import JSON, CheckConstraint, Column, Field, Session, SQLModel, col, select
 from tracker.database.utils import has_field_changed
 
 
@@ -20,6 +20,23 @@ class TaskStatus(str, Enum):
     IN_PROGRESS = "in_progress"
     EVALUATING = "evaluating"
     FINISHED = "finished"
+
+
+class FinalEvaluation(SQLModel, table=True):
+    id: UUID | None = Field(default_factory=uuid4, primary_key=True)
+    benchmark_id: UUID = Field(foreign_key="benchmark.id")
+    final_score: float = Field(nullable=False)
+    resolved_tasks: list[str] = Field(default_factory=list, sa_column=Column(JSON, nullable=False))
+    unresolved_tasks: list[str] = Field(default_factory=list, sa_column=Column(JSON, nullable=False))
+
+    def fetch_evaluation_results(self, session: Session) -> ScalarResult["EvaluationResult"]:
+        """Select all evaluation results for a given benchmark"""
+        statement = (
+            select(EvaluationResult)
+            .join(Task, col(EvaluationResult.task_id) == col(Task.id))
+            .where(col(Task.benchmark_id) == self.benchmark_id)
+        )
+        return session.exec(statement)
 
 
 class Benchmark(SQLModel, table=True):

@@ -1,20 +1,28 @@
+import logging
 import traceback
 import uuid
 from asyncio import create_subprocess_exec
+from itertools import batched
 from pathlib import Path
 from typing import Any, cast
 from uuid import UUID
 
 import pytest
+from benchmark_service import BenchmarkService
+from daytona import AsyncDaytona
 from pytest import MonkeyPatch
 from sqlmodel import Session, col, create_engine, inspect, select
-from tracker.database.models import Benchmark, BenchmarkStatus, EvaluationResult, Task, TaskStatus
+from tests.utils import build_task_environment
+from tracker.database.models import Benchmark, BenchmarkStatus, EvaluationResult, FinalEvaluation, Task, TaskStatus
+
+logger = logging.getLogger(__name__)
 
 
 class TestDatabaseIntegration:
     async def _create_task(self, database_session: Session, task_id: str, benchmark_id: UUID) -> Task:
         task_row = Task(task_id=task_id, benchmark_id=benchmark_id)
         database_session.add(task_row)
+        database_session.flush()
 
         return task_row
 
@@ -32,6 +40,20 @@ class TestDatabaseIntegration:
         database_session.flush()
 
         return evaluation_result_row
+
+    async def _create_final_evaluation(
+        self, database_session: Session, benchmark_row: Benchmark, final_score_result: dict[str, Any]
+    ) -> FinalEvaluation:
+        final_evaluation_row = FinalEvaluation(
+            benchmark_id=cast(UUID, benchmark_row.id),
+            final_score=final_score_result["final_score"],
+            resolved_tasks=final_score_result["resolved_tasks"],
+            unresolved_tasks=final_score_result["unresolved_tasks"],
+        )
+        database_session.add(final_evaluation_row)
+        database_session.flush()
+
+        return final_evaluation_row
 
     async def test_create_tables(self, monkeypatch: MonkeyPatch, tmp_path: Path):
         """
@@ -190,7 +212,38 @@ class TestDatabaseIntegration:
                 "Finished at timestamp should be auto generated when the task status has been updated"
             )
 
-    def test_end_to_end(self):
+    async def _evaluate_instance(
+        self,
+        database_session: Session,
+        benchmark_service: BenchmarkService,
+        daytona_client: AsyncDaytona,
+        task_row: Task,
+        task_data: dict[str, str],
+    ) -> dict[str, str]:
+        docker_image: str = task_data["docker_image"]
+
+        # Change the status of the task to evaluating before we start evaluation
+        task_row.status = TaskStatus.EVALUATING
+        database_session.add(task_row)
+        database_session.flush()
+
+        async with build_task_environment(daytona_client, task_row.task_id, docker_image) as sandbox:
+            request_setup = task_data["request_setup"]
+            if request_setup:
+                response = await benchmark_service.request_setup_task(
+                    task_id=task_row.task_id, instance_id=str(sandbox.id)
+                )
+                assert response == {"status": "ok"}
+
+            response = await benchmark_service.request_evaluate_instance(
+                task_id=task_row.task_id, instance_id=sandbox.id
+            )
+
+            return response
+
+    async def test_end_to_end(
+        self, database_session: Session, benchmark_service: BenchmarkService, daytona_client: AsyncDaytona
+    ):
         """
         Test the end to end flow when using database with a benchmark service
 
@@ -199,4 +252,84 @@ class TestDatabaseIntegration:
             - Apply concurrency to tasks and ensure that the tasks are correctly being added to the database
             - As evaluation results come in, ensure that we are correclty adding them to the database
         """
-        ...
+
+        try:
+            # Ensure that the benchmark service is running
+            response = await benchmark_service.request_health_check()
+            assert response == {"status": "ok"}
+
+            # Create benchmark row to initiate a benchmark
+            benchmark_row = Benchmark(name=benchmark_service.name)
+            database_session.add(benchmark_row)
+            database_session.flush()
+
+            # Request all of the task ids from the benchmark service
+            response = await benchmark_service.request_verify_task_ids(task_ids=None)
+            task_ids = response.get("task_ids")
+
+            # Returned all of the task ids from the swebench service
+            assert task_ids is not None
+            assert len(task_ids) == 500
+
+            # NOTE: For testing we only are going to use the first 50 task ids
+            # Also to mimic limits we are going to apply a concurrency limit of 10
+            task_ids = task_ids[1:2]
+
+            logger.info(f"Sample of task ids returned: {task_ids[:10]}")
+
+            # Create the task rows for each task we are going to run
+            task_row_mapping: dict[str, Task] = {}
+            for task_id in task_ids:
+                task_row = await self._create_task(database_session, task_id, cast(UUID, benchmark_row.id))
+                task_row_mapping[task_id] = task_row
+
+            logger.info(f"Sample of task row mapping: {str(list(task_row_mapping.values())[:250])}")
+
+            concurrency = 10
+
+            # Batch the task ids into groups of the concurrency limit
+            task_id_batches = list(batched(task_ids, concurrency))
+
+            evaluation_results: dict[str, dict[str, Any]] = {}
+            for task_id_batch in task_id_batches:
+                # Fetch the docker image info for all the tasks inside of the batch
+                task_information = await benchmark_service.request_retrieve_tasks(task_ids=list(task_id_batch))
+
+                for task_id, task_data in task_information.items():
+                    task_row = task_row_mapping[task_id]
+
+                    evaluation_result = await self._evaluate_instance(
+                        database_session, benchmark_service, daytona_client, task_row, task_data
+                    )
+
+                    # Push evaluation to the database and update the task status to finished
+                    evaluation_result_row = await self._create_evaluation_result(
+                        database_session, task_row, evaluation_result
+                    )
+                    evaluation_results[task_id] = evaluation_result_row.result
+
+            logger.info(f"Sample of evaluation results: {str(list(evaluation_results.values())[:250])}")
+
+            # When all tasks have been evaluated, we can make a request to get the final evaluation score
+            response = await benchmark_service.request_final_score(evaluation_results=evaluation_results)
+
+            logger.info(f"Final score response: {str(response)[:250]}")
+
+            # Create the final evaluation row and add it to the database
+            evaluation_result_row = await self._create_final_evaluation(database_session, benchmark_row, response)
+
+            # Fetch the evaluation results from the final evaluation row
+            fetched_evaluation_results = evaluation_result_row.fetch_evaluation_results(database_session)
+
+            results = fetched_evaluation_results.all()
+            assert len(results) == len(list(evaluation_results.keys()))
+
+            logger.info(f"Sample of fetched evaluation results: {str(results[:250])}")
+
+            for evaluation_result_row in results:
+                task_row = database_session.get(Task, evaluation_result_row.task_id)
+                assert task_row is not None
+                assert evaluation_results.get(task_row.task_id)
+
+        except Exception as e:
+            pytest.fail(f"End to end test failed: {e}", pytrace=False)

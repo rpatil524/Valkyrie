@@ -18,6 +18,10 @@ class BenchmarkService:
         self._environment_keys = self.daytona_keys()
 
     @property
+    def name(self) -> str:
+        return self._name
+
+    @property
     def environment_keys(self) -> dict[str, str]:
         return self._environment_keys
 
@@ -47,7 +51,7 @@ class BenchmarkService:
         """
         response = requests.get(f"{self._url}/health")
 
-        logger.info(f"Health check response: {response.json()}")
+        logger.debug(f"Health check response: {response.json()}")
 
         if response.status_code != 200:
             raise Exception(f"Health check failed with status code {response.status_code}, response: {response.text}")
@@ -65,7 +69,7 @@ class BenchmarkService:
 
         response = requests.get(f"{self._url}/verify-task-ids", params=params)
 
-        logger.info(f"Verify task ids response: {response.json()}")
+        logger.debug(f"Verify task ids response: {response.json()}")
 
         if response.status_code != 200:
             raise Exception(
@@ -84,7 +88,7 @@ class BenchmarkService:
         query_params = "&".join([f"task_ids={task_id}" for task_id in task_ids])
         response = requests.get(f"{self._url}/retrieve-tasks?{query_params}&skip_validation={skip_validation}")
 
-        logger.info(f"Retrieve tasks response: {response.json()}")
+        logger.debug(f"Retrieve tasks response: {response.json()}")
 
         if response.status_code != 200:
             raise Exception(f"Retrieve tasks failed with status code {response.status_code}, response: {response.text}")
@@ -107,7 +111,7 @@ class BenchmarkService:
             },
         )
 
-        logger.info(f"Setup task response: {response.json()}")
+        logger.debug(f"Setup task response: {response.json()}")
 
         if response.status_code != 200:
             raise Exception(f"Setup task failed with status code {response.status_code}, response: {response.text}")
@@ -130,7 +134,7 @@ class BenchmarkService:
             },
         )
 
-        logger.info(f"Evaluate instance response: {response.json()}")
+        logger.debug(f"Evaluate instance response: {response.json()}")
 
         if response.status_code != 200:
             raise Exception(
@@ -149,7 +153,7 @@ class BenchmarkService:
             headers={"Content-Type": "application/json"},
         )
 
-        logger.info(f"Final score response: {response.json()}")
+        logger.debug(f"Final score response: {response.json()}")
 
         if response.status_code != 200:
             raise Exception(f"Final score failed with status code {response.status_code}, response: {response.text}")

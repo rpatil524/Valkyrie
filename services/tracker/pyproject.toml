@@ -5,7 +5,7 @@ description = "Tracking service for agentic harness"
 authors = [
     { name = "Omar Almatov", email = "52346350+oalmatov@users.noreply.github.com" }
 ]
-requires-python = ">=3.11"
+requires-python = "==3.12.*"
 dependencies = [
     "boto3>=1.42.20",
     "daytona>=0.128.1",
@@ -33,4 +33,3 @@ reportAny=false
 [tool.pytest.ini_options]
 pythonpath = ["."]
 asyncio_mode = "auto"
-
