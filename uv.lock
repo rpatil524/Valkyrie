@@ -14,6 +14,7 @@ source = { editable = "." }
 dependencies = [
     { name = "click" },
     { name = "daytona" },
+    { name = "httpx" },
     { name = "model-library" },
     { name = "pypandoc" },
     { name = "pytest" },
@@ -25,7 +26,6 @@ dependencies = [
 [package.dev-dependencies]
 dev = [
     { name = "basedpyright" },
-    { name = "pypdf2" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "ruff" },
@@ -39,18 +39,18 @@ submodules = [
 requires-dist = [
     { name = "click", specifier = ">=8.1.0" },
     { name = "daytona", specifier = ">=0.123.0" },
+    { name = "httpx", specifier = ">=0.28.1" },
     { name = "model-library" },
     { name = "pypandoc" },
     { name = "pytest", specifier = ">=9.0.1" },
     { name = "pytest-asyncio", specifier = ">=1.3.0" },
-    { name = "valsai", directory = "../platform/sdk" },
+    { name = "valsai", directory = "../Vals/platform-be/sdk" },
     { name = "wonderwords", specifier = ">=3.0.1" },
 ]
 
 [package.metadata.requires-dev]
 dev = [
     { name = "basedpyright" },
-    { name = "pypdf2" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "ruff" },
@@ -1391,7 +1391,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "model-library", git = "https://github.com/vals-ai/model-library.git" },
+    { name = "model-library", specifier = ">=0.1.3" },
     { name = "pypdf2", specifier = ">=3.0.1" },
     { name = "python-dotenv", specifier = ">=1.2.1" },
 ]
@@ -3376,7 +3376,7 @@ wheels = [
 
 [[package]]
 name = "valsai"
-source = { directory = "../platform/sdk" }
+source = { directory = "../Vals/platform-be/sdk" }
 dependencies = [
     { name = "aiofiles" },
     { name = "aiohttp" },
