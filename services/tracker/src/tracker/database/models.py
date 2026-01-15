@@ -4,15 +4,28 @@ from typing import Any
 from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import Connection, ScalarResult, event
-from sqlalchemy.orm import Mapper
-from sqlmodel import JSON, CheckConstraint, Column, Field, Session, SQLModel, col, select
+from pydantic import BaseModel, field_serializer
+from sqlalchemy import Connection, Dialect, event
+from sqlalchemy.orm import Mapped, Mapper
+from sqlmodel import (
+    JSON,
+    CheckConstraint,
+    Column,
+    Field,
+    Relationship,
+    Session,
+    SQLModel,
+    TypeDecorator,
+    UniqueConstraint,
+)
+
 from tracker.database.utils import has_field_changed
 
 
 class BenchmarkStatus(str, Enum):
     IN_PROGRESS = "in_progress"
     FINISHED = "finished"
+    ERROR = "error"
 
 
 class TaskStatus(str, Enum):
@@ -20,38 +33,84 @@ class TaskStatus(str, Enum):
     IN_PROGRESS = "in_progress"
     EVALUATING = "evaluating"
     FINISHED = "finished"
+    ERROR = "error"
 
 
 class FinalEvaluation(SQLModel, table=True):
-    id: UUID | None = Field(default_factory=uuid4, primary_key=True)
-    benchmark_id: UUID = Field(foreign_key="benchmark.id")
+    id: UUID = Field(default_factory=uuid4, primary_key=True)
+    benchmark: UUID = Field(foreign_key="benchmark.id")
     final_score: float = Field(nullable=False)
-    resolved_tasks: list[str] = Field(default_factory=list, sa_column=Column(JSON, nullable=False))
-    unresolved_tasks: list[str] = Field(default_factory=list, sa_column=Column(JSON, nullable=False))
+    # NOTE: metadata was reserved by alchemy
+    properties: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON, nullable=False))
 
-    def fetch_evaluation_results(self, session: Session) -> ScalarResult["EvaluationResult"]:
-        """Select all evaluation results for a given benchmark"""
-        statement = (
-            select(EvaluationResult)
-            .join(Task, col(EvaluationResult.task_id) == col(Task.id))
-            .where(col(Task.benchmark_id) == self.benchmark_id)
-        )
-        return session.exec(statement)
+    @field_serializer("id", "benchmark")
+    def serialize_uuid(self, value: UUID | str) -> str:
+        return str(value)
+
+
+class BenchmarkArguments(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    contract_name: str
+    concurrency: int
+    task_ids: list[str] | None = None
+    slice_str: str | None = None
+
+
+class BenchmarkArgumentsType(TypeDecorator[BenchmarkArguments]):
+    """
+    Hook for converting benchmark arguments to an object and back again.
+    Allows us to use the type without manually serializing and deserializing.
+    NOTE: We do this because the field is not relevant enough to be a separate table and we want it created with the benchmark row
+
+    Related Documentation:
+        - https://docs.sqlalchemy.org/en/20/core/custom_types.html#sqlalchemy.types.TypeDecorator
+    """
+
+    impl = JSON
+    cache_ok = True
+
+    def process_bind_param(self, value: BenchmarkArguments | None, dialect: Dialect) -> dict[str, Any] | None:
+        """Runs when we save the value to the database."""
+        if value is None:
+            return None
+        return value.model_dump()
+
+    def process_result_value(self, value: dict[str, Any] | None, dialect: Dialect) -> BenchmarkArguments | None:
+        """Runs when we fetch the value from the database."""
+        if value is None:
+            return None
+        return BenchmarkArguments(**value)
 
 
 class Benchmark(SQLModel, table=True):
     __table_args__: tuple[CheckConstraint, ...] = (
         CheckConstraint(
-            "(status != 'FINISHED') OR (finished_at IS NOT NULL)",
+            "(status != 'FINISHED' AND status != 'ERROR') OR (finished_at IS NOT NULL)",
             name="benchmark_finished_requires_timestamp",
         ),
     )
 
-    id: UUID | None = Field(default_factory=uuid4, primary_key=True)
+    id: UUID = Field(default_factory=uuid4, primary_key=True)
     name: str
     started_at: datetime = Field(default_factory=lambda: datetime.now(ZoneInfo("UTC")))
     finished_at: datetime | None = None
-    status: BenchmarkStatus = Field(default=BenchmarkStatus.IN_PROGRESS)
+    status: BenchmarkStatus = Field(
+        default=BenchmarkStatus.IN_PROGRESS
+    )  # TODO: Automatically set to finished when all tasks are in a finished state or error state
+
+    error_message: str | None = Field(default=None)
+    arguments: BenchmarkArguments = Field(
+        sa_column=Column(BenchmarkArgumentsType),
+    )
+    final_evaluation: Mapped[FinalEvaluation | None] = Relationship(
+        sa_relationship_kwargs={"foreign_keys": "[FinalEvaluation.benchmark]"}
+    )
+
+    def fetch_evaluation_results(self, session: Session) -> dict[str, dict[str, Any]]:
+        from tracker.utils import fetch_evaluation_results
+
+        return fetch_evaluation_results(self.id, session)
 
 
 @event.listens_for(Benchmark, "before_insert")
@@ -68,7 +127,7 @@ def set_finished_at_when_benchmark_finished(_mapper: Mapper[Benchmark], _connect
     """
 
     # Benchmark statuses we want the finished_at timestamp to be set when updated to
-    finished_states = [BenchmarkStatus.FINISHED]
+    finished_states = [BenchmarkStatus.FINISHED, BenchmarkStatus.ERROR]
 
     # Check that the status has actually changed between the current and previous state
     status_changed = has_field_changed(target, "status")
@@ -79,19 +138,21 @@ def set_finished_at_when_benchmark_finished(_mapper: Mapper[Benchmark], _connect
 
 
 class Task(SQLModel, table=True):
-    __table_args__: tuple[CheckConstraint, ...] = (
+    __table_args__: tuple[CheckConstraint, UniqueConstraint] = (
         CheckConstraint(
-            "(status != 'FINISHED') OR (finished_at IS NOT NULL)",
+            "(status != 'FINISHED' AND status != 'ERROR') OR (finished_at IS NOT NULL)",
             name="task_finished_requires_timestamp",
         ),
+        UniqueConstraint("benchmark", "task_id", name="unique_task_per_benchmark"),
     )
 
-    id: UUID | None = Field(default_factory=uuid4, primary_key=True)
-    task_id: str = Field(unique=True)
+    id: UUID = Field(default_factory=uuid4, primary_key=True)
+    task_id: str
     status: TaskStatus = Field(default=TaskStatus.STARTING)
     started_at: datetime = Field(default_factory=lambda: datetime.now(ZoneInfo("UTC")))
+    error_message: str | None = Field(default=None)
     finished_at: datetime | None = None
-    benchmark_id: UUID = Field(foreign_key="benchmark.id")
+    benchmark: UUID = Field(foreign_key="benchmark.id")
 
 
 @event.listens_for(Task, "before_insert")
@@ -102,7 +163,7 @@ def set_finished_at_when_task_finished(_mapper: Mapper[Task], _connection: Conne
     """
 
     # Task statuses we want the finished_at timestamp to be set when updated to
-    finished_states = [TaskStatus.FINISHED]
+    finished_states = [TaskStatus.FINISHED, TaskStatus.ERROR]
 
     # Check that the status has actually changed between the current and previous state
     status_changed = has_field_changed(target, "status")
@@ -113,7 +174,7 @@ def set_finished_at_when_task_finished(_mapper: Mapper[Task], _connection: Conne
 
 
 class EvaluationResult(SQLModel, table=True):
-    id: UUID | None = Field(default_factory=uuid4, primary_key=True)
-    task_id: UUID = Field(foreign_key="task.id")
+    id: UUID = Field(default_factory=uuid4, primary_key=True)
+    task: UUID = Field(foreign_key="task.id")
     instance_id: str = Field(unique=True)
     result: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON, nullable=False))

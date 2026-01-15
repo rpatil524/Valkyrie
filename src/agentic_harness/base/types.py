@@ -1,47 +1,43 @@
-from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
-from model_library.base import InputItem
 from pydantic import BaseModel, model_validator
 from wonderwords import RandomWord
 
 rw = RandomWord()
 
 
-class EnvironmentKeys(BaseModel):
-    """Inherited by environments expected to return desired dependencies to inject into the sandbox environment"""
-
-    ...
+# NOTE: Was getting some dependency issues with the model-library
+# Removing the package fixed it
 
 
-class Image(BaseModel):
-    dockerfile: Path | None = None
-    name: str | None = None
-    tag: str = "latest"
-
-    @property
-    def image_name(self) -> str:
-        if self.name is None:
-            adjective = rw.word(include_categories=["adjectives"])
-            noun = rw.word(include_categories=["nouns"])
-
-            name = f"{adjective.capitalize()}-{noun.capitalize()}"
-
-            # In case we need to access it again
-            self.name = name
-
-            return name
-
-        return self.image_name
+class InputItem(BaseModel):
+    pass
 
 
-class Sandbox(BaseModel):
-    """
-    Represents a sandbox.
-    """
+class TextInput(InputItem):
+    text: str
+    type: Literal["text"] = "text"
 
-    id: str | None = None
-    image: Image
+
+class QueryResultCost(BaseModel):
+    input: float = 0
+    output: float = 0
+    total: float | None = None
+
+
+class QueryResultMetadata(BaseModel):
+    cost: QueryResultCost | None = None
+    duration_seconds: float | None = None
+    in_tokens: int = 0
+    out_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
+
+
+class QueryResult(BaseModel):
+    output_text: str | None = None
+    metadata: QueryResultMetadata | None = None
+    raw: dict[str, Any] | None = None
 
 
 class Task(BaseModel):
@@ -54,25 +50,6 @@ class Task(BaseModel):
     id: str
     input: list[InputItem]
     extra: dict[str, Any] = {}
-
-    # Sandbox information
-    sandbox: Sandbox | None = None
-
-
-class TaskGroup(BaseModel):
-    """Collection of tasks."""
-
-    tasks: list[Task]
-
-
-class DatasetConfig(BaseModel):
-    name: str
-    kwargs: dict[str, Any] = {}
-
-
-class EnvironmentConfig(BaseModel):
-    name: str
-    kwargs: dict[str, Any] = {}
 
 
 class AgentConfig(BaseModel):
@@ -101,10 +78,6 @@ class BaseConfig(BaseModel):
     benchmark: str = "base"
 
     agent: AgentConfig
-
-    environment: EnvironmentConfig
-
-    dataset: DatasetConfig
 
     @model_validator(mode="before")
     def validate_config(cls, config: dict[str, Any]) -> dict[str, Any]:

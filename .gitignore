@@ -1,5 +1,6 @@
 # env files
 .env
+env
 
 .venv/
 
@@ -13,3 +14,6 @@ config/**.yaml
 
 # fab
 logs
+
+
+tracker.db*

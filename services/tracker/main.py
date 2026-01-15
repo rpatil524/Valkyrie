@@ -1,11 +1,38 @@
-from fastapi import FastAPI, File, HTTPException, UploadFile
-from tracker.s3 import upload_to_s3
+from uuid import UUID
+
+from fastapi import BackgroundTasks, Depends, FastAPI, File, HTTPException, Query, Request, UploadFile
+from fastapi.responses import StreamingResponse
+from sqlalchemy.orm import joinedload
+from sqlmodel import Session, select
+
+from tracker.benchmark_service import BenchmarkService
+from tracker.database.models import Benchmark
+from tracker.database.session import get_session
+from tracker.exceptions import TrackerServiceError
+from tracker.logger import get_logger
+from tracker.s3 import get_contract_s3_key, upload_to_s3
+from tracker.types import (
+    FetchBenchmarkResponse,
+    RetrieveResultsResponse,
+    StartRunErrorResponse,
+    StartRunRequest,
+    StartRunResponse,
+)
+from tracker.utils import BenchmarkContext, commit_benchmark_error, process_benchmark, stream_benchmark_results
+
+logger = get_logger(__name__)
 
 app = FastAPI()
 
 
+@app.exception_handler(TrackerServiceError)
+async def tracker_service_error_handler(_request: Request, exc: TrackerServiceError):
+    logger.error(exc, exc_info=True)
+    raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
 @app.get("/health")
-def health_check():
+def health_check() -> dict[str, str]:
     """
     Health check to ensure that the tracker service is running.
 
@@ -25,22 +52,20 @@ def health_check():
 
 
 @app.post("/upload")
-async def upload_agent(
-    agent: UploadFile = File(..., description="Agent submodule zip file"),
-    contract: UploadFile = File(..., description="AgentContract python file"),
-):
+async def upload_contract_to_s3(
+    contract: UploadFile = File(..., description="Contract directory zip file"),
+) -> dict[str, str]:
     """
-    Upload agent and contract to S3.
+    Upload contract to S3.
 
     Usage:
     curl -X POST http://<endpoint>/upload \
-      -F "agent=@agent.zip" \
-      -F "contract=@contract.py"
+      -F "contract=@claude_code.zip"
 
     Returns:
     {
         "status": "success",
-        "message": "Agent and contract uploaded successfully"
+        "message": "Contract uploaded successfully"
     }
 
     Returns:
@@ -48,29 +73,148 @@ async def upload_agent(
     - 400 Bad Request if files are invalid
     - 500 Internal Server Error if upload fails
     """
-    # TODO: More robust validation.
-    # Perhaps run some kind of test script to make sure implementation is correct
-    if not agent.filename or not agent.filename.endswith(".zip"):
-        raise HTTPException(status_code=400, detail="Agent must be a zip file")
+    if not contract.filename or not contract.filename.endswith(".zip"):
+        raise HTTPException(status_code=400, detail="Contract must be a zip file")
 
-    if not contract.filename or not contract.filename.endswith(".py"):
-        raise HTTPException(status_code=400, detail="Contract must be a Python file")
+    contract_content = await contract.read()
+    # Extract contract name from filename (remove .zip extension)
+    contract_name = contract.filename.rsplit(".zip", 1)[0]
+    contract_s3_key = get_contract_s3_key(contract_name)
+    upload_to_s3(contract_content, contract_s3_key)
 
+    return {
+        "status": "success",
+        "message": "Contract uploaded successfully",
+    }
+
+
+@app.post("/start-run")
+async def start_run(
+    request: StartRunRequest,
+    session: Session = Depends(get_session),
+    background_tasks: BackgroundTasks = BackgroundTasks(),
+) -> StartRunResponse:
+    """
+    Start a benchmark run with the uploaded contract.
+
+    Usage:
+    curl -X POST http://<endpoint>/start-run \
+      -H "Content-Type: application/json" \
+      -d '{"contract_name": "claude_code", "benchmark_name": "swebench", "task_ids": ["astropy__astropy-12907"]}'
+
+    Returns:
+        StartRunResponse
+
+    Returns:
+    - 200 OK if run starts successfully
+    - 400 Bad Request if parameters are invalid
+    - 500 Internal Server Error if run fails to start
+    """
+    logger.info(f"Starting benchmark run - contract: {request.contract_name}, benchmark: {request.benchmark_name}")
+
+    benchmark_service = request.benchmark_service
+
+    # Check service is running
+    _ = await benchmark_service.request_health_check()
+
+    # Create benchmark row inside of database to mark start of the benchmark
+    benchmark_row = BenchmarkService.start_run_request_to_benchmark_object(request)
+    session.add(benchmark_row)
+    session.commit()
+
+    # Verify task ids passed in (they exist within dataset and all dependencies are met to run them)
     try:
-        # Read file contents
-        agent_content = await agent.read()
-        contract_content = await contract.read()
-
-        # TODO: better keys so that contracts and agents with same names don't collide
-        agent_s3_key = f"agents/{agent.filename}"
-        contract_s3_key = f"contracts/{contract.filename}"
-
-        upload_to_s3(agent_content, agent_s3_key)
-        upload_to_s3(contract_content, contract_s3_key)
-
-        return {
-            "status": "success",
-            "message": "Agent and contract uploaded successfully",
-        }
+        verify_response = await benchmark_service.request_verify_task_ids(
+            task_ids=request.task_ids, slice_str=request.slice_str
+        )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
+        error_message = str(e)
+        commit_benchmark_error(benchmark_row, session, error_message)
+        error_response = StartRunErrorResponse(
+            benchmark_id=benchmark_row.id,
+            error_message=error_message,
+        )
+
+        raise TrackerServiceError(error_response.model_dump_json()) from e
+
+    background_tasks.add_task(
+        process_benchmark, request, benchmark_row.id, verify_response.task_ids, benchmark_service, session
+    )
+
+    return StartRunResponse(
+        benchmark_name=benchmark_row.name,
+        contract_name=request.contract_name,
+        benchmark_id=benchmark_row.id,
+        concurrency=request.concurrency,
+        started_at=benchmark_row.started_at,
+        task_count=len(verify_response.task_ids),
+    )
+
+
+@app.get("/fetch-benchmark", response_model=None)
+async def fetch_benchmark(
+    benchmark_id: UUID, connect: bool = Query(default=False), session: Session = Depends(get_session)
+) -> FetchBenchmarkResponse | StreamingResponse:
+    """
+    Fetch a benchmark by its id.
+
+    Usage:
+    curl -X GET http://<endpoint>/fetch-benchmark/<benchmark_id>?connect=true
+
+    Returns:
+        FetchBenchmarkResponse
+
+    Returns:
+    - 200 OK if benchmark is found
+    - 404 Not Found if benchmark is not found
+    """
+    benchmark_row = session.get(Benchmark, benchmark_id)
+    if not benchmark_row:
+        raise HTTPException(status_code=404, detail=f"Benchmark with id {benchmark_id} not found")
+
+    # When we connect to the client every 60 seconds we send the latest benchmark status
+    # and additional updates about the tasks completed
+    if connect:
+        return StreamingResponse(
+            stream_benchmark_results(benchmark_id, session),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    benchmark_context = BenchmarkContext(benchmark_row, session)
+
+    return FetchBenchmarkResponse(
+        benchmark_name=benchmark_row.name,
+        benchmark_id=benchmark_row.id,
+        details=benchmark_context.benchmark_details,
+    )
+
+
+@app.get("/retrieve-results", response_model_exclude_none=True)
+async def retrieve_results(benchmark_id: UUID, session: Session = Depends(get_session)) -> RetrieveResultsResponse:
+    """
+    Retrieve the results of a benchmark by its id.
+
+    Usage:
+    curl -X GET http://<endpoint>/retrieve-results/<benchmark_id>
+
+    Returns:
+        RetrieveResultsResponse
+    """
+    statement = select(Benchmark).where(Benchmark.id == benchmark_id).options(joinedload(Benchmark.final_evaluation))
+    benchmark_row = session.exec(statement).first()
+    if not benchmark_row:
+        raise HTTPException(status_code=404, detail=f"Benchmark with id {benchmark_id} not found")
+
+    return RetrieveResultsResponse(
+        benchmark_name=benchmark_row.name,
+        status=benchmark_row.status,
+        benchmark_id=benchmark_row.id,
+        benchmark_arguments=benchmark_row.arguments,
+        final_evaluation=benchmark_row.final_evaluation,
+        evaluation_results=benchmark_row.fetch_evaluation_results(session),
+    )

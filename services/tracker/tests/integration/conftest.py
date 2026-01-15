@@ -1,45 +1,36 @@
 import os
-from collections.abc import Generator
-from typing import Any
+from collections.abc import AsyncGenerator
 
 import pytest
-from benchmark_service import BenchmarkService
 from daytona import AsyncDaytona, DaytonaConfig
 from dotenv import load_dotenv
-from sqlmodel import Session, SQLModel, StaticPool, create_engine
-from tracker.database.models import *  # noqa: F403
+
+from tracker.benchmark_service import BenchmarkService
+from tracker.database.models import *  # noqa: F403 # type: ignore[attr-defined]
 
 _ = load_dotenv()
 
 
 @pytest.fixture(scope="function")
-def database_session() -> Generator[Session, Any, None]:
-    """Create an in-memory database and mock the session engine."""
-    test_engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
-
-    SQLModel.metadata.create_all(test_engine)
-
-    with Session(test_engine) as session:
-        yield session
-
-    SQLModel.metadata.drop_all(test_engine)
-
-
-@pytest.fixture(scope="session")
-def benchmark_service() -> BenchmarkService:
-    service_ip = os.getenv("SWEBENCH_SERVICE_IP")
+async def benchmark_service() -> AsyncGenerator[BenchmarkService, None]:
+    service_ip = os.getenv("BENCHMARK_SERVICE_URL")
     if not service_ip:
-        raise ValueError("SWEBENCH_SERVICE_IP is not set")
+        raise ValueError("BENCHMARK_SERVICE_URL is not set")
 
-    return BenchmarkService(name="swebench", url=f"http://{service_ip}:8000")
+    service = BenchmarkService(name="swebench", url=service_ip)
+
+    yield service
+
+    await service.daytona_client.close()
 
 
 @pytest.fixture
-def daytona_client(benchmark_service: BenchmarkService) -> AsyncDaytona:
-    return AsyncDaytona(
-        config=DaytonaConfig(
-            api_key=benchmark_service.environment_keys["DAYTONA_API_KEY"],
-            api_url=benchmark_service.environment_keys["DAYTONA_API_URL"],
-            target=benchmark_service.environment_keys["DAYTONA_TARGET"],
-        )
+async def daytona_client(benchmark_service: BenchmarkService) -> AsyncGenerator[AsyncDaytona, None]:
+    daytona_config = DaytonaConfig(
+        api_key=benchmark_service.environment_keys["DAYTONA_API_KEY"],
+        api_url=benchmark_service.environment_keys["DAYTONA_API_URL"],
+        target=benchmark_service.environment_keys["DAYTONA_TARGET"],
     )
+
+    async with AsyncDaytona(config=daytona_config) as client:
+        yield client

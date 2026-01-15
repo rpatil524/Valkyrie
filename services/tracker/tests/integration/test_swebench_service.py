@@ -1,9 +1,13 @@
+import os
+from typing import Any
+
 import pytest
 from daytona import AsyncDaytona, AsyncSandbox
 from pytest import MonkeyPatch
 from requests.exceptions import ConnectTimeout
-from src.benchmark_service import BenchmarkService
+
 from tests.utils import build_task_environment, validate_docker_image
+from tracker.benchmark_service import BenchmarkService
 
 
 @pytest.fixture
@@ -12,8 +16,15 @@ def docker_image_format() -> str:
 
 
 @pytest.fixture(scope="session", autouse=True)
-async def require_health_check(benchmark_service: BenchmarkService):
+async def require_health_check():
     """Checks that the server is running before running the test. If its not connected it will fail"""
+
+    service_ip = os.getenv("BENCHMARK_SERVICE_URL")
+    if not service_ip:
+        pytest.fail("BENCHMARK_SERVICE_URL is not set", pytrace=False)
+
+    benchmark_service = BenchmarkService(name="swebench", url=service_ip)
+
     try:
         _ = await benchmark_service.request_health_check()
     except ConnectTimeout:
@@ -58,7 +69,7 @@ class TestSWEBenchmarkService:
         """
         try:
             response = await benchmark_service.request_health_check()
-            assert response == {"status": "ok"}
+            assert response.status == "ok"
 
         except Exception as e:
             pytest.fail(f"Health check failed: {e}", pytrace=False)
@@ -71,74 +82,65 @@ class TestSWEBenchmarkService:
         - Valid task ids: Returns 200 OK
         - Invalid task ids: Raises Exception that the user sees
         - No task ids passed in: Returns all 500 task ids to run the benchmark
+        - Slice string passed in: Returns the correct amount of task ids expected for the slice
         """
 
         try:
             # Test case 1. Valid tasks passed in returns the same task ids in the same order passed in
             task_ids = ["astropy__astropy-12907", "django__django-11066", "django__django-12858"]
-            response = await benchmark_service.request_verify_task_ids(task_ids=task_ids)
-            assert response == {
-                "task_ids": task_ids,
-            }
+            response = await benchmark_service.request_verify_task_ids(task_ids=task_ids, slice_str=None)
+            assert response.task_ids == task_ids
 
             # Test case 2. Invalid task ids passed in raises and Exception that the user sees
             with pytest.raises(Exception):
                 _ = await benchmark_service.request_verify_task_ids(
-                    task_ids=["astropy__astropy-12907", "invalid_task_id"]
+                    task_ids=["astropy__astropy-12907", "invalid_task_id"], slice_str=None
                 )
 
             # Test case 3. No task ids passed in returns all 500 task ids to run the benchmark
-            response = await benchmark_service.request_verify_task_ids(task_ids=None)
-            assert response.get("task_ids")
-            assert len(response["task_ids"]) == 500
+            response = await benchmark_service.request_verify_task_ids(task_ids=[], slice_str=None)
+            assert response.task_ids
+            assert len(response.task_ids) == 500
+
+            # Test case 4. Slice string passed in returns the correct amount of task ids expected for the slice
+            response = await benchmark_service.request_verify_task_ids(task_ids=None, slice_str="100:200")
+            assert response.task_ids
+            assert len(response.task_ids) == 100
 
         except Exception as e:
             pytest.fail(f"Verify task ids failed: {e}", pytrace=False)
 
-    async def test_retrieve_tasks(self, benchmark_service: BenchmarkService, docker_image_format: str):
+    async def test_retrieve_task(self, benchmark_service: BenchmarkService, docker_image_format: str):
         """
-        Test the retrieve tasks endpoint of the benchmark service.
+        Test the retrieve task endpoint of the benchmark service.
 
         Test Cases:
-        - Valid task ids: Returns the tasks in the same order as the task ids passed in
-        - Invalid task ids: Raises Exception that the user sees
-        - No task ids passed in: Raises Exception that the user sees
+        - Valid task id: Returns the task data with correct structure
+        - Invalid task id: Raises Exception that the user sees
         """
 
         try:
-            # Test case 1. Valid tasks passed in returns a valid dict structure
+            # Test case 1. Valid task returns a valid dict structure
             task_ids = ["astropy__astropy-12907", "django__django-11066", "django__django-12858"]
-            response: dict[str, dict[str, str]] = await benchmark_service.request_retrieve_tasks(task_ids=task_ids)
 
-            assert list(response.keys()) == task_ids, "Returned in the same order as passed in"
+            for task_id in task_ids:
+                task_data = await benchmark_service.request_retrieve_task(task_id=task_id)
 
-            for task_id, task_data in response.items():
-                assert task_data.get("docker_image") == docker_image_format.format(task_id=task_id)
-                assert task_data.get("request_setup")
-                assert task_data.get("problem_statement")
+                assert task_data.docker_image == docker_image_format.format(task_id=task_id)
+                assert task_data.request_setup
+                assert task_data.problem_statement
 
-            # We can also pull the manifest from these docker images to ensure that they do in fact exist
-            failed_images: list[str] = []
-            for task_id, task_data in response.items():
-                if not await validate_docker_image(task_data["docker_image"]):
-                    failed_images.append(task_id)
+                # Verify docker image exists
+                if not await validate_docker_image(task_data.docker_image):
+                    pytest.fail(f"Failed to validate docker image for task: {task_id}")
 
-            assert len(failed_images) == 0, f"Failed to validate the following tasks: {', '.join(failed_images)}"
-
-            # Test case 2. Invalid task ids passed in raises and Exception that the user sees
+            # Test case 2. Invalid task id raises an Exception that the user sees
             # Skip validation since some tasks don't have proper manifests but we can still pull them
             with pytest.raises(Exception):
-                _ = await benchmark_service.request_retrieve_tasks(
-                    task_ids=["django__django-12858", "invalid_task_id"], skip_validation=True
-                )
-
-            # Test case 3. Ensure that if we pass in an empty list, we get an error back from the service
-            # (Minimum of 1 task is required to fetch the tasks)
-            with pytest.raises(Exception):
-                _ = await benchmark_service.request_retrieve_tasks(task_ids=[], skip_validation=True)
+                _ = await benchmark_service.request_retrieve_task(task_id="invalid_task_id", skip_validation=True)
 
         except Exception as e:
-            pytest.fail(f"Retrieve tasks failed: {e}", pytrace=False)
+            pytest.fail(f"Retrieve task failed: {e}", pytrace=False)
 
     @staticmethod
     async def _fetch_commit(sandbox: AsyncSandbox) -> str:
@@ -191,7 +193,7 @@ class TestSWEBenchmarkService:
 
                 # Test case 3. When using the setup task endpoint with a valid task id and instance id: Returns 200 OK
                 response = await benchmark_service.request_setup_task(task_id=task_id, instance_id=sandbox.id)
-                assert response == {"status": "ok"}
+                assert response.status == "ok"
 
                 # Test case 3. Ensure we have entered the correct commit inside of the environment after using the setup task endpoint
                 current_commit = await self._fetch_commit(sandbox)
@@ -235,7 +237,7 @@ class TestSWEBenchmarkService:
         """
         try:
             task_id = "astropy__astropy-12907"
-            first_evaluation_result = {
+            first_evaluation_result: dict[str, dict[str, Any] | None] = {
                 task_id: {
                     "task_id": task_id,
                     "instance_id": task_id,
@@ -247,13 +249,10 @@ class TestSWEBenchmarkService:
 
             final_score = await benchmark_service.request_final_score(evaluation_results=first_evaluation_result)
 
-            assert final_score == {
-                "tasks_evaluated": [task_id],
-                "final_score": round(100.0, 6),
-                "resolved_tasks": [task_id],
-                "unresolved_tasks": [],
-                "evaluation_results": first_evaluation_result,
-            }
+            assert final_score.tasks_evaluated == [task_id]
+            assert final_score.final_score == round(100.0, 6)
+            assert final_score.metadata.get("resolved_tasks", []) == [task_id]
+            assert final_score.metadata.get("unresolved_tasks", []) == []
 
         except Exception as e:
             pytest.fail(f"Final score failed: {e}", pytrace=False)

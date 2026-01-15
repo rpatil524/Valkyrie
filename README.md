@@ -1,59 +1,77 @@
-# Agentic Harness
+## Development
 
-Define your agent in `agents/`, add benchmarks as git submodules in `benchmarks/`, and run evaluations.
+### Prerequisites
+
+- Python 3.12
+- UV package manager (brew install uv)
+
+### Environment Setup
+
+Create `services/tracker/.env` with the following configuration:
+
+```env
+DAYTONA_API_KEY=dtn_5ebxx_xxxx
+DAYTONA_API_URL=https://app.daytona.io/api
+DAYTONA_TARGET=us
+BENCHMARK_SERVICE_URL=http://98.xx.xx:8000
+```
+
+### Installation
+
+**Harness (CLI)**
 
 ```bash
-python runner.py --config config/ioi.yaml
+make install
 ```
 
-**Setup:** `make install`
-**Style:** `make style`
-**Type Check:** `make typecheck`
+Creates `.venv` and installs dependencies for CLI and harness from `pyproject.toml`.
 
-## Virtual Environment Setup
+**Services**
 
-This project uses separate virtual environments for different components:
+Each service maintains its own isolated virtual environment:
 
-- **Root workspace** (`.venv`): Contains the main harness framework and shared dependencies
-  - Install with: `make install`
-  
-- **Services** (isolated venvs): Each service maintains its own virtual environment. You might have to switch your venv depending on the service you are working on.
-  - Tracker service: `make tracker-install` (creates `services/tracker/.venv`)
-  - SWE-bench service: `make swebench-install` (creates `services/benchmarks/swebench/.venv`)
+- **Tracker service**: `make tracker-service` — Cleans, builds, and runs Docker container
+- **SWE-bench service**: `make swebench-install` — Creates `services/benchmarks/swebench/.venv`
 
-### Running Tracker Service Locally
+### Usage
+
+#### Start a benchmark
 
 ```bash
-# Start tracker service (development mode)
-make tracker-dev
+# With specific task IDs:
+uv run harness start-benchmark \
+  --contract <contract_path> \
+  --benchmark <benchmark_name> \
+  --concurrency 1 \
+  --task-ids "task_1_id,task_2_id" \
+  --slice "start:stop:step"
+
+# Or run whole benchmark (not recommended for development):
+uv run harness start-benchmark \
+  --contract <contract_path> \
+  --benchmark <benchmark_name> \
+  --concurrency 1 \
+  --slice "start:stop:step"
 ```
 
-### Additional Setup Steps
+Starts the benchmark and exits once successfully created.
 
-if you are developing locally and need to test changes to the sdk
+#### Monitor benchmark status
 
-comment out the ssh url to the sdk and use the generic dependency
+```bash
+# Live updates every 60 seconds
+uv run harness fetch-benchmark --benchmark-id <benchmark_id> --connect
 
-_under dependencies_
-
-```
-# "valsai @ git+ssh://git@github.com/vals-ai/platform-be.git@dev#subdirectory=sdk",
-  "valsai",
-  ...
+# One-time status check
+uv run harness fetch-benchmark --benchmark-id <benchmark_id>
 ```
 
-fill out the path to your local sdk version inside of `pyproject.toml`
+#### Download results
 
-```
-[tool.uv.sources]
-valsai = { path = "path/to/your/platform-be/sdk" }
+```bash
+uv run harness retrieve-results --benchmark-id <benchmark_id> --path ./results.json
 ```
 
-We are using the privated model-proxy now in case we need to make changes while we develop. We are overriding the package version because the sdk version uses the public version of the model-library which would cause a conflict if we did not do this
+### Supported Benchmarks
 
-```
-[tool.uv]
-override-dependencies = [
-  "model-library @ git+https://github.com/vals-ai/model-proxy.git@dev",
-]
-```
+- SWE-bench
