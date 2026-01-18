@@ -1,6 +1,6 @@
 from datetime import datetime
 from enum import Enum
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
 
@@ -21,9 +21,14 @@ from sqlmodel import (
 
 from tracker.database.utils import has_field_changed
 
+if TYPE_CHECKING:
+    from tracker.types import StartRunRequest
+
 
 class BenchmarkStatus(str, Enum):
     IN_PROGRESS = "in_progress"
+    STOPPING = "stopping"
+    STOPPED = "stopped"
     FINISHED = "finished"
     ERROR = "error"
 
@@ -32,6 +37,7 @@ class TaskStatus(str, Enum):
     STARTING = "starting"
     IN_PROGRESS = "in_progress"
     EVALUATING = "evaluating"
+    STOPPED = "stopped"
     FINISHED = "finished"
     ERROR = "error"
 
@@ -111,6 +117,18 @@ class Benchmark(SQLModel, table=True):
         from tracker.utils import fetch_evaluation_results
 
         return fetch_evaluation_results(self.id, session)
+
+    @property
+    def start_run_request(self) -> "StartRunRequest":
+        from tracker.types import StartRunRequest
+
+        return StartRunRequest(
+            contract_name=self.arguments.contract_name,
+            benchmark_name=self.name,
+            concurrency=self.arguments.concurrency,
+            task_ids=self.arguments.task_ids,
+            slice_str=self.arguments.slice_str,
+        )
 
 
 @event.listens_for(Benchmark, "before_insert")

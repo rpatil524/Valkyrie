@@ -87,3 +87,11 @@ class RetrieveTaskResponse(BaseModel):
 
 class VerifyTaskIdsResponse(BaseModel):
     task_ids: list[str]
+
+
+class StopRunResponse(StatusResponse):
+    pass
+
+
+class ResumeRunResponse(StatusResponse):
+    pass
