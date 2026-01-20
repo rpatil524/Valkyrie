@@ -383,12 +383,12 @@ class TestProcessBenchmark:
 
         # Mock installing and running agent part
         monkeypatch.setattr(
-            "tracker.utils.upload_contract_to_sandbox",
+            "tracker.utils.upload_agent_artifacts",
             TestProcessBenchmark._mock_upload_contract,
         )
 
         monkeypatch.setattr(
-            "tracker.utils.install_dependencies",
+            "tracker.utils.install_agent_dependencies",
             TestProcessBenchmark._mock_install_dependencies,
         )
 
