@@ -37,12 +37,16 @@ async def create_sandbox(
     daytona: AsyncDaytona,
     sandbox_name: str,
     image: str,
+    hash_suffix: str | None = None,
 ) -> AsyncGenerator[AsyncSandbox, Any]:
     """
     Create a sandbox with the given name and image.
     Automatically cleans up the sandbox when the context manager exits.
     """
     logger.info(f"Creating sandbox {sandbox_name} with image {image}")
+
+    if hash_suffix:
+        sandbox_name = f"{sandbox_name}-{hash_suffix}"
 
     sandbox = await daytona.create(
         CreateSandboxFromImageParams(
