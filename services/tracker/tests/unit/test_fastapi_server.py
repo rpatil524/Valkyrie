@@ -11,6 +11,7 @@ from sqlmodel import Session
 from main import app
 from tracker.benchmark_service import BenchmarkService
 from tracker.database.models import (
+    AgentContractRequest,
     Benchmark,
     BenchmarkArguments,
     BenchmarkStatus,
@@ -52,7 +53,7 @@ class TestFastapiServer:
 
         assert response.json() == {"status": "ok"}
 
-    async def test_start_run(self, monkeypatch: MonkeyPatch, database_session: Session):
+    async def test_start_run(self, contract: AgentContractRequest, monkeypatch: MonkeyPatch, database_session: Session):
         """
         Test start run of the fastapi server.
 
@@ -71,7 +72,7 @@ class TestFastapiServer:
 
         # Example request sent from the cli to the fastapi server
         request = StartRunRequest(
-            contract_name="claude_code",
+            contract=contract,
             benchmark_name="swebench",
             concurrency=10,
             task_ids=None,
@@ -113,7 +114,7 @@ class TestFastapiServer:
 
         # Secondary test. Arguments is correct serialized into the database
         assert benchmark_row.arguments == BenchmarkArguments(
-            contract_name=request.contract_name,
+            contract=request.contract,
             concurrency=request.concurrency,
             task_ids=None,
             slice_str=None,
@@ -127,7 +128,7 @@ class TestFastapiServer:
 
         # Remaining fields match what we passed into the request
         assert json_response["benchmark_name"] == request.benchmark_name
-        assert json_response["contract_name"] == request.contract_name
+        assert json_response["contract_name"] == request.contract.name
         assert json_response["concurrency"] == request.concurrency
 
     async def test_fetch_benchmark(self, database_session: Session, example_benchmark_object: Benchmark):
@@ -356,7 +357,9 @@ class TestFastapiServer:
         # If we did not get an error message, we return a default message
         assert response_json.get("task_errors").get("task_23") == "No error message was provided"
 
-    async def test_benchmark_error_handling(self, database_session: Session, monkeypatch: MonkeyPatch):
+    async def test_benchmark_error_handling(
+        self, contract: AgentContractRequest, database_session: Session, monkeypatch: MonkeyPatch
+    ):
         """
         Test benchmark error handling of the fastapi server.
 
@@ -378,7 +381,7 @@ class TestFastapiServer:
 
         # Example request sent from the cli to the fastapi server
         request = StartRunRequest(
-            contract_name="claude_code",
+            contract=contract,
             benchmark_name="swebench",
             concurrency=10,
             task_ids=None,

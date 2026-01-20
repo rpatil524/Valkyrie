@@ -26,6 +26,15 @@ if TYPE_CHECKING:
     from tracker.types import StartRunRequest
 
 
+class TaskStatus(str, Enum):
+    STARTING = "starting"
+    IN_PROGRESS = "in_progress"
+    EVALUATING = "evaluating"
+    STOPPED = "stopped"
+    FINISHED = "finished"
+    ERROR = "error"
+
+
 class BenchmarkStatus(str, Enum):
     IN_PROGRESS = "in_progress"
     STOPPING = "stopping"
@@ -34,13 +43,21 @@ class BenchmarkStatus(str, Enum):
     ERROR = "error"
 
 
-class TaskStatus(str, Enum):
-    STARTING = "starting"
-    IN_PROGRESS = "in_progress"
-    EVALUATING = "evaluating"
-    STOPPED = "stopped"
-    FINISHED = "finished"
-    ERROR = "error"
+class AgentContractRequest(BaseModel):
+    name: str
+    artifacts: list[str] = []
+    install_cmd: str
+    run_cmd: str
+    env: dict[str, str] = {}
+
+
+class BenchmarkArguments(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    contract: AgentContractRequest
+    concurrency: int
+    task_ids: list[str] | None = None
+    slice_str: str | None = None
 
 
 class FinalEvaluation(SQLModel, table=True):
@@ -54,14 +71,10 @@ class FinalEvaluation(SQLModel, table=True):
     def serialize_uuid(self, value: UUID | str) -> str:
         return str(value)
 
+    def fetch_evaluation_results(self, session: Session) -> dict[str, dict[str, Any]]:
+        from tracker.utils import fetch_evaluation_results
 
-class BenchmarkArguments(BaseModel):
-    model_config = {"extra": "forbid"}
-
-    contract_name: str
-    concurrency: int
-    task_ids: list[str] | None = None
-    slice_str: str | None = None
+        return fetch_evaluation_results(self.benchmark, session)
 
 
 class BenchmarkArgumentsType(TypeDecorator[BenchmarkArguments]):
@@ -137,7 +150,7 @@ class Benchmark(SQLModel, table=True):
         from tracker.types import StartRunRequest
 
         return StartRunRequest(
-            contract_name=self.arguments.contract_name,
+            contract=self.arguments.contract,
             benchmark_name=self.name,
             concurrency=self.arguments.concurrency,
             task_ids=self.arguments.task_ids,
@@ -210,3 +223,4 @@ class EvaluationResult(SQLModel, table=True):
     task: UUID = Field(foreign_key="task.id")
     instance_id: str = Field(unique=True)
     result: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON, nullable=False))
+    agent_output: str = Field(default="")

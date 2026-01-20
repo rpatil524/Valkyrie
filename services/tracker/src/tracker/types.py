@@ -1,3 +1,7 @@
+"""API request and response types for the tracker service."""
+
+from __future__ import annotations
+
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 from uuid import UUID
@@ -5,14 +9,26 @@ from uuid import UUID
 from pydantic import BaseModel
 
 from tracker.config import BENCHMARK_SERVICE_URL
-from tracker.database.models import BenchmarkArguments, BenchmarkStatus, FinalEvaluation
+from tracker.database.models import (
+    AgentContractRequest,
+    BenchmarkArguments,
+    BenchmarkStatus,
+    FinalEvaluation,
+)
 
 if TYPE_CHECKING:
     from tracker.benchmark_service import BenchmarkService
 
 
+class BenchmarkDetails(BaseModel):
+    status: BenchmarkStatus
+    started_at: datetime
+    total_tasks: int
+    finished_tasks: int
+
+
 class StartRunRequest(BaseModel):
-    contract_name: str
+    contract: AgentContractRequest
     benchmark_name: str
     concurrency: int = 5
     task_ids: list[str] | None = None
@@ -37,13 +53,6 @@ class StartRunResponse(BaseModel):
     concurrency: int
     started_at: datetime
     task_count: int
-
-
-class BenchmarkDetails(BaseModel):
-    status: BenchmarkStatus
-    started_at: datetime
-    total_tasks: int
-    finished_tasks: int
 
 
 class FetchBenchmarkResponse(BaseModel):

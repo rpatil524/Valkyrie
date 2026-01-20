@@ -118,7 +118,7 @@ async def start_run(
     - 400 Bad Request if parameters are invalid
     - 500 Internal Server Error if run fails to start
     """
-    logger.info(f"Starting benchmark run - contract: {request.contract_name}, benchmark: {request.benchmark_name}")
+    logger.info(f"Starting benchmark run - contract: {request.contract.name}, benchmark: {request.benchmark_name}")
 
     benchmark_service = request.benchmark_service
 
@@ -153,7 +153,7 @@ async def start_run(
 
     return StartRunResponse(
         benchmark_name=benchmark_row.name,
-        contract_name=request.contract_name,
+        contract_name=request.contract.name,
         benchmark_id=benchmark_row.id,
         concurrency=request.concurrency,
         started_at=benchmark_row.started_at,
@@ -290,8 +290,10 @@ async def resume_run(benchmark_id: UUID, session: Session = Depends(get_session)
 
     start_run_request = benchmark_row.start_run_request
 
+    benchmark_service = start_run_request.benchmark_service
+
     # prepare benchmark and tasks to be resumed
-    verified_task_ids = await resume_benchmark(benchmark_row, session, start_run_request.benchmark_service)
+    verified_task_ids = await resume_benchmark(benchmark_row, session, benchmark_service)
 
     # start the benchmark with the same args used to create it
     # we will delegate inside what tasks we are running
