@@ -204,7 +204,7 @@ async def fetch_benchmark(
     )
 
 
-@app.get("/retrieve-results", response_model_exclude_none=True)
+@app.get("/retrieve-results")
 async def retrieve_results(benchmark_id: UUID, session: Session = Depends(get_session)) -> RetrieveResultsResponse:
     """
     Retrieve the results of a benchmark by its id.
