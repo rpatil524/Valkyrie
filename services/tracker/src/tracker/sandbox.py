@@ -71,6 +71,7 @@ async def create_sandbox(
     finally:
         logger.info(f"Deleting sandbox {sandbox.name}")
         await daytona.delete(sandbox)
+        await daytona.close()
 
 
 async def upload_agent_artifacts(sandbox: AsyncSandbox, contract: AgentContractRequest) -> None:
