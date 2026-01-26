@@ -1,3 +1,4 @@
+import traceback
 from uuid import UUID
 
 from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, UploadFile
@@ -140,7 +141,7 @@ async def start_run(
             task_ids=request.task_ids, slice_str=request.slice_str
         )
     except Exception as e:
-        error_message = str(e)
+        error_message = f"{str(e)}\n{traceback.format_exc()}"
         commit_benchmark_error(benchmark_row, session, error_message)
         error_response = StartRunErrorResponse(
             benchmark_id=benchmark_row.id,
@@ -233,6 +234,7 @@ async def retrieve_results(benchmark_id: UUID, session: Session = Depends(get_se
     return RetrieveResultsResponse(
         benchmark_name=benchmark_row.name,
         status=benchmark_row.status,
+        error_message=benchmark_row.error_message,
         benchmark_id=benchmark_row.id,
         benchmark_arguments=benchmark_row.arguments,
         tasks_stopped=tasks_stopped or None,  # NOTE: Only include if we stopped the benchmark

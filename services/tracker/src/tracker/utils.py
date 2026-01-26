@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import json
+import traceback
 from asyncio import Semaphore, gather
 from collections.abc import AsyncGenerator, Coroutine
 from datetime import datetime
@@ -377,7 +378,7 @@ async def process_benchmark(
 
             set_benchmark_final_status(benchmark_row, session)
         except Exception as e:
-            error_message = str(e)
+            error_message = f"{str(e)}\n{traceback.format_exc()}"
             commit_benchmark_error(benchmark_row, session, error_message)
 
 
@@ -401,7 +402,7 @@ class BenchmarkContext:
 
     @cached_property
     def _task_counts(self) -> TaskCounts:
-        finished_statuses = [TaskStatus.FINISHED, TaskStatus.ERROR]
+        finished_statuses = [TaskStatus.FINISHED, TaskStatus.ERROR, TaskStatus.STOPPED]
 
         statement = (
             select(
@@ -419,6 +420,30 @@ class BenchmarkContext:
 
         return task_counts
 
+    @property
+    def _task_breakdown(self) -> dict[TaskStatus, int]:
+        """
+        Returns a mapping between the task status and the number of tasks in that status
+
+        Provides a breakdown of the benchmark.
+        """
+        statement = (
+            select(Task.status, func.count(col(Task.id)))
+            .select_from(Task)
+            .where(Task.benchmark == self._benchmark_row.id)
+            .group_by(Task.status)
+            .having(func.count(col(Task.id)) > 0)  # Exclude all with count of 0
+        )
+
+        result = self._session.exec(statement).all()
+
+        if not result:
+            raise TrackerServiceError(
+                f"No tasks have been discovered for benchmark {self._benchmark_row.id}, cannot provide task breakdown"
+            )
+
+        return {TaskStatus(status): count for status, count in result}
+
     @cached_property
     def benchmark_details(self) -> BenchmarkDetails:
         return BenchmarkDetails(
@@ -426,6 +451,7 @@ class BenchmarkContext:
             started_at=self._benchmark_row.started_at,
             total_tasks=self._task_counts.total_tasks,
             finished_tasks=self._task_counts.finished_tasks,
+            task_breakdown=self._task_breakdown,
         )
 
 

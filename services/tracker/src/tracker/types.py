@@ -15,6 +15,7 @@ from tracker.database.models import (
     BenchmarkArguments,
     BenchmarkStatus,
     FinalEvaluation,
+    TaskStatus,
 )
 
 if TYPE_CHECKING:
@@ -26,6 +27,7 @@ class BenchmarkDetails(BaseModel):
     started_at: datetime
     total_tasks: int
     finished_tasks: int
+    task_breakdown: dict[TaskStatus, int]
 
 
 class StartRunRequest(BaseModel):
@@ -65,12 +67,13 @@ class FetchBenchmarkResponse(BaseModel):
 class RetrieveResultsResponse(BaseModel):
     benchmark_name: str
     status: BenchmarkStatus
+    error_message: str | None
     benchmark_id: UUID
     benchmark_arguments: BenchmarkArguments
-    tasks_stopped: int | None = None
-    final_evaluation: FinalEvaluation | None = None
-    evaluation_results: dict[str, dict[str, Any]] | None = None
-    task_errors: dict[str, str] | None = None
+    tasks_stopped: int | None
+    final_evaluation: FinalEvaluation | None
+    evaluation_results: dict[str, dict[str, Any]] | None
+    task_errors: dict[str, str] | None
 
 
 class FinalScoreResponse(BaseModel):
