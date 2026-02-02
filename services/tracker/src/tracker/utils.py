@@ -1,5 +1,4 @@
 import asyncio
-import hashlib
 import json
 import traceback
 from asyncio import Semaphore, gather
@@ -11,25 +10,25 @@ from typing import Any, NamedTuple, Sequence
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
+from daytona import AsyncDaytona, AsyncPaginatedSandboxes, AsyncSandbox, SandboxState
 from sqlmodel import Session, asc, case, col, desc, func, select, update
 
 from tracker.benchmark_service import BenchmarkService
 from tracker.config import broker
-from tracker.database.models import Benchmark, EvaluationResult, FinalEvaluation, Task, TaskStatus
+from tracker.database.models import Benchmark, BenchmarkStatus, EvaluationResult, FinalEvaluation, Task, TaskStatus
 from tracker.database.session import engine
 from tracker.exceptions import TrackerServiceError
 from tracker.logger import get_logger
 from tracker.sandbox import create_sandbox, install_agent_dependencies, run_agent, upload_agent_artifacts
 from tracker.types import (
     BenchmarkDetails,
-    BenchmarkStatus,
     FetchBenchmarkResponse,
     FetchBenchmarksRequest,
     Order,
     StartRunRequest,
 )
 
-logger = get_logger(__name__, stream=True)
+logger = get_logger(__name__)
 
 
 class TrackedTaskStatus(str, Enum):
@@ -176,8 +175,17 @@ async def process_task(
     benchmark_id: UUID,
     task_id: str,
 ) -> dict[str, dict[str, Any] | None]:
+    """
+    Processes a task and returns the evaluation result
+
+    NOTE: When we close the sandbox the agent process will be killed and we will instantly go to evaluating,
+    the evaluation will fail since the instance no longer exists. We handle this inside of the exception caught.
+    """
     with Session(bind=engine, expire_on_commit=False) as task_session:
         benchmark_row = fetch_benchmark_row(benchmark_id, task_session)
+
+        # Merge the task row to get the latest state from the database
+        task_row = task_session.merge(task_row)
 
         # If user has requested to stop the benchmark we exit before we process the task
         if benchmark_row.status == BenchmarkStatus.STOPPING:
@@ -187,63 +195,74 @@ async def process_task(
         try:
             task_data = await benchmark_service.request_retrieve_task(task_id=task_id)
 
-            task_row = task_session.merge(task_row)
-            task_row.status = TaskStatus.IN_PROGRESS
-            task_session.add(task_row)
-            task_session.commit()
-
-            # Generate a hash suffix shared across all tasks in a single benchmark to ensure that you can run more than one benchmark at a time
-            hash_suffix = hashlib.md5(
-                f"{benchmark_row.id}-{benchmark_row.started_at.isoformat()}".encode()
-            ).hexdigest()[:5]
+            # Labels that show up in the UI we can use to filter sandboxes
+            labels = {
+                "Benchmark": benchmark_row.name,
+                "Id": str(benchmark_row.id),
+                "Task": task_row.task_id,
+            }
 
             async with create_sandbox(
-                benchmark_service.daytona_client,
-                task_row.task_id,
-                task_data.docker_image,
-                hash_suffix,
-                start_run_request.contract.env,
+                daytona=benchmark_service.daytona_client,
+                sandbox_name=task_row.alias,
+                image=task_data.docker_image,
+                labels=labels,
+                env_vars=start_run_request.contract.env,
             ) as sandbox:
-                # Upload the contract to the sandbox after creating and install the dependencies
-                await upload_agent_artifacts(sandbox, start_run_request.contract)
-                await install_agent_dependencies(sandbox, start_run_request.contract)
+                try:
+                    task_row.status = TaskStatus.IN_PROGRESS
+                    task_session.add(task_row)
+                    task_session.commit()
 
-                # Setup task if requested
-                if task_data.request_setup:
-                    _ = await benchmark_service.request_setup_task(task_row.task_id, sandbox.id)
+                    # Upload the contract to the sandbox after creating and install the dependencies
+                    await upload_agent_artifacts(sandbox, start_run_request.contract)
+                    await install_agent_dependencies(sandbox, start_run_request.contract)
 
-                # Run the agent inside of the sandbox
-                # NOTE: Currently only testing when agent does not need a response, in the future run agent will return a json to evaluate it needed
-                await run_agent(
-                    sandbox, start_run_request.contract, task_data.problem_statement, task_id, task_data.cwd
-                )
+                    # Setup task if requested
+                    if task_data.request_setup:
+                        _ = await benchmark_service.request_setup_task(task_row.task_id, sandbox.id)
 
-                # Update the status to evaluating once we finish running the agent
-                task_row.status = TaskStatus.EVALUATING
-                task_session.add(task_row)
-                task_session.commit()
+                    # Run the agent inside of the sandbox
+                    # NOTE: Currently only testing when agent does not need a response, in the future run agent will return a json to evaluate it needed
+                    await run_agent(
+                        sandbox, start_run_request.contract, task_data.problem_statement, task_id, task_data.cwd
+                    )
 
-                # Evaluate the instance
-                # NOTE: only really good for when we need to evaluate the container (for just evaluating a text response we can delegate before this)
-                logger.info(f"Evaluating agent {start_run_request.contract.name} in sandbox {sandbox.name}")
-                evaluation_result = await benchmark_service.request_evaluate_instance(task_row.task_id, sandbox.id)
+                    # Update the status to evaluating once we finish running the agent
+                    task_row.status = TaskStatus.EVALUATING
+                    task_session.add(task_row)
+                    task_session.commit()
 
-                # Save the evaluation result to the database with the task row
-                evaluation_result_row = EvaluationResult(
-                    task=task_row.id, instance_id=sandbox.id, result=evaluation_result
-                )
-                task_session.add(evaluation_result_row)
+                    # Evaluate the instance
+                    # NOTE: only really good for when we need to evaluate the container (for just evaluating a text response we can delegate before this)
+                    logger.info(f"Evaluating agent {start_run_request.contract.name} in sandbox {sandbox.name}")
+                    evaluation_result = await benchmark_service.request_evaluate_instance(task_row.task_id, sandbox.id)
 
-                # Mark the task status as finished since we have finished processing the task
-                task_row.status = TaskStatus.FINISHED
-                task_session.add(task_row)
-                task_session.commit()
+                    # Save the evaluation result to the database with the task row
+                    evaluation_result_row = EvaluationResult(
+                        task=task_row.id, instance_id=sandbox.id, result=evaluation_result
+                    )
+                    task_session.add(evaluation_result_row)
 
-                return {task_id: evaluation_result_row.result}
+                    # Mark the task status as finished since we have finished processing the task
+                    task_row.status = TaskStatus.FINISHED
+                    task_session.add(task_row)
+                    task_session.commit()
+
+                    return {task_id: evaluation_result_row.result}
+                except Exception as e:
+                    # Error can come from the sandbox being destroyed
+                    task_session.refresh(task_row)
+                    if task_row.status == TaskStatus.STOPPED:
+                        return {task_id: None}
+
+                    raise e from e
         except Exception as e:
-            error_message = str(e)
+            error_message = f"{str(e)}\n{traceback.format_exc()}"
             logger.error(error_message)
+
             commit_task_error(task_row, task_session, error_message)
+
             return {task_id: None}
 
 
@@ -387,6 +406,8 @@ async def process_benchmark(
         except Exception as e:
             error_message = f"{str(e)}\n{traceback.format_exc()}"
             commit_benchmark_error(benchmark_row, session, error_message)
+        finally:
+            await benchmark_service.daytona_client.close()
 
 
 class TaskCounts(NamedTuple):
@@ -503,10 +524,13 @@ async def stream_benchmark_results(benchmark_id: UUID, session: Session) -> Asyn
     Returns:
         AsyncGenerator[str]
     """
+    PULL_INTERVAL = 5
+
     EVENT_COMPLETE = "event: complete\n\n"
     EVENT_ERROR = "event: error\ndata:"
     DATA_PREFIX = "data:"
     DISCONNECT = "event: disconnect\n\n"
+
     try:
         while True:
             with Session(bind=session.bind) as fresh_session:
@@ -530,14 +554,14 @@ async def stream_benchmark_results(benchmark_id: UUID, session: Session) -> Asyn
                     yield EVENT_COMPLETE
                     break
 
-            await asyncio.sleep(60)
+            await asyncio.sleep(PULL_INTERVAL)
 
     except asyncio.CancelledError:
         logger.info(f"Client disconnected from benchmark {benchmark_id} stream")
         yield DISCONNECT
 
 
-async def stop_benchmark(benchmark_row: Benchmark, session: Session) -> None:
+async def stop_benchmark(benchmark_row: Benchmark, session: Session, force: bool) -> None:
     """
     Sets the flags to initiate the stopping process for a benchmark.
 
@@ -547,35 +571,116 @@ async def stop_benchmark(benchmark_row: Benchmark, session: Session) -> None:
     NOTE: Tasks that have already started will continue to run and finish.
     """
     try:
-        # Check if there are any tasks yet that have not been started yet
-        tasks = session.exec(
-            select(func.count(col(Task.id)))
-            .where(col(Task.benchmark) == benchmark_row.id)
-            .where(col(Task.status) == TaskStatus.STARTING)
-        ).one()
-
-        if not tasks:
-            raise TrackerServiceError(
-                f"All tasks for benchmark {benchmark_row.id} have been started. Must wait for the tasks to finish running."
-            )
-
-        # Set the benchmark status to stopping to initiate the stopping process
-        benchmark_row.status = BenchmarkStatus.STOPPING
-        session.add(benchmark_row)
-        session.commit()
-
-        # Stop all tasks that have not been started yet from starting by setting the stop flag
-        session.exec(
+        # Update all rows where tasks are starting to stopped
+        result = session.exec(
             update(Task)
             .where(col(Task.benchmark) == benchmark_row.id)
             .where(col(Task.status) == TaskStatus.STARTING)
             .values(status=TaskStatus.STOPPED)
         )
         session.commit()
-    except TrackerServiceError:
-        raise
+
+        # If we have stopped any tasks or are forcing the benchmark to stop, set the benchmark status to stopping
+        if result.rowcount > 0 or force:
+            benchmark_row.status = BenchmarkStatus.STOPPING
+            session.add(benchmark_row)
+            session.commit()
     except Exception as e:
         raise TrackerServiceError(f"Unexpected error stopping benchmark {benchmark_row.id}: {str(e)}") from e
+
+
+async def stop_sandbox(
+    sandbox: AsyncSandbox, daytona_client: AsyncDaytona, session: Session, task_id: UUID | None
+) -> str | None:
+    try:
+        # Wait for the sandbox to be in a valid deletion state
+        await sandbox.wait_for_sandbox_start(timeout=0)
+
+        # Delete the sandbox
+        await daytona_client.delete(sandbox)
+
+        # Only update the task row if it is still in progress
+        if task_id:
+            session.exec(update(Task).where(col(Task.id) == task_id).values(status=TaskStatus.STOPPED))
+            session.commit()
+
+        return None
+    except Exception as e:
+        return f"{str(e)}: {traceback.format_exc()}"
+
+
+async def fetch_sandboxes(benchmark_row: Benchmark, daytona_client: AsyncDaytona, page: int) -> AsyncPaginatedSandboxes:
+    return await daytona_client.list(
+        labels={"Benchmark": benchmark_row.name, "Id": str(benchmark_row.id)}, limit=10, page=page
+    )
+
+
+async def sandbox_generator(
+    benchmark_row: Benchmark, daytona_client: AsyncDaytona
+) -> AsyncGenerator[AsyncSandbox, None]:
+    """
+    Generator that yields all sandboxes for a given benchmark in paginated chunks of 10.
+
+    NOTE: At the time of this implementation there are several things weird with the dayyona api
+        1. If you delete the sandboxes in the list, the next page should be the first page (repopulated)
+        2. Final state is not DESTROYED, but rather DESTROYING
+        3. The total_pages count is not updated as you delete sandboxes
+    """
+
+    paginated_sandboxes: AsyncPaginatedSandboxes = await fetch_sandboxes(benchmark_row, daytona_client, 1)
+
+    total_pages = paginated_sandboxes.total_pages
+    while (paginated_sandboxes.page <= total_pages) and paginated_sandboxes.items:
+        sandboxes = paginated_sandboxes.items
+        for sandbox in sandboxes:
+            if sandbox.state in [SandboxState.DESTROYING, SandboxState.DESTROYED]:
+                continue
+
+            yield sandbox
+
+        # NOTE: Since we deleted the first 10 the first page will be populated with the next 10 sandboxes
+        paginated_sandboxes = await fetch_sandboxes(benchmark_row, daytona_client, int(paginated_sandboxes.page))
+
+
+async def force_stop_sandboxes(benchmark_row: Benchmark, session: Session) -> None:
+    """
+    Stops and deletes all sandboxes which are in progress or evaluating.
+    NOTE: If task is not in progress but sandbox exists, we kill it and leave the task status as is.
+
+    Raises:
+        TrackerServiceError: If there are any errors stopping the sandboxes
+    """
+    daytona_client: AsyncDaytona = benchmark_row.benchmark_service.daytona_client
+
+    # Create a mapping between all task primary key id and their task_id (that are pending or evaluating)
+    task_rows: Sequence[Task] = session.exec(
+        select(Task)
+        .where(col(Task.benchmark) == benchmark_row.id)
+        .where(col(Task.status).in_([TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING]))
+    ).all()
+
+    # Create a mapping upfront that we can use to update the task rows after stopping the sandboxes
+    task_metadata: dict[str, UUID] = {task.alias: task.id for task in task_rows}
+
+    # Iterate through each running sandbox and stop it, collecting error messages
+    results: dict[str, str | None] = {}
+    async for sandbox in sandbox_generator(benchmark_row, daytona_client):
+        # If task id does not exist, the task is finished and we can just close the sandbox
+        # Edge case where the sandbox is hanging
+        task_id: UUID | None = task_metadata.get(sandbox.name)
+        if not task_id:
+            logger.info(f"Discovered sandbox not being tracked with the name {sandbox.name}. Closing sandbox.")
+
+        result = await stop_sandbox(sandbox, daytona_client, session, task_id if task_id else None)
+
+        results[sandbox.name] = result
+
+    error_message: str = "\n".join(
+        f"{task_alias}: {error_message}" for task_alias, error_message in results.items() if error_message
+    )
+
+    if error_message:
+        raise TrackerServiceError(f"Unexpected errors stopping sandboxes:\n{error_message}")
 
 
 async def resume_benchmark(

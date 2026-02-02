@@ -12,16 +12,17 @@ from daytona import (
     AsyncDaytona,
     AsyncSandbox,
     CreateSandboxFromImageParams,
+    DaytonaNotFoundError,
     FileUpload,
-    Image,
     Resources,
+    SandboxState,
     SessionExecuteRequest,
 )
 
+from tracker.database.models import AgentContractRequest
 from tracker.exceptions import SandboxError
 from tracker.logger import get_logger
 from tracker.s3 import download_from_s3, get_contract_s3_key
-from tracker.types import AgentContractRequest
 
 logger = get_logger(__name__)
 
@@ -36,27 +37,39 @@ def get_contract_path(contract_name: str) -> PurePosixPath:
     return bundle_path / contract_name
 
 
+async def delete_sandbox(sandbox: AsyncSandbox, daytona: AsyncDaytona) -> None:
+    """Delete sandbox if it is not already destroyed or being destroyed"""
+    try:
+        await sandbox.refresh_data()
+        if sandbox.state not in [SandboxState.DESTROYING, SandboxState.DESTROYED]:
+            await daytona.delete(sandbox)
+    except DaytonaNotFoundError:
+        # If we error here that means the sandbox has just been deleted before we could refresh the state
+        logger.warning(f"Sandbox `{sandbox.name}` has already been terminated")
+        pass
+    except Exception as e:
+        logger.error(f"Unexpected error deleting sandbox {sandbox.name}: {e}")
+
+
 @asynccontextmanager
 async def create_sandbox(
     daytona: AsyncDaytona,
     sandbox_name: str,
     image: str,
-    hash_suffix: str | None = None,
+    labels: dict[str, str] | None = None,
     env_vars: dict[str, str] | None = None,
 ) -> AsyncGenerator[AsyncSandbox, Any]:
     """
-    Create a sandbox with the given name and image.
+    Create a sandbox with the given name, image, and labels.
     Automatically cleans up the sandbox when the context manager exits.
     """
     logger.info(f"Creating sandbox {sandbox_name} with image {image}")
 
-    if hash_suffix:
-        sandbox_name = f"{sandbox_name}-{hash_suffix}"
-
     sandbox = await daytona.create(
         CreateSandboxFromImageParams(
             name=sandbox_name,
-            image=Image.base(image),
+            labels=labels,
+            image=image,
             network_block_all=False,
             resources=Resources(
                 cpu=4,
@@ -71,9 +84,7 @@ async def create_sandbox(
     try:
         yield sandbox
     finally:
-        logger.info(f"Deleting sandbox {sandbox.name}")
-        await daytona.delete(sandbox)
-        await daytona.close()
+        await delete_sandbox(sandbox, daytona)
 
 
 async def upload_agent_artifacts(sandbox: AsyncSandbox, contract: AgentContractRequest) -> None:
@@ -153,7 +164,7 @@ async def run_agent(
         await sandbox.process.create_session(session_id)
 
         session_exec_resp = await sandbox.process.execute_session_command(
-            session_id, SessionExecuteRequest(command=f"cd {cwd} && {run_cmd}", runAsync=True)
+            session_id, SessionExecuteRequest(command=f"cd {cwd} && {run_cmd}", run_async=True)
         )
 
         cmd_id = session_exec_resp.cmd_id
@@ -179,4 +190,9 @@ async def run_agent(
 
         return ""
     finally:
-        await sandbox.process.delete_session(session_id)
+        try:
+            await sandbox.process.delete_session(session_id)
+        except Exception:
+            # NOTE: If we kill the sandbox this sometimes errors
+            logger.error(f"Caught failure to delete session `{session_id}`")
+            pass
