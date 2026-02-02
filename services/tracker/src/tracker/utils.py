@@ -11,7 +11,7 @@ from uuid import UUID
 from zoneinfo import ZoneInfo
 
 from daytona import AsyncDaytona, AsyncPaginatedSandboxes, AsyncSandbox, SandboxState
-from sqlmodel import Session, asc, case, col, delete, desc, func, select, update
+from sqlmodel import Session, asc, case, col, delete, desc, func, or_, select, update
 
 from tracker.benchmark_service import BenchmarkService
 from tracker.config import broker
@@ -684,11 +684,13 @@ async def force_stop_sandboxes(benchmark_row: Benchmark, session: Session) -> No
 
 
 async def resume_benchmark(
-    benchmark_row: Benchmark, session: Session, benchmark_service: BenchmarkService, retry: bool
+    benchmark_row: Benchmark, session: Session, benchmark_service: BenchmarkService, retry: bool, force: list[str]
 ) -> list[str]:
     """
     Resets benchmark and task status to flag resuming the benchmark.
-    if user requests to retry tasks, we reset objects with an error status ontop of the stopped status
+
+    Retry: we reset objects with an error status ontop of the stopped status
+    Force: even if task has been finished we restart it
 
     Benchmark - In progress status
     Tasks - Starting status
@@ -700,18 +702,31 @@ async def resume_benchmark(
         if retry:
             retry_statuses.append(TaskStatus.ERROR)
 
-        filter_query = (col(Task.benchmark) == benchmark_row.id, col(Task.status).in_(retry_statuses))
+        filter_query = [
+            col(Task.benchmark) == benchmark_row.id,
+            or_(
+                col(Task.status).in_(retry_statuses),
+                col(Task.task_id).in_(force),
+            ),
+        ]
 
         # Check if there are any tasks that have been stopped
         task_ids = session.exec(select(Task.id, Task.task_id).where(*filter_query)).all()
+
+        # id is task row primary key, task_id is the task id
+        task_mapping: dict[UUID, str] = {id: task_id for id, task_id in task_ids}
+
+        # Ensure we are not missing any tasks that were requested (skips if force is empty)
+        missing_task_ids = [task_id for task_id in force if task_id not in task_mapping.values()]
+        if missing_task_ids:
+            raise TrackerServiceError(
+                f"{', '.join(missing_task_ids)} was requested to be force resumed but does not exist in the dataset"
+            )
 
         if not task_ids:
             raise TrackerServiceError(
                 f"No tasks for benchmark {benchmark_row.id} can be resumed because all tasks are finished"
             )
-
-        # id is task row primary key, task_id is the task id
-        task_mapping: dict[UUID, str] = {id: task_id for id, task_id in task_ids}
 
         # Verify the task ids are still valid before priming to resume
         # Raises if any task ids are invalid
