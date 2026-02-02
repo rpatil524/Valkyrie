@@ -51,6 +51,7 @@ class AgentContractRequest(BaseModel):
     artifacts: list[str] = []
     install_cmd: str
     run_cmd: str
+    final_output: str | None = None
     env: dict[str, str] = {}
 
 
@@ -269,4 +270,4 @@ class EvaluationResult(SQLModel, table=True):
     task: UUID = Field(foreign_key="task.id")
     instance_id: str = Field(unique=True)
     result: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON, nullable=False))
-    agent_output: str = Field(default="")
+    agent_output: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON, nullable=False))

@@ -126,16 +126,19 @@ class TestSandboxOperations:
 
         mock_stream_logger.info.side_effect = mock_info
 
-        run_cmd = "echo line1 && sleep 1 && echo line2 && sleep 1 && echo line3"
+        run_cmd = 'echo line1 && sleep 1 && echo line2 && sleep 1 && echo line3 && echo \'{"result": "hello world"}\' > /tmp/agent_output.json'
 
         contract = AgentContractRequest(
             name="test_agent",
             artifacts=[],
             install_cmd="echo 'no-op'",
             run_cmd=run_cmd,
+            final_output="/tmp/agent_output.json",
         )
 
-        await run_agent(test_sandbox, contract, "some problem statement", "some task id", cwd="/")
+        final_output = await run_agent(test_sandbox, contract, "some problem statement", "some task id", cwd="/")
+
+        assert final_output == {"result": "hello world"}
 
         output = "\n".join(logged_messages)
         assert "line1" in output

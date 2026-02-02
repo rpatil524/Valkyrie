@@ -223,8 +223,7 @@ async def process_task(
                         _ = await benchmark_service.request_setup_task(task_row.task_id, sandbox.id)
 
                     # Run the agent inside of the sandbox
-                    # NOTE: Currently only testing when agent does not need a response, in the future run agent will return a json to evaluate it needed
-                    await run_agent(
+                    agent_output = await run_agent(
                         sandbox, start_run_request.contract, task_data.problem_statement, task_id, task_data.cwd
                     )
 
@@ -240,7 +239,7 @@ async def process_task(
 
                     # Save the evaluation result to the database with the task row
                     evaluation_result_row = EvaluationResult(
-                        task=task_row.id, instance_id=sandbox.id, result=evaluation_result
+                        task=task_row.id, instance_id=sandbox.id, result=evaluation_result, agent_output=agent_output
                     )
                     task_session.add(evaluation_result_row)
 
@@ -495,6 +494,9 @@ def fetch_evaluation_results(benchmark_id: UUID, session: Session) -> dict[str, 
     evaluation_results: dict[str, dict[str, Any]] = {}
     for evaluation_result, task_id in results:
         result_data = evaluation_result.result
+        if evaluation_result.agent_output:
+            result_data["agent_output"] = evaluation_result.agent_output
+
         evaluation_results[task_id] = result_data
 
     return evaluation_results
