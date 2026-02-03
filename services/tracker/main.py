@@ -17,21 +17,21 @@ from tracker.types import (
     FetchBenchmarkResponse,
     FetchBenchmarksRequest,
     FetchBenchmarksResponse,
-    ResumeRunResponse,
+    ResumeBenchmarkResponse,
     RetrieveResultsResponse,
-    StartRunErrorResponse,
-    StartRunRequest,
-    StartRunResponse,
-    StopRunResponse,
+    StartBenchmarkErrorResponse,
+    StartBenchmarkRequest,
+    StartBenchmarkResponse,
+    StopBenchmarkResponse,
 )
 from tracker.utils import (
     BenchmarkContext,
     commit_benchmark_error,
     fetch_filtered_benchmark_rows,
     force_stop_sandboxes,
+    initiate_resume_benchmark,
+    initiate_stop_benchmark,
     process_benchmark,
-    resume_benchmark,
-    stop_benchmark,
     stream_benchmark_results,
 )
 
@@ -103,26 +103,26 @@ async def upload_contract_to_s3(
     }
 
 
-@app.post("/start-run")
-async def start_run(
-    request: StartRunRequest,
+@app.post("/start-benchmark")
+async def start_benchmark(
+    request: StartBenchmarkRequest,
     session: Session = Depends(get_session),
-) -> StartRunResponse:
+) -> StartBenchmarkResponse:
     """
     Start a benchmark run with the uploaded contract.
 
     Usage:
-    curl -X POST http://<endpoint>/start-run \
+    curl -X POST http://<endpoint>/start-benchmark \
       -H "Content-Type: application/json" \
       -d '{"agent_name": "claude_code", "benchmark_name": "swebench", "task_ids": ["astropy__astropy-12907"]}'
 
     Returns:
-        StartRunResponse
+        StartBenchmarkResponse
 
     Returns:
-    - 200 OK if run starts successfully
+    - 200 OK if benchmark starts successfully
     - 400 Bad Request if parameters are invalid
-    - 500 Internal Server Error if run fails to start
+    - 500 Internal Server Error if benchmark fails to start
     """
     logger.info(f"Starting benchmark run - contract: {request.contract.name}, benchmark: {request.benchmark_name}")
 
@@ -132,7 +132,7 @@ async def start_run(
     _ = await benchmark_service.request_health_check()
 
     # Create benchmark row inside of database to mark start of the benchmark
-    benchmark_row = BenchmarkService.start_run_request_to_benchmark_object(request)
+    benchmark_row = BenchmarkService.start_benchmark_request_to_benchmark_object(request)
     session.add(benchmark_row)
     session.commit()
 
@@ -144,7 +144,7 @@ async def start_run(
     except Exception as e:
         error_message = f"{str(e)}\n{traceback.format_exc()}"
         commit_benchmark_error(benchmark_row, session, error_message)
-        error_response = StartRunErrorResponse(
+        error_response = StartBenchmarkErrorResponse(
             benchmark_id=benchmark_row.id,
             error_message=error_message,
         )
@@ -152,12 +152,12 @@ async def start_run(
         raise TrackerServiceError(error_response.model_dump_json()) from e
 
     await process_benchmark.kiq(
-        start_run_request_json=request.model_dump(),
+        start_benchmark_request_json=request.model_dump(),
         benchmark_id_str=str(benchmark_row.id),
         verified_task_ids=verify_response.task_ids,
     )
 
-    return StartRunResponse(
+    return StartBenchmarkResponse(
         benchmark_name=benchmark_row.name,
         agent_name=request.contract.name,
         benchmark_id=benchmark_row.id,
@@ -245,19 +245,19 @@ async def retrieve_results(benchmark_id: UUID, session: Session = Depends(get_se
     )
 
 
-@app.post("/stop-run/{benchmark_id}")
-async def stop_run(
+@app.post("/stop-benchmark/{benchmark_id}")
+async def stop_benchmark(
     benchmark_id: UUID, force: bool = Query(default=False), session: Session = Depends(get_session)
-) -> StopRunResponse:
+) -> StopBenchmarkResponse:
     """
-    Stop a benchmark run by its id.
+    Stop a benchmark by its id.
     If force is True, the sandboxes will be stopped and deleted, even if the tasks are in progress.
 
     Usage:
-    curl -X POST http://<endpoint>/stop-run/<benchmark_id>?force=true
+    curl -X POST http://<endpoint>/stop-benchmark/<benchmark_id>?force=true
 
     Returns:
-        StopRunResponse
+        StopBenchmarkResponse
     """
     benchmark_row = session.get(Benchmark, benchmark_id)
     if not benchmark_row:
@@ -270,31 +270,31 @@ async def stop_run(
             detail=f"Benchmark {benchmark_id} is currently in the {benchmark_row.status} state. Can only pause an in progress benchmark.",
         )
 
-    await stop_benchmark(benchmark_row, session, force)
+    await initiate_stop_benchmark(benchmark_row, session, force)
 
     if force:
         await force_stop_sandboxes(benchmark_row, session)
 
-    return StopRunResponse(
+    return StopBenchmarkResponse(
         status="success",
     )
 
 
-@app.post("/resume-run/{benchmark_id}")
-async def resume_run(
+@app.post("/resume-benchmark/{benchmark_id}")
+async def resume_benchmark(
     benchmark_id: UUID,
     retry: bool = Query(default=False),
     force: list[str] = Body(default=[]),
     session: Session = Depends(get_session),
-) -> ResumeRunResponse:
+) -> ResumeBenchmarkResponse:
     """
     Resume a benchmark run by its id.
 
     Usage:
-    curl -X POST http://<endpoint>/resume-run/<benchmark_id>?retry=true
+    curl -X POST http://<endpoint>/resume-benchmark/<benchmark_id>?retry=true
       -d '{"force": ["task_id_1", "task_id_2"]}'
     Returns:
-        ResumeRunResponse
+        ResumeBenchmarkResponse
     """
     benchmark_row = session.get(Benchmark, benchmark_id)
     if not benchmark_row:
@@ -306,22 +306,22 @@ async def resume_run(
             detail=f"Benchmark {benchmark_id} is in the {benchmark_row.status} state. Must be in the stopped state to resume.",
         )
 
-    start_run_request = benchmark_row.start_run_request
+    start_benchmark_request = benchmark_row.start_benchmark_request
 
-    benchmark_service = start_run_request.benchmark_service
+    benchmark_service = start_benchmark_request.benchmark_service
 
     # prepare benchmark and tasks to be resumed
-    verified_task_ids = await resume_benchmark(benchmark_row, session, benchmark_service, retry, force)
+    verified_task_ids = await initiate_resume_benchmark(benchmark_row, session, benchmark_service, retry, force)
 
     # start the benchmark with the same args used to create it
     # we will delegate inside what tasks we are running
     await process_benchmark.kiq(
-        start_run_request_json=start_run_request.model_dump(),
+        start_benchmark_request_json=start_benchmark_request.model_dump(),
         benchmark_id_str=str(benchmark_row.id),
         verified_task_ids=verified_task_ids,
     )
 
-    return ResumeRunResponse(
+    return ResumeBenchmarkResponse(
         status="success",
     )
 

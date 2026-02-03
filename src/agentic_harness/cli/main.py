@@ -5,7 +5,7 @@ from uuid import UUID
 
 import click
 from tracker.database.models import BenchmarkStatus
-from tracker.types import Order, StartRunResponse
+from tracker.types import Order, StartBenchmarkResponse
 
 from agentic_harness.cli.bundler import get_agent_zip_stream, get_contract
 from agentic_harness.cli.exceptions import BundlerError, TrackerServiceError
@@ -13,7 +13,7 @@ from agentic_harness.cli.tracker_service import TrackerService
 from agentic_harness.cli.utils import (
     check_tracker_service_health,
     format_benchmark_status,
-    format_start_run_response,
+    format_start_benchmark_response,
     paginate_benchmarks,
     stream_benchmark_status,
 )
@@ -120,7 +120,7 @@ def start_benchmark(
 
             click.echo(f"\r\033[KStarting benchmark for: {contract.name}...", nl=False)
 
-            response = tracker.start_run(
+            response = tracker.start_benchmark(
                 contract,
                 benchmark,
                 concurrency,
@@ -134,7 +134,7 @@ def start_benchmark(
                 click.echo(response.text)
                 return
 
-            format_start_run_response(StartRunResponse.model_validate(response.json()))
+            format_start_benchmark_response(StartBenchmarkResponse.model_validate(response.json()))
     except (BundlerError, TrackerServiceError) as e:
         raise click.ClickException(str(e))
 
@@ -240,14 +240,14 @@ def retrieve_results(benchmark_id: UUID, path: Path):
     default=False,
     help="Force stop the benchmark run",
 )
-def stop_run(benchmark_id: UUID, force: bool):
+def stop_benchmark(benchmark_id: UUID, force: bool):
     """
-    Stop a benchmark run by its benchmark id.
+    Stop a benchmark by its benchmark id.
 
     Example:
-        harness stop-run --benchmark-id 123e4567-e89b-12d3-a456-426614174000
+        harness stop-benchmark --benchmark-id 123e4567-e89b-12d3-a456-426614174000
     """
-    click.echo(f"Stopping run for benchmark: {benchmark_id}")
+    click.echo(f"Stopping benchmark for benchmark: {benchmark_id}")
 
     if force:
         click.echo(click.style("Force stopping the benchmark", fg="yellow", bold=True))
@@ -256,7 +256,7 @@ def stop_run(benchmark_id: UUID, force: bool):
             if not check_tracker_service_health(tracker):
                 return
 
-            _ = tracker.stop_run(benchmark_id, force)
+            _ = tracker.stop_benchmark(benchmark_id, force)
             click.echo(
                 click.style(
                     "Run is currently being stopped. Will be stopped when all tasks in flight are finished.",
@@ -295,12 +295,12 @@ def stop_run(benchmark_id: UUID, force: bool):
     default=None,
     help="Force retry tasks with the given task ids (e.g., task_1_id task_2_id)",
 )
-def resume_run(benchmark_id: UUID, retry: bool, force: str | None):
+def resume_benchmark(benchmark_id: UUID, retry: bool, force: str | None):
     """
     Resume a benchmark run by its benchmark id.
 
     Example:
-        harness resume-run --benchmark-id 123e4567-e89b-12d3-a456-426614174000 --retry
+        harness resume-benchmark --benchmark-id 123e4567-e89b-12d3-a456-426614174000 --retry
     """
     click.echo(f"Resuming run for benchmark: {benchmark_id}")
     try:
@@ -309,7 +309,7 @@ def resume_run(benchmark_id: UUID, retry: bool, force: str | None):
                 return
 
             force_task_ids = force.split() if force else []
-            _ = tracker.resume_run(benchmark_id, retry, force_task_ids)
+            _ = tracker.resume_benchmark(benchmark_id, retry, force_task_ids)
             click.echo(click.style("Run resumed successfully!", fg="green", bold=True))
             click.echo(
                 click.style(

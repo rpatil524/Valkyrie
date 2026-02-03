@@ -38,8 +38,9 @@ class TestDatabaseIntegration:
     async def _create_evaluation_result(
         self, database_session: Session, task_row: Task, evaluation_result: dict[str, Any]
     ) -> EvaluationResult:
-        instance_id = evaluation_result["instance_id"]
-        evaluation_result_row = EvaluationResult(task=task_row.id, instance_id=instance_id, result=evaluation_result)
+        evaluation_result_row = EvaluationResult(
+            task=task_row.id, instance_id=str(uuid.uuid4()), result=evaluation_result
+        )
         database_session.add(evaluation_result_row)
 
         task_row.status = TaskStatus.FINISHED
@@ -129,8 +130,8 @@ class TestDatabaseIntegration:
         task_row = Task(task_id="task_id_1", benchmark=benchmark_row.id)
         database_session.add(task_row)
 
-        # When created its in starting status
-        assert task_row.status == TaskStatus.STARTING
+        # When created its in pending status
+        assert task_row.status == TaskStatus.PENDING
         assert task_row.finished_at is None
 
         # When the status is updated to finished, the finished_at timestamp should be set
@@ -195,7 +196,7 @@ class TestDatabaseIntegration:
         for task_id, task_row in zip(task_ids, fetched_tasks):
             assert task_row.task_id == task_id
             assert task_row.benchmark == benchmark_row.id
-            assert task_row.status == TaskStatus.STARTING
+            assert task_row.status == TaskStatus.PENDING
             assert task_row.started_at is not None
             assert task_row.finished_at is None
 

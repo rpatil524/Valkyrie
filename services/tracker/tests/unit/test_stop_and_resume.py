@@ -8,8 +8,8 @@ from main import app
 from tracker.benchmark_service import BenchmarkService
 from tracker.database.models import AgentContractRequest, BenchmarkStatus, Task, TaskStatus
 from tracker.database.session import get_session
-from tracker.types import FinalScoreResponse, RetrieveTaskResponse, StartRunRequest, VerifyTaskIdsResponse
-from tracker.utils import process_benchmark, resume_benchmark, stop_benchmark
+from tracker.types import FinalScoreResponse, RetrieveTaskResponse, StartBenchmarkRequest, VerifyTaskIdsResponse
+from tracker.utils import initiate_resume_benchmark, initiate_stop_benchmark, process_benchmark
 
 
 class TestStopAndResume:
@@ -61,8 +61,8 @@ class TestStopAndResume:
 
         Test Cases:
             - Start benchmark with 5 tasks
-            - 2 tasks are completed (finished), 3 are still starting
-            - Stop benchmark - 3 tasks are stopped (starting -> stopped)
+            - 2 tasks are completed (finished), 3 are still pending
+            - Stop benchmark - 3 tasks are stopped (pending -> stopped)
             - Resume benchmark - only the 3 tasks that are stopped should be resumed
             - Process benchmark - all 5 tasks should have evaluation results after completion
         """
@@ -80,14 +80,14 @@ class TestStopAndResume:
             "django__django-12858",
         ]
 
-        start_run_request = StartRunRequest(
+        start_benchmark_request = StartBenchmarkRequest(
             benchmark_name="swebench",
             contract=contract,
             concurrency=2,
             task_ids=task_ids,
         )
 
-        benchmark_row = BenchmarkService.start_run_request_to_benchmark_object(start_run_request)
+        benchmark_row = BenchmarkService.start_benchmark_request_to_benchmark_object(start_benchmark_request)
         database_session.add(benchmark_row)
         database_session.commit()
 
@@ -98,22 +98,22 @@ class TestStopAndResume:
         monkeypatch.setattr(BenchmarkService, "request_retrieve_task", self._mock_request_retrieve_task)
         monkeypatch.setattr(BenchmarkService, "request_final_score", self._mock_request_final_score)
 
-        # Create tasks - 2 tasks are finished, 3 tasks are starting
+        # Create tasks - 2 tasks are finished, 3 tasks are pending
         finished_task_ids = task_ids[:2]
-        starting_task_ids = task_ids[2:]
+        pending_task_ids = task_ids[2:]
 
         for task_id in finished_task_ids:
             task_row = Task(task_id=task_id, benchmark=benchmark_row.id, status=TaskStatus.FINISHED)
             database_session.add(task_row)
 
-        for task_id in starting_task_ids:
-            task_row = Task(task_id=task_id, benchmark=benchmark_row.id, status=TaskStatus.STARTING)
+        for task_id in pending_task_ids:
+            task_row = Task(task_id=task_id, benchmark=benchmark_row.id, status=TaskStatus.PENDING)
             database_session.add(task_row)
 
         database_session.commit()
 
-        # Stop benchmark - only tasks that are starting become stopped
-        await stop_benchmark(benchmark_row, database_session, force=False)
+        # Stop benchmark - only tasks that are pending become stopped
+        await initiate_stop_benchmark(benchmark_row, database_session, force=False)
 
         # Verify: 2 tasks are finished, 3 tasks are stopped
         finished_count = len(
@@ -134,24 +134,24 @@ class TestStopAndResume:
         database_session.add(benchmark_row)
         database_session.commit()
 
-        # Resume benchmark - mock verify to return only the starting task IDs
+        # Resume benchmark - mock verify to return only the pending task IDs
         monkeypatch.setattr(
             BenchmarkService,
             "request_verify_task_ids",
-            partial(self._mock_request_verify_task_ids, task_ids=starting_task_ids),
+            partial(self._mock_request_verify_task_ids, task_ids=pending_task_ids),
         )
 
-        verified_task_ids = await resume_benchmark(
-            benchmark_row, database_session, start_run_request.benchmark_service, retry=False, force=[]
+        verified_task_ids = await initiate_resume_benchmark(
+            benchmark_row, database_session, start_benchmark_request.benchmark_service, retry=False, force=[]
         )
 
         # Only 3 tasks should be verified for resume (the 3 tasks that are stopped)
         assert len(verified_task_ids) == 3
-        assert set(verified_task_ids) == set(starting_task_ids)
+        assert set(verified_task_ids) == set(pending_task_ids)
 
-        # Run process_benchmark to complete the remaining tasks (the 3 tasks that are starting)
+        # Run process_benchmark to complete the remaining tasks (the 3 tasks that are pending)
         await process_benchmark(
-            start_run_request.model_dump(),
+            start_benchmark_request.model_dump(),
             str(benchmark_row.id),
             verified_task_ids,
         )

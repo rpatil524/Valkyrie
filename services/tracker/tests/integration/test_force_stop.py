@@ -145,7 +145,7 @@ class TestForceStop:
         # Start the benchmark run with just 5 tasks
         benchmark_task = asyncio.create_task(
             process_benchmark(
-                start_run_request_json=example_benchmark_object.start_run_request.model_dump(),
+                start_benchmark_request_json=example_benchmark_object.start_benchmark_request.model_dump(),
                 benchmark_id_str=str(example_benchmark_object.id),
                 verified_task_ids=verify_response.task_ids,
             )
@@ -155,17 +155,17 @@ class TestForceStop:
         await asyncio.sleep(15)
 
         # Force stop the benchmark run with all sandboxes
-        response = client.post(f"/stop-run/{example_benchmark_object.id}?force=true")
+        response = client.post(f"/stop-benchmark/{example_benchmark_object.id}?force=true")
         assert response.status_code == 200
         assert response.json() == {"status": "success"}
 
         await benchmark_task
 
-        # Ensure no tasks are in starting state
+        # Ensure no tasks are in pending state
         pending_tasks = database_session.exec(
             select(Task)
             .where(Task.benchmark == example_benchmark_object.id)
-            .where(Task.status in [TaskStatus.STARTING, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING])
+            .where(Task.status in [TaskStatus.PENDING, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING])
         ).all()
         assert len(pending_tasks) == 0
 
