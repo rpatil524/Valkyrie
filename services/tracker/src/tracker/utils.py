@@ -6,7 +6,7 @@ from collections.abc import AsyncGenerator, Coroutine
 from datetime import datetime
 from enum import Enum
 from functools import cached_property
-from typing import Any, NamedTuple, Sequence
+from typing import Any, NamedTuple, Sequence, cast
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
@@ -114,9 +114,12 @@ class TaskMonitor:
 
         """
         self._session.expire_all()
+        self._session.refresh(self._benchmark_row)
+
         task_row = self._fetch_task_row(task_id)
 
-        if task_row.status == TaskStatus.STOPPED:
+        # If task has been stopped or benchmark has occured an error we need to exit
+        if task_row.status == TaskStatus.STOPPED or self._benchmark_row.status == BenchmarkStatus.ERROR:
             return False
 
         return True
@@ -325,15 +328,12 @@ def create_task_rows(
     # NOTE: Must maintain same order that was passed in
     task_ids_to_create = [task_id for task_id in verified_task_ids if task_id not in existing_task_ids]
 
-    created_task_rows: dict[str, Task] = {}
     for task_id in task_ids_to_create:
         task_row = Task(task_id=task_id, benchmark=benchmark_row.id)
-        created_task_rows[task_id] = task_row
+        session.add(task_row)
 
-    # Create the task rows if we need to add any new ones
-    if created_task_rows:
-        session.add_all(list(created_task_rows.values()))
-        session.commit()
+    session.commit()
+    session.expire_all()
 
     # Fetch all task rows with the status of pending
     pending_task_rows: Sequence[tuple[str, Task]] = session.exec(
@@ -341,6 +341,25 @@ def create_task_rows(
     ).all()
 
     return pending_task_rows
+
+
+async def fetch_missing_tasks(
+    session: Session, benchmark_row: Benchmark, evaluation_results: dict[str, dict[str, Any]]
+):
+    remaining_task_results_query = cast(
+        Sequence[tuple[str, dict[str, Any]]],
+        session.exec(
+            select(Task.task_id, EvaluationResult.result)  # pyright: ignore[reportUnknownArgumentType]
+            .join(EvaluationResult, col(Task.id) == col(EvaluationResult.task))
+            .where(col(Task.benchmark) == benchmark_row.id)
+            .where(col(Task.task_id).notin_(list(evaluation_results.keys())))
+        ).all(),
+    )
+
+    remaining_task_results: dict[str, dict[str, Any] | None] = {
+        task_id: evaluation_result for task_id, evaluation_result in remaining_task_results_query
+    }
+    return remaining_task_results
 
 
 @broker.task
@@ -396,6 +415,11 @@ async def process_benchmark(
                 for result_dict in evaluation_result_rows
                 for task_id, evaluation_result in result_dict.items()
             }
+
+            # Fetch remaining tasks (in case this benchmark was resumed)
+            remaining_task_results = await fetch_missing_tasks(session, benchmark_row, evaluation_results)
+
+            evaluation_results.update(remaining_task_results)
 
             # Calculate the final score based off the tasks that were ran
             final_score_response = await benchmark_service.request_final_score(evaluation_results=evaluation_results)
@@ -600,20 +624,13 @@ async def initiate_stop_benchmark(benchmark_row: Benchmark, session: Session, fo
         raise TrackerServiceError(f"Unexpected error stopping benchmark {benchmark_row.id}: {str(e)}") from e
 
 
-async def stop_sandbox(
-    sandbox: AsyncSandbox, daytona_client: AsyncDaytona, session: Session, task_id: UUID | None
-) -> str | None:
+async def stop_sandbox(sandbox: AsyncSandbox, daytona_client: AsyncDaytona) -> str | None:
     try:
         # Wait for the sandbox to be in a valid deletion state
         await sandbox.wait_for_sandbox_start(timeout=0)
 
         # Delete the sandbox
         await daytona_client.delete(sandbox)
-
-        # Only update the task row if it is still in progress
-        if task_id:
-            session.exec(update(Task).where(col(Task.id) == task_id).values(status=TaskStatus.STOPPED))
-            session.commit()
 
         return None
     except Exception as e:
@@ -663,26 +680,20 @@ async def force_stop_sandboxes(benchmark_row: Benchmark, session: Session) -> No
     """
     daytona_client: AsyncDaytona = benchmark_row.benchmark_service.daytona_client
 
-    # Create a mapping between all task primary key id and their task_id (that are pending or evaluating)
-    task_rows: Sequence[Task] = session.exec(
-        select(Task)
+    # Update all tasks being processed to stopped
+    session.exec(
+        update(Task)
         .where(col(Task.benchmark) == benchmark_row.id)
         .where(col(Task.status).in_([TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING]))
-    ).all()
+        .values(status=TaskStatus.STOPPED)
+    )
 
-    # Create a mapping upfront that we can use to update the task rows after stopping the sandboxes
-    task_metadata: dict[str, UUID] = {task.alias: task.id for task in task_rows}
+    session.commit()
 
     # Iterate through each running sandbox and stop it, collecting error messages
     results: dict[str, str | None] = {}
     async for sandbox in sandbox_generator(benchmark_row, daytona_client):
-        # If task id does not exist, the task is finished and we can just close the sandbox
-        # Edge case where the sandbox is hanging
-        task_id: UUID | None = task_metadata.get(sandbox.name)
-        if not task_id:
-            logger.info(f"Discovered sandbox not being tracked with the name {sandbox.name}. Closing sandbox.")
-
-        result = await stop_sandbox(sandbox, daytona_client, session, task_id if task_id else None)
+        result = await stop_sandbox(sandbox, daytona_client)
 
         results[sandbox.name] = result
 

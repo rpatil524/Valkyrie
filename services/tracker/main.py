@@ -263,11 +263,12 @@ async def stop_benchmark(
     if not benchmark_row:
         raise HTTPException(status_code=404, detail=f"Benchmark with id {benchmark_id} not found")
 
-    # Can only pause a in progress benchmark
-    if benchmark_row.status != BenchmarkStatus.IN_PROGRESS:
+    valid_stop_states = [BenchmarkStatus.IN_PROGRESS, BenchmarkStatus.ERROR, BenchmarkStatus.STOPPING]
+
+    if benchmark_row.status not in valid_stop_states:
         raise HTTPException(
             status_code=400,
-            detail=f"Benchmark {benchmark_id} is currently in the {benchmark_row.status} state. Can only pause an in progress benchmark.",
+            detail=f"Benchmark {benchmark_id} is currently in the {benchmark_row.status} state. Can only pause an in progress or error benchmark.",
         )
 
     await initiate_stop_benchmark(benchmark_row, session, force)
@@ -300,10 +301,12 @@ async def resume_benchmark(
     if not benchmark_row:
         raise HTTPException(status_code=404, detail=f"Benchmark with id {benchmark_id} not found")
 
-    if benchmark_row.status != BenchmarkStatus.STOPPED:
+    valid_resume_states = [BenchmarkStatus.STOPPED, BenchmarkStatus.ERROR]
+
+    if benchmark_row.status not in valid_resume_states:
         raise HTTPException(
             status_code=400,
-            detail=f"Benchmark {benchmark_id} is in the {benchmark_row.status} state. Must be in the stopped state to resume.",
+            detail=f"Benchmark {benchmark_id} is in the {benchmark_row.status} state. Must be in the stopped or error state to resume.",
         )
 
     start_benchmark_request = benchmark_row.start_benchmark_request
