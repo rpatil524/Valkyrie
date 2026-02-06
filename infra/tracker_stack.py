@@ -11,6 +11,7 @@ from aws_cdk import (
     aws_ecs_patterns,
     aws_elasticloadbalancingv2,
     aws_logs,
+    aws_rds,
     aws_route53,
     aws_s3,
     aws_secretsmanager,
@@ -29,6 +30,11 @@ from constants import (
     DAYTONA_SECRET_NAME,
     DAYTONA_TARGET,
     NAMESPACE,
+    POSTGRES_DB,
+    POSTGRES_PORT,
+    POSTGRES_USER,
+    RDS_ALLOCATED_STORAGE_GB,
+    RDS_INSTANCE_CLASS,
     REDIS_HEALTH_INTERVAL_SECONDS,
     REDIS_HEALTH_START_PERIOD_SECONDS,
     REDIS_PORT,
@@ -67,6 +73,41 @@ class TrackerStack(Stack):
             self,
             "DaytonaSecret",
             secret_name=DAYTONA_SECRET_NAME,
+        )
+
+        # RDS PostgreSQL instance
+        db_security_group = aws_ec2.SecurityGroup(
+            self,
+            f"{self._SERVICE_NAME}DbSecurityGroup",
+            vpc=vpc,
+            description="Security group for Tracker RDS instance",
+            allow_all_outbound=False,
+        )
+
+        # RDS credentials stored in Secrets Manager
+        db_credentials = aws_rds.DatabaseSecret(
+            self,
+            f"{self._SERVICE_NAME}DbCredentials",
+            username=POSTGRES_USER,
+        )
+
+        self.database = aws_rds.DatabaseInstance(
+            self,
+            f"{self._SERVICE_NAME}Database",
+            engine=aws_rds.DatabaseInstanceEngine.postgres(
+                version=aws_rds.PostgresEngineVersion.VER_16,
+            ),
+            instance_type=aws_ec2.InstanceType(RDS_INSTANCE_CLASS),
+            vpc=vpc,
+            vpc_subnets=aws_ec2.SubnetSelection(subnet_type=aws_ec2.SubnetType.PUBLIC),
+            security_groups=[db_security_group],
+            credentials=aws_rds.Credentials.from_secret(db_credentials),
+            database_name=POSTGRES_DB,
+            allocated_storage=RDS_ALLOCATED_STORAGE_GB,
+            publicly_accessible=True,  # Required for public subnet, access controlled by security group
+            deletion_protection=True,
+            removal_policy=cdk.RemovalPolicy.RETAIN,
+            backup_retention=Duration.days(7),
         )
 
         # fargate task
@@ -129,9 +170,14 @@ class TrackerStack(Stack):
                 "AWS_S3_BUCKET": bucket.bucket_name,
                 "DAYTONA_API_URL": DAYTONA_API_URL,
                 "DAYTONA_TARGET": DAYTONA_TARGET,
+                "DB_HOST": self.database.db_instance_endpoint_address,
+                "DB_PORT": self.database.db_instance_endpoint_port,
+                "DB_NAME": POSTGRES_DB,
             },
             secrets={
                 "DAYTONA_API_KEY": aws_ecs.Secret.from_secrets_manager(daytona_secret),
+                "DB_USERNAME": aws_ecs.Secret.from_secrets_manager(db_credentials, field="username"),
+                "DB_PASSWORD": aws_ecs.Secret.from_secrets_manager(db_credentials, field="password"),
             },
             health_check=aws_ecs.HealthCheck(
                 command=["CMD-SHELL", f"curl -f http://localhost:{TRACKER_PORT}/health || exit 1"],
@@ -142,12 +188,12 @@ class TrackerStack(Stack):
             ),
         )
 
-        # redis dependency
+        # sidecar dependencies
         tracker_container.add_container_dependencies(
             aws_ecs.ContainerDependency(
                 container=redis_container,
                 condition=aws_ecs.ContainerDependencyCondition.HEALTHY,
-            )
+            ),
         )
 
         task_def.default_container = tracker_container
@@ -213,3 +259,10 @@ class TrackerStack(Stack):
 
         # Grant S3 read/write permissions to the task
         bucket.grant_read_write(task_def.task_role)
+
+        # Allow Fargate service to connect to RDS
+        self.database.connections.allow_from(
+            self.service.service,
+            aws_ec2.Port.tcp(POSTGRES_PORT),
+            description="Allow Tracker Fargate service to connect to RDS",
+        )
