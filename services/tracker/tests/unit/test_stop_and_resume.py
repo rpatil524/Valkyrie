@@ -1,13 +1,12 @@
-from functools import partial
 from typing import Any
 
+from fastapi.testclient import TestClient
 from pytest import MonkeyPatch
 from sqlmodel import Session, select
 
 from main import app
 from tracker.benchmark_service import BenchmarkService
 from tracker.database.models import AgentContractRequest, BenchmarkStatus, Task, TaskStatus
-from tracker.database.session import get_session
 from tracker.types import (
     FinalScoreResponse,
     Resources,
@@ -17,25 +16,10 @@ from tracker.types import (
 )
 from tracker.utils import initiate_stop_benchmark, process_benchmark, reset_to_in_progress_status
 
+client = TestClient(app)
+
 
 class TestStopAndResume:
-    @staticmethod
-    async def _mock_install_dependencies(*args: Any, **kwargs: Any) -> None:
-        pass
-
-    @staticmethod
-    async def _mock_run_agent(*args: Any, **kwargs: Any) -> None:
-        pass
-
-    @staticmethod
-    async def _mock_upload_contract(*args: Any, **kwargs: Any) -> None:
-        pass
-
-    async def _mock_request_verify_task_ids(
-        self, *args: Any, task_ids: list[str], **kwargs: Any
-    ) -> VerifyTaskIdsResponse:
-        return VerifyTaskIdsResponse(task_ids=task_ids)
-
     @staticmethod
     async def _mock_request_retrieve_task(*args: Any, **kwargs: Any) -> RetrieveTaskResponse:
         return RetrieveTaskResponse(
@@ -71,13 +55,8 @@ class TestStopAndResume:
             - 2 tasks are completed (finished), 3 are still pending
             - Stop benchmark - 3 tasks are stopped (pending -> stopped)
             - Resume benchmark - only the 3 tasks that are stopped should be resumed
-            - Process benchmark - all 5 tasks should have evaluation results after completion
+            - Retry or resume benchmark - all 5 tasks should have evaluation results after completion
         """
-
-        def get_test_session():
-            yield database_session
-
-        app.dependency_overrides[get_session] = get_test_session
 
         task_ids: list[str] = [
             "astropy__astropy-12907",
@@ -99,9 +78,6 @@ class TestStopAndResume:
         database_session.commit()
 
         monkeypatch.setattr("tracker.utils.engine", database_session.bind)
-        monkeypatch.setattr("tracker.sandbox.upload_agent_artifacts", self._mock_upload_contract)
-        monkeypatch.setattr("tracker.sandbox.install_agent_dependencies", self._mock_install_dependencies)
-        monkeypatch.setattr("tracker.sandbox.run_agent", self._mock_run_agent)
         monkeypatch.setattr(BenchmarkService, "request_retrieve_task", self._mock_request_retrieve_task)
         monkeypatch.setattr(BenchmarkService, "request_final_score", self._mock_request_final_score)
 
@@ -141,12 +117,10 @@ class TestStopAndResume:
         database_session.add(benchmark_row)
         database_session.commit()
 
-        # Resume benchmark - mock verify to return only the pending task IDs
-        monkeypatch.setattr(
-            BenchmarkService,
-            "request_verify_task_ids",
-            partial(self._mock_request_verify_task_ids, task_ids=pending_task_ids),
-        )
+        async def _mock_request_verify_task_ids(*_args: Any, **_kwargs: Any) -> VerifyTaskIdsResponse:
+            return VerifyTaskIdsResponse(task_ids=pending_task_ids)
+
+        monkeypatch.setattr(BenchmarkService, "request_verify_task_ids", _mock_request_verify_task_ids)
 
         verified_task_ids = await reset_to_in_progress_status(
             benchmark_row=benchmark_row,
@@ -155,16 +129,15 @@ class TestStopAndResume:
             retry=False,
             rerun_task_ids=[],
         )
-
         # Only 3 tasks should be verified for resume (the 3 tasks that are stopped)
         assert len(verified_task_ids) == 3
         assert set(verified_task_ids) == set(pending_task_ids)
 
         # Run process_benchmark to complete the remaining tasks (the 3 tasks that are pending)
         await process_benchmark(
-            start_benchmark_request.model_dump(),
-            str(benchmark_row.id),
-            verified_task_ids,
+            start_benchmark_request_json=benchmark_row.start_benchmark_request.model_dump(),
+            benchmark_id_str=str(benchmark_row.id),
+            verified_task_ids=verified_task_ids,
         )
 
         database_session.refresh(benchmark_row)
