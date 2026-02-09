@@ -1,4 +1,5 @@
 from asyncio import gather
+from collections.abc import Callable
 from functools import partial
 from sqlite3 import OperationalError
 from typing import Any
@@ -106,18 +107,18 @@ class TestProcessBenchmark:
 
         # Mock upload contract since we don't have actual contract files
         monkeypatch.setattr(
-            "tracker.utils.upload_agent_artifacts",
+            "tracker.sandbox.upload_agent_artifacts",
             self._mock_upload_contract,
         )
 
         monkeypatch.setattr(
-            "tracker.utils.install_agent_dependencies",
+            "tracker.sandbox.install_agent_dependencies",
             self._mock_install_dependencies,
         )
 
         original_run_agent = self._mock_run_agent
         monkeypatch.setattr(
-            "tracker.utils.run_agent",
+            "tracker.sandbox.run_agent",
             partial(self._test_run_agent, original_run_agent),
         )
 
@@ -168,12 +169,12 @@ class TestProcessBenchmark:
         )
 
         monkeypatch.setattr(
-            "tracker.utils.install_agent_dependencies",
+            "tracker.sandbox.install_agent_dependencies",
             TestProcessBenchmark._mock_install_dependencies,
         )
 
         monkeypatch.setattr(
-            "tracker.utils.run_agent",
+            "tracker.sandbox.run_agent",
             TestProcessBenchmark._mock_run_agent,
         )
 
@@ -244,12 +245,12 @@ class TestProcessBenchmark:
         monkeypatch.setattr("tracker.utils.engine", database_session.bind)
 
         monkeypatch.setattr(
-            "tracker.utils.install_agent_dependencies",
+            "tracker.sandbox.install_agent_dependencies",
             self._mock_install_dependencies,
         )
 
         monkeypatch.setattr(
-            "tracker.utils.run_agent",
+            "tracker.sandbox.run_agent",
             self._mock_run_agent,
         )
 
@@ -288,11 +289,13 @@ class TestProcessBenchmark:
 
         original_request_setup_task = BenchmarkService.request_setup_task
 
-        async def mock_request_setup_task(self: Any, task_id: str, instance_id: str) -> SetupTaskResponse:
+        async def mock_request_setup_task(
+            self: Any, task_id: str, instance_id: str, on_message: Callable[[str], None] | None = None
+        ) -> SetupTaskResponse:
             if task_id == "astropy__astropy-13033":
                 raise Exception("Exception raised while setting up the task")
 
-            return await original_request_setup_task(self, task_id, instance_id)
+            return await original_request_setup_task(self, task_id, instance_id, on_message)
 
         # Setup fails for the second task
         monkeypatch.setattr(
@@ -311,13 +314,13 @@ class TestProcessBenchmark:
 
         # Mock the install dependencies part in case dependencies break it does not affect this test
         monkeypatch.setattr(
-            "tracker.utils.install_agent_dependencies",
+            "tracker.sandbox.install_agent_dependencies",
             TestProcessBenchmark._mock_install_dependencies,
         )
 
         # Mock run agent part because we don't have an agent inside of the sandbox
         monkeypatch.setattr(
-            "tracker.utils.run_agent",
+            "tracker.sandbox.run_agent",
             TestProcessBenchmark._mock_run_agent,
         )
 
@@ -388,12 +391,12 @@ class TestProcessBenchmark:
         )
 
         monkeypatch.setattr(
-            "tracker.utils.install_agent_dependencies",
+            "tracker.sandbox.install_agent_dependencies",
             TestProcessBenchmark._mock_install_dependencies,
         )
 
         monkeypatch.setattr(
-            "tracker.utils.run_agent",
+            "tracker.sandbox.run_agent",
             TestProcessBenchmark._mock_run_agent,
         )
 

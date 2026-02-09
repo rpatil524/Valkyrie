@@ -1,9 +1,9 @@
 """Integration tests for sandbox operations."""
 
 import io
+import uuid
 import zipfile
 from typing import AsyncGenerator, Generator
-from unittest.mock import MagicMock, patch
 
 import boto3
 import pytest
@@ -41,7 +41,10 @@ def test_resources() -> Resources:
 @pytest.fixture
 async def test_sandbox(daytona_client: AsyncDaytona, test_resources: Resources) -> AsyncGenerator[AsyncSandbox, None]:
     """Create a test sandbox with Python."""
-    async with create_sandbox(daytona_client, "test-sandbox", "python:3.11-slim", test_resources) as sandbox:
+
+    sandbox_name = f"test-sandbox-{str(uuid.uuid4())}"
+
+    async with create_sandbox(daytona_client, sandbox_name, "python:3.11-slim", test_resources) as sandbox:
         yield sandbox
 
 
@@ -98,9 +101,13 @@ class TestSandboxOperations:
         assert result.exit_code == 0
         assert "hello world" in result.result
 
-    @patch("tracker.sandbox.logger")
-    async def test_install_agent_dependencies(self, mock_logger: MagicMock, test_sandbox: AsyncSandbox) -> None:
+    async def test_install_agent_dependencies(self, test_sandbox: AsyncSandbox) -> None:
         """Test that install command is correctly executed in the sandbox."""
+        logged_messages: list[str] = []
+
+        def log_callback(message: str) -> None:
+            logged_messages.append(message)
+
         contract_name = "test_contract"
         contract = AgentContractRequest(
             name=contract_name,
@@ -113,37 +120,37 @@ class TestSandboxOperations:
         await test_sandbox.process.exec(f"mkdir -p /bundle/{contract_name}")
         await test_sandbox.process.exec(f"echo '#!/bin/bash\necho hello world' > /bundle/{contract_name}/setup.sh")
 
-        await install_agent_dependencies(test_sandbox, contract)
+        await install_agent_dependencies(test_sandbox, contract, log_callback)
 
-        # Verify logger.info was called with the result of the install command
-        mock_logger.info.assert_any_call("hello world")
+        # Verify messages were logged
+        output = "\n".join(logged_messages)
+        assert "Installing dependencies" in output
+        assert "hello world" in output
 
-    @patch("tracker.sandbox.stream_logger")
     async def test_run_agent(
         self,
-        mock_stream_logger: MagicMock,
         test_sandbox: AsyncSandbox,
     ) -> None:
-        """Test that agent runs and prints output lines via on_data function."""
-
+        """Test that agent runs and prints output lines."""
         logged_messages: list[str] = []
 
-        def mock_info(msg: str) -> None:
-            logged_messages.append(msg)
-
-        mock_stream_logger.info.side_effect = mock_info
+        def log_callback(message: str) -> None:
+            logged_messages.append(message)
 
         run_cmd = 'echo line1 && sleep 1 && echo line2 && sleep 1 && echo line3 && echo \'{"result": "hello world"}\' > /tmp/agent_output.json'
 
         contract = AgentContractRequest(
             name="test_agent",
             artifacts=[],
-            install_cmd="echo 'no-op'",
+            install_cmd="true",
             run_cmd=run_cmd,
             final_output="/tmp/agent_output.json",
         )
 
-        final_output = await run_agent(test_sandbox, contract, "some problem statement", "some task id", cwd="/")
+        # Expecting bundle directory to exist
+        await test_sandbox.process.exec("mkdir -p /bundle/test_agent")
+
+        final_output = await run_agent(test_sandbox, contract, "some problem statement", log_callback, cwd="/")
 
         assert final_output == {"result": "hello world"}
 

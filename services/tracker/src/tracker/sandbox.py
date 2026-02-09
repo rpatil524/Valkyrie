@@ -1,10 +1,11 @@
 """Sandbox management utilities for the tracker service."""
 
-import asyncio
 import io
 import json
 import shlex
+import uuid
 import zipfile
+from collections.abc import Callable
 from contextlib import asynccontextmanager
 from pathlib import PurePosixPath
 from typing import Any, AsyncGenerator
@@ -27,8 +28,6 @@ from tracker.s3 import download_from_s3, get_contract_s3_key
 from tracker.types import Resources as TrackerResources
 
 logger = get_logger(__name__)
-
-stream_logger = get_logger(__name__, stream=True)
 
 
 bundle_path = PurePosixPath("/bundle")
@@ -86,6 +85,9 @@ async def create_sandbox(
 
     try:
         yield sandbox
+    except Exception as e:
+        logger.error(f"Error creating sandbox {sandbox.name}: {e}")
+        raise e from e
     finally:
         await delete_sandbox(sandbox, daytona)
 
@@ -120,33 +122,81 @@ async def upload_agent_artifacts(sandbox: AsyncSandbox, contract: AgentContractR
     await sandbox.fs.upload_files(files_to_upload)
 
 
-async def install_agent_dependencies(sandbox: AsyncSandbox, contract: AgentContractRequest) -> None:
+async def install_agent_dependencies(
+    sandbox: AsyncSandbox,
+    contract: AgentContractRequest,
+    log_output: Callable[[str], None],
+) -> None:
     """Install agent dependencies in the sandbox."""
-    logger.info(f"Installing dependencies for contract: {contract.name}")
+    if not contract.install_cmd:
+        return
+
+    log_output(f"Installing dependencies for contract: {contract.name}")
 
     contract_path = get_contract_path(contract.name)
 
-    response = await sandbox.process.exec(contract.install_cmd, cwd=str(contract_path))
+    await stream_command_output(sandbox, f"cd {str(contract_path)} && {contract.install_cmd}", log_output)
 
-    if response.exit_code != 0:
-        error_msg = f"Failed to install dependencies for contract {contract.name}: {response.result}"
-        logger.error(error_msg)
-        raise SandboxError(error_msg)
+    log_output(f"Finished installing dependencies for contract: {contract.name}")
 
-    logger.info(response.result)
-    logger.info(f"Finished running installing dependencies for contract: {contract.name}")
+
+async def stream_command_output(
+    sandbox: AsyncSandbox,
+    command: str,
+    on_output: Callable[[str], None],
+) -> None:
+    """
+    Execute a command inside of a sandbox using a session and stream the output to the given callbacks.
+    """
+    session_id = f"{sandbox.id}:{str(uuid.uuid4())}"
+    try:
+        await sandbox.process.create_session(session_id)
+
+        session_exec_resp = await sandbox.process.execute_session_command(
+            session_id, SessionExecuteRequest(command=command, run_async=True)
+        )
+
+        cmd_id = session_exec_resp.cmd_id
+
+        if not cmd_id:
+            raise SandboxError(f"Failed to execute command {command} in session {session_id}")
+
+        await sandbox.process.get_session_command_logs_async(
+            session_id=session_id,
+            command_id=cmd_id,
+            on_stdout=on_output,
+            on_stderr=on_output,
+        )
+
+        cmd = await sandbox.process.get_session_command(session_id, cmd_id)
+
+        if cmd.exit_code != 0:
+            raise SandboxError(f"Failed to run command {command}, exit code: {cmd.exit_code}")
+
+    finally:
+        try:
+            await sandbox.process.delete_session(session_id)
+        except Exception:
+            logger.error(f"Caught failure to delete session `{session_id}`")
+            pass
 
 
 async def run_agent(
-    sandbox: AsyncSandbox, contract: AgentContractRequest, problem_statement: str, task_id: str, cwd: str
+    sandbox: AsyncSandbox,
+    contract: AgentContractRequest,
+    problem_statement: str,
+    log_output: Callable[[str], None],
+    cwd: str,
 ) -> dict[str, Any]:
     """
     Run the agent inside the sandbox for a given task.
 
     Args:
         sandbox: The sandbox to run the agent in
-        contract_name: Name of the contract
+        contract: The agent contract configuration
         problem_statement: Problem statement to pass to the agent
+        log_output: Callback to log output
+        cwd: Working directory to run the agent in
 
     Returns:
         Agent output as a dictionary
@@ -154,70 +204,33 @@ async def run_agent(
     Raises:
         SandboxError: If the agent fails to run or times out
     """
-    logger.info(f"Running agent {contract.name} on task {task_id}")
+    log_output(f"Running agent {contract.name}")
+
+    await install_agent_dependencies(sandbox, contract, log_output)
 
     run_cmd = contract.run_cmd.replace("{problem_statement}", shlex.quote(problem_statement))
 
-    def on_data(data: str) -> None:
-        stream_logger.info(data.strip("\n"))
+    await stream_command_output(sandbox, f"cd {cwd} && {run_cmd}", log_output)
 
-    session_id = f"{contract.name}-{task_id.replace(' ', '_')}"
+    if not contract.final_output:
+        return {}
+
+    # Check if a agent_output.json file exists
+    agent_output_exists = await sandbox.process.exec(f"[ -f {contract.final_output} ]")
+
+    # If agent output does not exist, return an empty result
+    if agent_output_exists.exit_code != 0:
+        return {}
+
+    # If agent output exists, try to load it as a json, if not, return the result as a string
+    agent_output = await sandbox.process.exec(f"cat {contract.final_output}")
 
     try:
-        await sandbox.process.create_session(session_id)
+        return json.loads(agent_output.result)
+    except Exception:
+        logger.warning("Failed to load agent output as a json, creating a fallback result")
+        pass
 
-        session_exec_resp = await sandbox.process.execute_session_command(
-            session_id, SessionExecuteRequest(command=f"cd {cwd} && {run_cmd}", run_async=True)
-        )
-
-        cmd_id = session_exec_resp.cmd_id
-
-        if not cmd_id:
-            raise SandboxError(f"Failed to execute command {run_cmd} in session {session_id}")
-
-        log_task = asyncio.create_task(
-            sandbox.process.get_session_command_logs_async(
-                session_id=session_id,
-                command_id=cmd_id,
-                on_stdout=on_data,
-                on_stderr=on_data,
-            )
-        )
-
-        await log_task
-
-        cmd = await sandbox.process.get_session_command(session_id, cmd_id)
-
-        if cmd.exit_code != 0:
-            raise SandboxError(f"Failed to run agent {contract.name}, exit code: {cmd.exit_code}")
-
-        if not contract.final_output:
-            return {}
-
-        # Check if a agent_output.json file exists
-        agent_output_exists = await sandbox.process.exec(f"[ -f {contract.final_output} ]")
-
-        # If agent output does not exist, return an empty result
-        if agent_output_exists.exit_code != 0:
-            return {}
-
-        # If agent output exists, try to load it as a json, if not, return the result as a string
-        agent_output = await sandbox.process.exec(f"cat {contract.final_output}")
-
-        try:
-            return json.loads(agent_output.result)
-        except Exception:
-            logger.warning("Failed to load agent output as a json, creating a fallback result")
-            pass
-
-        return {
-            "result": agent_output.result,
-        }
-
-    finally:
-        try:
-            await sandbox.process.delete_session(session_id)
-        except Exception:
-            # NOTE: If we kill the sandbox this sometimes errors
-            logger.error(f"Caught failure to delete session `{session_id}`")
-            pass
+    return {
+        "result": agent_output.result,
+    }

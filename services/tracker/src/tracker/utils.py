@@ -14,13 +14,20 @@ from daytona import AsyncDaytona, AsyncPaginatedSandboxes, AsyncSandbox, Sandbox
 from sqlmodel import Session, asc, case, col, delete, desc, func, or_, select, update
 
 from tracker.benchmark_service import BenchmarkService
+from tracker.cloudwatch import cloudwatch_stream, create_benchmark_group
 from tracker.config import broker
 from tracker.database.models import Benchmark, BenchmarkStatus, EvaluationResult, FinalEvaluation, Task, TaskStatus
 from tracker.database.session import engine
 from tracker.exceptions import TrackerServiceError
 from tracker.logger import get_logger
-from tracker.sandbox import create_sandbox, install_agent_dependencies, run_agent, upload_agent_artifacts
-from tracker.types import BenchmarkDetails, FetchBenchmarkResponse, FetchBenchmarksRequest, Order, StartBenchmarkRequest
+from tracker.sandbox import create_sandbox, run_agent, upload_agent_artifacts
+from tracker.types import (
+    BenchmarkDetails,
+    FetchBenchmarkResponse,
+    FetchBenchmarksRequest,
+    Order,
+    StartBenchmarkRequest,
+)
 
 logger = get_logger(__name__)
 
@@ -62,6 +69,7 @@ class TrackedTask:
             self._task = asyncio.create_task(_wrap_coro())
             return await self._task
         except asyncio.CancelledError:
+            logger.error(f"Task {task_row.task_id} was cancelled")
             # Need to clean up the coroutine if we cancelled the task
             self._coro.close()
 
@@ -69,6 +77,7 @@ class TrackedTask:
             return {task_row.task_id: None}
         except Exception as e:
             error_message = f"Task error was not handled: {str(e)}\n{traceback.format_exc()}"
+            logger.error(error_message)
             task_row_merged = session.merge(task_row)
             commit_task_error(task_row_merged, session, error_message)
 
@@ -174,6 +183,20 @@ def handle_early_exit(task_row: Task, task_session: Session) -> None:
     task_session.commit()
 
 
+def buffer_logs(log_queue: asyncio.Queue[str], stream_key: str, force_flush: bool = False) -> None:
+    """
+    Buffers the logs in the queue and waits till they are full before streaming them to CloudWatch.
+    """
+    if not log_queue.full() and not force_flush:
+        return
+
+    messages: list[str] = []
+    while not log_queue.empty():
+        messages.append(log_queue.get_nowait())
+
+    cloudwatch_stream(stream_key, "".join(messages))
+
+
 async def process_task(
     task_row: Task,
     start_benchmark_request: StartBenchmarkRequest,
@@ -208,6 +231,15 @@ async def process_task(
                 "Task": task_row.task_id,
             }
 
+            stream_key: str = f"{benchmark_id}:{task_id}"
+
+            log_queue: asyncio.Queue[str] = asyncio.Queue(maxsize=20)
+
+            # Collects the logs and dumps them when the queue is full
+            def log_output(data: str) -> None:
+                log_queue.put_nowait(data)
+                buffer_logs(log_queue, stream_key)
+
             async with create_sandbox(
                 daytona=benchmark_service.daytona_client,
                 sandbox_name=task_row.alias,
@@ -223,15 +255,23 @@ async def process_task(
 
                     # Upload the contract to the sandbox after creating and install the dependencies
                     await upload_agent_artifacts(sandbox, start_benchmark_request.contract)
-                    await install_agent_dependencies(sandbox, start_benchmark_request.contract)
 
                     # Setup task if requested
                     if task_data.request_setup:
-                        _ = await benchmark_service.request_setup_task(task_row.task_id, sandbox.id)
+                        _ = await benchmark_service.request_setup_task(
+                            task_row.task_id, sandbox.id, on_message=log_output
+                        )
+
+                        # Force flush the logs if anything has been buffered
+                        buffer_logs(log_queue, stream_key, force_flush=True)
 
                     # Run the agent inside of the sandbox
                     agent_output = await run_agent(
-                        sandbox, start_benchmark_request.contract, task_data.problem_statement, task_id, task_data.cwd
+                        sandbox,
+                        start_benchmark_request.contract,
+                        task_data.problem_statement,
+                        log_output,
+                        task_data.cwd,
                     )
 
                     # Update the status to evaluating once we finish running the agent
@@ -242,7 +282,12 @@ async def process_task(
                     # Evaluate the instance
                     # NOTE: only really good for when we need to evaluate the container (for just evaluating a text response we can delegate before this)
                     logger.info(f"Evaluating agent {start_benchmark_request.contract.name} in sandbox {sandbox.name}")
-                    evaluation_result = await benchmark_service.request_evaluate_instance(task_row.task_id, sandbox.id)
+                    evaluation_result = await benchmark_service.request_evaluate_instance(
+                        task_row.task_id, sandbox.id, on_message=log_output
+                    )
+
+                    # Force flush the logs
+                    buffer_logs(log_queue, stream_key, force_flush=True)
 
                     # Save the evaluation result to the database with the task row
                     evaluation_result_row = EvaluationResult(
@@ -374,6 +419,9 @@ async def process_benchmark(
         benchmark_row = fetch_benchmark_row(benchmark_id, session)
 
         try:
+            # Create benchmark cloudwatch log group
+            create_benchmark_group(str(benchmark_id))
+
             # Create tasks inside of the database for each task id
             task_rows: Sequence[tuple[str, Task]] = create_task_rows(verified_task_ids, benchmark_row, session)
 

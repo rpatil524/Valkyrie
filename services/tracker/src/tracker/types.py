@@ -108,6 +108,16 @@ class RetrieveTaskResponse(BaseModel):
     resources: Resources
 
 
+class SetupTaskRequest(BaseModel):
+    task_id: str
+    instance_id: str
+
+
+class EvaluateInstanceRequest(BaseModel):
+    task_id: str
+    instance_id: str
+
+
 class VerifyTaskIdsResponse(BaseModel):
     task_ids: list[str]
 

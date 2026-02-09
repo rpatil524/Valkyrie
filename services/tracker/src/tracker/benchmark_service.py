@@ -1,16 +1,23 @@
+import json
 import os
+from collections.abc import AsyncGenerator, Callable
 from typing import Any
 
 import httpx
+import websockets
 from daytona import AsyncDaytona, DaytonaConfig
+from websockets.asyncio.client import ClientConnection
+from websockets.exceptions import ConnectionClosed
 
 from tracker.database.models import Benchmark, BenchmarkArguments
 from tracker.exceptions import BenchmarkServiceError
 from tracker.logger import get_logger
 from tracker.types import (
+    EvaluateInstanceRequest,
     FinalScoreResponse,
     HealthCheckResponse,
     RetrieveTaskResponse,
+    SetupTaskRequest,
     SetupTaskResponse,
     StartBenchmarkRequest,
     VerifyTaskIdsResponse,
@@ -53,6 +60,18 @@ class BenchmarkService:
 
         return self._daytona_client
 
+    @property
+    def ws_url(self) -> str:
+        return self._url.replace("http://", "ws://").replace("https://", "wss://")
+
+    @property
+    def _headers(self) -> dict[str, str]:
+        return {
+            "x-api-key": self._environment_keys["DAYTONA_API_KEY"],
+            "x-api-url": self._environment_keys["DAYTONA_API_URL"],
+            "x-target": self._environment_keys["DAYTONA_TARGET"],
+        }
+
     @staticmethod
     def daytona_keys() -> dict[str, str]:
         environment_keys: dict[str, str] = {
@@ -85,11 +104,32 @@ class BenchmarkService:
             ),
         )
 
+    async def _return_websocket_result(self, websocket: ClientConnection) -> AsyncGenerator[str | dict[str, Any]]:
+        """
+        Returns the result from a websock connection, logs and handles other types of responses returned
+
+        Yields:
+            str | dict[str, Any]: The message that we can log or the result object that we can return
+        """
+        try:
+            async for message in websocket:
+                parsed_message: dict[str, Any] = json.loads(message)
+                data: str | dict[str, Any] = parsed_message["data"]
+                if parsed_message["type"] == "error":
+                    raise BenchmarkServiceError(data)
+
+                if not data:
+                    continue
+
+                yield data
+        except ConnectionClosed:
+            pass
+
     async def request_health_check(self) -> HealthCheckResponse:
         """
         Requests health check from benchmark service
         """
-        async with httpx.AsyncClient(timeout=None, follow_redirects=True) as client:
+        async with httpx.AsyncClient(follow_redirects=True) as client:
             response = await client.get(f"{self._url}/health")
 
         logger.debug(f"Health check response: {response.text}")
@@ -113,7 +153,7 @@ class BenchmarkService:
         if slice_str is not None:
             params["slice"] = slice_str
 
-        async with httpx.AsyncClient(timeout=None, follow_redirects=True) as client:
+        async with httpx.AsyncClient(follow_redirects=True) as client:
             response = await client.get(f"{self._url}/verify-task-ids/", params=params)
 
         logger.debug(f"Verify task ids response: {response.text}")
@@ -131,7 +171,7 @@ class BenchmarkService:
         """
 
         params = {"task_id": task_id, "skip_validation": skip_validation}
-        async with httpx.AsyncClient(timeout=None, follow_redirects=True) as client:
+        async with httpx.AsyncClient(follow_redirects=True) as client:
             response = await client.get(f"{self._url}/retrieve-task/", params=params)
 
         logger.debug(f"Retrieve task response: {response.text}")
@@ -143,63 +183,61 @@ class BenchmarkService:
 
         return RetrieveTaskResponse.model_validate(response.json())
 
-    async def request_setup_task(self, task_id: str, instance_id: str) -> SetupTaskResponse:
+    async def request_setup_task(
+        self, task_id: str, instance_id: str, on_message: Callable[[str], None] | None = None
+    ) -> SetupTaskResponse:
         """
         Requests setup task from benchmark service
         """
 
-        async with httpx.AsyncClient(timeout=None, follow_redirects=True) as client:
-            response = await client.post(
-                f"{self._url}/setup-task",
-                json={"task_id": task_id, "instance_id": instance_id},
-                headers={
-                    "Content-Type": "application/json",
-                    "X-Api-Key": self._environment_keys["DAYTONA_API_KEY"],
-                    "X-Api-Url": self._environment_keys["DAYTONA_API_URL"],
-                    "X-Target": self._environment_keys["DAYTONA_TARGET"],
-                },
-            )
+        request = SetupTaskRequest(
+            task_id=task_id,
+            instance_id=instance_id,
+        )
 
-        logger.debug(f"Setup task response: {response.text}")
+        async with websockets.connect(f"{self.ws_url}/ws/setup-task", additional_headers=self._headers) as websocket:
+            await websocket.send(request.model_dump_json())
 
-        if response.status_code != 200:
-            raise BenchmarkServiceError(
-                f"Setup task failed with status code {response.status_code}, response: {response.text}"
-            )
+            async for data in self._return_websocket_result(websocket):
+                if isinstance(data, dict):
+                    return SetupTaskResponse.model_validate(data)
 
-        return SetupTaskResponse.model_validate(response.json())
+                if on_message:
+                    on_message(data)
 
-    async def request_evaluate_instance(self, task_id: str, instance_id: str) -> dict[str, str]:
+        raise BenchmarkServiceError("Exited websocket without returning final result")
+
+    async def request_evaluate_instance(
+        self, task_id: str, instance_id: str, on_message: Callable[[str], None] | None = None
+    ) -> dict[str, str]:
         """
         Requests evaluate instance from benchmark service
         """
 
-        async with httpx.AsyncClient(timeout=None, follow_redirects=True) as client:
-            response = await client.post(
-                f"{self._url}/evaluate-instance/",
-                json={"task_id": task_id, "instance_id": instance_id},
-                headers={
-                    "Content-Type": "application/json",
-                    "X-Api-Key": self._environment_keys["DAYTONA_API_KEY"],
-                    "X-Api-Url": self._environment_keys["DAYTONA_API_URL"],
-                    "X-Target": self._environment_keys["DAYTONA_TARGET"],
-                },
-            )
+        request = EvaluateInstanceRequest(
+            task_id=task_id,
+            instance_id=instance_id,
+        )
 
-        logger.debug(f"Evaluate instance response: {response.text}")
+        async with websockets.connect(
+            f"{self.ws_url}/ws/evaluate-instance", additional_headers=self._headers
+        ) as websocket:
+            await websocket.send(request.model_dump_json())
 
-        if response.status_code != 200:
-            raise BenchmarkServiceError(
-                f"Evaluate instance failed with status code {response.status_code}, response: {response.text}"
-            )
+            async for data in self._return_websocket_result(websocket):
+                if isinstance(data, dict):
+                    return data
 
-        return response.json()
+                if on_message:
+                    on_message(data)
+
+        raise BenchmarkServiceError("Exited websocket without returning final result")
 
     async def request_final_score(self, evaluation_results: dict[str, dict[str, Any] | None]) -> FinalScoreResponse:
         """
         Requests final score from benchmark service
         """
-        async with httpx.AsyncClient(timeout=None, follow_redirects=True) as client:
+        async with httpx.AsyncClient(follow_redirects=True) as client:
             response = await client.post(
                 f"{self._url}/final-score/",
                 json={"evaluation_results": evaluation_results},
