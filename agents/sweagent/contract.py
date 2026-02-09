@@ -26,8 +26,7 @@ class SWEAgentContract(BaseAgentContract):
 
     @property
     def final_output(self) -> Path | None:
-        # return Path("/logs/sweagent/stats.json")
-        return None
+        return Path("/logs/sweagent")
 
     @property
     def run_cmd(self) -> str:
@@ -36,6 +35,7 @@ class SWEAgentContract(BaseAgentContract):
             "--env.repo.type=preexisting",
             "--env.repo.repo_name=/testbed",
             "--agent.model.provider=vals",
+            "--agent.max_steps=5",
             "--problem_statement.text={problem_statement}",
             "--config=/bundle/sweagent/submodules/sweagent/config/default.yaml",
             # TODO: add predictable place to store logs/outputs

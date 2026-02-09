@@ -2,15 +2,22 @@
 
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
+
 from tracker.config import AWS_S3_BUCKET
 from tracker.exceptions import S3Error
 
 S3_CONTRACTS_PREFIX = "contracts"
+S3_BENCHMARKS_PREFIX = "benchmarks"
 
 
 def get_contract_s3_key(contract_name: str) -> str:
     """Get the S3 key for a contract zip file."""
     return f"{S3_CONTRACTS_PREFIX}/{contract_name}.zip"
+
+
+def get_agent_result_s3_key(benchmark_id: str, task_id: str, output_name: str) -> str:
+    """Get the S3 key for an agent output archive."""
+    return f"{S3_BENCHMARKS_PREFIX}/{benchmark_id}/{task_id}/{output_name}"
 
 
 def upload_to_s3(file_content: bytes, s3_key: str) -> None:
@@ -52,3 +59,11 @@ def download_from_s3(s3_key: str) -> bytes:
         return response["Body"].read()
     except (ClientError, BotoCoreError) as e:
         raise S3Error(f"Failed to download from S3 bucket '{AWS_S3_BUCKET}' with key '{s3_key}': {str(e)}") from e
+
+
+def delete_from_s3(s3_key: str) -> None:
+    try:
+        s3_client = boto3.client("s3")  # pyright: ignore[reportUnknownMemberType]
+        s3_client.delete_object(Bucket=AWS_S3_BUCKET, Key=s3_key)
+    except (ClientError, BotoCoreError) as e:
+        raise S3Error(f"Failed to delete from S3 bucket '{AWS_S3_BUCKET}' with key '{s3_key}': {str(e)}") from e
