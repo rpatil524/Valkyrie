@@ -748,14 +748,18 @@ async def force_stop_sandboxes(benchmark_row: Benchmark, session: Session) -> No
         raise TrackerServiceError(f"Unexpected errors stopping sandboxes:\n{error_message}")
 
 
-async def initiate_resume_benchmark(
-    benchmark_row: Benchmark, session: Session, benchmark_service: BenchmarkService, retry: bool, force: list[str]
+async def reset_to_in_progress_status(
+    benchmark_row: Benchmark,
+    session: Session,
+    benchmark_service: BenchmarkService,
+    retry: bool,
+    rerun_task_ids: list[str],
 ) -> list[str]:
     """
-    Resets benchmark and task status to flag resuming the benchmark.
+    Resets valid tasks to in progress and to allow for retrying or resuming the benchmark.
 
     Retry: we reset objects with an error status ontop of the stopped status
-    Force: even if task has been finished we restart it
+    Rerun Task IDs: even if task has been finished we restart it
 
     Benchmark - In progress status
     Tasks - Pending status
@@ -771,7 +775,7 @@ async def initiate_resume_benchmark(
             col(Task.benchmark) == benchmark_row.id,
             or_(
                 col(Task.status).in_(retry_statuses),
-                col(Task.task_id).in_(force),
+                col(Task.task_id).in_(rerun_task_ids),
             ),
         ]
 
@@ -782,7 +786,7 @@ async def initiate_resume_benchmark(
         task_mapping: dict[UUID, str] = {id: task_id for id, task_id in task_ids}
 
         # Ensure we are not missing any tasks that were requested (skips if force is empty)
-        missing_task_ids = [task_id for task_id in force if task_id not in task_mapping.values()]
+        missing_task_ids = [task_id for task_id in rerun_task_ids if task_id not in task_mapping.values()]
         if missing_task_ids:
             raise TrackerServiceError(
                 f"{', '.join(missing_task_ids)} was requested to be force resumed but does not exist in the dataset"

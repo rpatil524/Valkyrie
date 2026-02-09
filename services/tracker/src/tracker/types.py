@@ -126,7 +126,7 @@ class StopBenchmarkResponse(StatusResponse):
     pass
 
 
-class ResumeBenchmarkResponse(StatusResponse):
+class RetryOrResumeBenchmarkResponse(StatusResponse):
     pass
 
 
