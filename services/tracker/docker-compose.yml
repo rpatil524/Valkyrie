@@ -1,3 +1,7 @@
+networks:
+  tracker-network:
+    name: tracker-network
+
 services:
   postgres:
     image: postgres:16-alpine
@@ -15,6 +19,8 @@ services:
       interval: 5s
       timeout: 3s
       retries: 5
+    networks:
+      - tracker-network
 
   redis:
     image: redis:7-alpine
@@ -26,6 +32,8 @@ services:
       interval: 5s
       timeout: 3s
       retries: 5
+    networks:
+      - tracker-network
 
   tracker:
     image: tracker-service
@@ -38,6 +46,8 @@ services:
     environment:
       - REDIS_URL=redis://redis:6379
       - DATABASE_URL=postgresql://tracker:tracker@postgres:5432/tracker
+      - DB_HOST=postgres
+      - DB_PORT=5432
     env_file:
       - .env
     volumes:
@@ -52,6 +62,8 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    networks:
+      - tracker-network
 
 volumes:
   postgres_data:
