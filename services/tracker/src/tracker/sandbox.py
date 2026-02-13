@@ -1,9 +1,7 @@
 """Sandbox management utilities for the tracker service."""
 
-import asyncio
 import base64
 import io
-import json
 import shlex
 import uuid
 import zipfile
@@ -12,12 +10,10 @@ from contextlib import asynccontextmanager
 from pathlib import PurePosixPath
 from typing import Any, AsyncGenerator
 
-import websockets.asyncio.client as ws_client
 from daytona import (
     AsyncDaytona,
     AsyncSandbox,
     CreateSandboxFromImageParams,
-    DaytonaError,
     DaytonaNotFoundError,
     FileUpload,
     Resources,
@@ -30,23 +26,6 @@ from tracker.exceptions import SandboxError
 from tracker.logger import get_logger
 from tracker.s3 import download_from_s3, get_contract_s3_key, upload_to_s3
 from tracker.types import Resources as TrackerResources
-
-"""
-Monkey-patch websockets to use longer ping timeouts for long-running tasks
-"""
-
-_original_connect = ws_client.connect
-
-
-# NOTE: can probably remove completely and rely on fallback to polling
-def _patched_connect(*args: object, **kwargs: object):
-    kwargs.setdefault("ping_interval", 60)
-    kwargs.setdefault("ping_timeout", 120)
-    kwargs.setdefault("close_timeout", 30)
-    return _original_connect(*args, **kwargs)  # pyright: ignore[reportArgumentType]
-
-
-ws_client.connect = _patched_connect
 
 logger = get_logger(__name__)
 
@@ -161,42 +140,6 @@ async def install_agent_dependencies(
     log_output(f"Finished installing dependencies for contract: {contract.name}")
 
 
-async def _poll_until_complete(
-    sandbox: AsyncSandbox,
-    session_id: str,
-    cmd_id: str,
-    on_output: Callable[[str], None],
-    poll_interval: float = 5.0,
-) -> None:
-    """
-    Poll for command completion when WebSocket streaming fails.
-    Fetches logs periodically until the command completes.
-    """
-    last_log_length = 0
-
-    while True:
-        cmd = await sandbox.process.get_session_command(session_id, cmd_id)
-
-        # Fetch current logs
-        try:
-            logs = await sandbox.process.get_session_command_logs(session_id, cmd_id)
-            current_output = logs.output or ""
-
-            # Output only new content
-            if len(current_output) > last_log_length:
-                new_content = current_output[last_log_length:]
-                on_output(new_content)
-                last_log_length = len(current_output)
-        except Exception as e:
-            logger.warning(f"Failed to fetch logs during polling: {e}")
-
-        # Check if command completed
-        if cmd.exit_code is not None:
-            break
-
-        await asyncio.sleep(poll_interval)
-
-
 async def stream_command_output(
     sandbox: AsyncSandbox,
     command: str,
@@ -219,20 +162,12 @@ async def stream_command_output(
         if not cmd_id:
             raise SandboxError(f"Failed to execute command {command} in session {session_id}")
 
-        try:
-            await sandbox.process.get_session_command_logs_async(
-                session_id=session_id,
-                command_id=cmd_id,
-                on_stdout=on_output,
-                on_stderr=on_output,
-            )
-        except DaytonaError as e:
-            error_msg = str(e).lower()
-            if not ("ping timeout" in error_msg or "websocket" in error_msg):
-                raise
-
-            logger.warning(f"WebSocket streaming failed, falling back to polling: {e}")
-            await _poll_until_complete(sandbox, session_id, cmd_id, on_output)
+        await sandbox.process.get_session_command_logs_async(
+            session_id=session_id,
+            command_id=cmd_id,
+            on_stdout=on_output,
+            on_stderr=on_output,
+        )
 
         cmd = await sandbox.process.get_session_command(session_id, cmd_id)
 
@@ -262,7 +197,12 @@ async def archive_and_upload_output(sandbox: AsyncSandbox, output_path: str, age
 
         upload_to_s3(base64.b64decode(b64_result.result), agent_output_s3_key)
     finally:
-        await sandbox.process.exec(f"rm -f {shlex.quote(archive_path)}")
+        # Check if file exists and remove it if it does
+        result = await sandbox.process.exec(f"test -e {shlex.quote(archive_path)}")
+        if result.exit_code == 0:
+            await sandbox.process.exec(f"rm -f {shlex.quote(archive_path)}")
+        else:
+            logger.warning(f"File {archive_path} does not exist, skipping removal")
 
 
 async def run_agent(
@@ -272,7 +212,7 @@ async def run_agent(
     log_output: Callable[[str], None],
     cwd: str,
     agent_output_s3_key: str | None = None,
-) -> dict[str, Any]:
+) -> None:
     """
     Run the agent inside the sandbox for a given task.
 
@@ -299,20 +239,11 @@ async def run_agent(
     await stream_command_output(sandbox, f"cd {cwd} && {run_cmd}", log_output)
 
     if not contract.final_output:
-        return {}
+        return
 
     result = await sandbox.process.exec(f"test -e {shlex.quote(contract.final_output)}")
     if result.exit_code != 0:
-        return {}
+        return
 
     if agent_output_s3_key:
         await archive_and_upload_output(sandbox, contract.final_output, agent_output_s3_key)
-
-    agent_output = await sandbox.process.exec(f"cat {shlex.quote(contract.final_output)}")
-
-    try:
-        return json.loads(agent_output.result)
-    except Exception:
-        logger.warning("Failed to load agent output as a json, creating a fallback result")
-
-    return {"result": agent_output.result}

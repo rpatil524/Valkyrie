@@ -70,7 +70,7 @@ class TrackedTask:
             self._task = asyncio.create_task(_wrap_coro())
             return await self._task
         except asyncio.CancelledError:
-            logger.error(f"Task {task_row.task_id} was cancelled")
+            logger.warning(f"Task {task_row.task_id} was cancelled")
             # Need to clean up the coroutine if we cancelled the task
             self._coro.close()
 
@@ -195,7 +195,9 @@ def buffer_logs(log_queue: asyncio.Queue[str], stream_key: str, force_flush: boo
     while not log_queue.empty():
         messages.append(log_queue.get_nowait())
 
-    cloudwatch_stream(stream_key, "".join(messages))
+    message = "".join(messages)
+    loop = asyncio.get_running_loop()
+    loop.run_in_executor(None, cloudwatch_stream, stream_key, message)
 
 
 async def process_task(
@@ -326,7 +328,6 @@ async def process_task(
 
             return {task_id: None}
         finally:
-            # force flush the logs
             buffer_logs(log_queue, stream_key, force_flush=True)
 
 
