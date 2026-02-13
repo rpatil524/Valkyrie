@@ -5,6 +5,7 @@ import io
 import shlex
 import uuid
 import zipfile
+from asyncio import Semaphore
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 from pathlib import PurePosixPath
@@ -20,6 +21,7 @@ from daytona import (
     SandboxState,
     SessionExecuteRequest,
 )
+from tenacity import before_sleep_log, retry, stop_after_attempt, wait_fixed
 
 from tracker.database.models import AgentContractRequest
 from tracker.exceptions import SandboxError
@@ -52,23 +54,45 @@ async def delete_sandbox(sandbox: AsyncSandbox, daytona: AsyncDaytona) -> None:
         logger.error(f"Unexpected error deleting sandbox {sandbox.name}: {e}")
 
 
-@asynccontextmanager
-async def create_sandbox(
+_SANBDOX_CREATION_CAP: int = 10
+_sandbox_creation_semaphore = Semaphore(_SANBDOX_CREATION_CAP)
+
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_fixed(120),
+    before_sleep=before_sleep_log(logger, logger.level),
+    reraise=True,
+)
+async def _create_sandbox(
     daytona: AsyncDaytona,
     sandbox_name: str,
     image: str,
     resources: TrackerResources,
     labels: dict[str, str] | None = None,
     env_vars: dict[str, str] | None = None,
-) -> AsyncGenerator[AsyncSandbox, Any]:
+) -> AsyncSandbox:
     """
-    Create a sandbox with the given name, image, and labels.
-    Automatically cleans up the sandbox when the context manager exits.
-    """
-    logger.info(f"Creating sandbox {sandbox_name} with image {image}")
+    Creates a sandbox and takes into account timeouts and retries.
 
-    sandbox = await daytona.create(
+    This retry only works in the following case:
+    - Client times out while sandbox is being created
+    """
+
+    # If the container already exists we reuse it
+    try:
+        sandbox = await daytona.get(sandbox_name)
+
+        await sandbox.wait_for_sandbox_start(timeout=0)
+
+        return sandbox
+    except DaytonaNotFoundError:
+        pass
+
+    # Create a new sandbox from scratch, if it stops we delete it within a minute
+    return await daytona.create(
         CreateSandboxFromImageParams(
+            auto_delete_interval=60,
             name=sandbox_name,
             labels=labels,
             image=image,
@@ -82,6 +106,37 @@ async def create_sandbox(
         ),
         timeout=360,
     )
+
+
+@asynccontextmanager
+async def create_sandbox(
+    daytona: AsyncDaytona,
+    sandbox_name: str,
+    image: str,
+    resources: TrackerResources,
+    labels: dict[str, str] | None = None,
+    env_vars: dict[str, str] | None = None,
+) -> AsyncGenerator[AsyncSandbox, Any]:
+    """
+    Yeild a sandbox to be used within a context manager.
+
+    Args:
+        daytona: The daytona client
+        sandbox_name: The name of the sandbox
+        image: The image to use for the sandbox
+        resources: The resources to use for the sandbox
+        labels: The labels to use for the sandbox
+        env_vars: The environment variables to use for the sandbox
+
+    Returns:
+        A context manager that yields the sandbox
+    """
+    logger.info(f"Creating sandbox {sandbox_name} with image {image}")
+
+    # If we run too many at once it can cause hanging issues
+    # NOTE does not block how many context managers we can have open, just how many sandboxes we can create at once
+    async with _sandbox_creation_semaphore:
+        sandbox = await _create_sandbox(daytona, sandbox_name, image, resources, labels, env_vars)
 
     try:
         yield sandbox
