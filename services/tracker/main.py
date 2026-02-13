@@ -1,3 +1,4 @@
+import tarfile
 import traceback
 from uuid import UUID
 
@@ -12,9 +13,10 @@ from tracker.database.models import Benchmark, BenchmarkStatus, Task, TaskStatus
 from tracker.database.session import check_database_connection, get_session
 from tracker.exceptions import TrackerServiceError
 from tracker.logger import get_logger
-from tracker.s3 import get_contract_s3_key, upload_to_s3
+from tracker.s3 import S3_BENCHMARKS_PREFIX, download_from_s3_stream, get_contract_s3_key, list_s3_objects, upload_to_s3
 from tracker.types import (
     BenchmarkTableRow,
+    FetchBenchmarkMetadataResponse,
     FetchBenchmarkResponse,
     FetchBenchmarksRequest,
     FetchBenchmarksResponse,
@@ -27,6 +29,7 @@ from tracker.types import (
 )
 from tracker.utils import (
     BenchmarkContext,
+    YieldingWriter,
     commit_benchmark_error,
     fetch_filtered_benchmark_rows,
     force_stop_sandboxes,
@@ -358,4 +361,80 @@ async def fetch_benchmarks(
     return FetchBenchmarksResponse(
         benchmarks=benchmark_table_rows,
         total_count=total_count,
+    )
+
+
+@app.get("/fetch-benchmark-metadata/{benchmark_id}")
+async def fetch_benchmark_metadata(
+    benchmark_id: UUID, session: Session = Depends(get_session)
+) -> FetchBenchmarkMetadataResponse:
+    """
+    Fetch benchmark metadata by its id.
+
+    Usage:
+    curl -X GET http://<endpoint>/fetch-benchmark-metadata/<benchmark_id>
+
+    Returns:
+        FetchBenchmarkMetadataResponse
+    """
+    benchmark_row: Benchmark | None = session.get(Benchmark, benchmark_id)
+
+    if not benchmark_row:
+        raise HTTPException(status_code=404, detail=f"Benchmark with id {benchmark_id} not found")
+
+    return benchmark_row.benchmark_metadata
+
+
+@app.get("/fetch-agent-outputs/{benchmark_id}")
+async def fetch_agent_outputs(benchmark_id: UUID) -> StreamingResponse:
+    """
+    Stream a tar file with agent outputs to the client.
+
+    Usage:
+    curl -X GET http://<endpoint>/fetch-agent-outputs/<benchmark_id>
+
+    Returns:
+        StreamingResponse
+    """
+    prefix = f"{S3_BENCHMARKS_PREFIX}/{benchmark_id}/"
+    s3_keys = list_s3_objects(prefix)
+
+    if not s3_keys:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No outputs found for benchmark '{benchmark_id}'",
+        )
+
+    def tar_generator():
+        writer: YieldingWriter = YieldingWriter()
+
+        with tarfile.open(fileobj=writer, mode="w|") as tar:
+            for s3_key in s3_keys:
+                relative_path: str = s3_key.removeprefix(prefix)
+
+                try:
+                    body, size = download_from_s3_stream(s3_key)
+
+                    tarinfo = tarfile.TarInfo(name=relative_path)
+                    tarinfo.size = size
+
+                    tar.addfile(tarinfo, fileobj=body)
+
+                    chunk = writer.pop()
+                    if chunk:
+                        yield chunk
+
+                except Exception as e:
+                    logger.warning(f"Failed to add {s3_key} to tar: {e}", exc_info=True)
+
+                    continue
+
+        final_chunk = writer.pop()
+        if final_chunk:
+            yield final_chunk
+
+    return StreamingResponse(
+        tar_generator(),
+        media_type="application/x-tar",
+        headers={"Content-Disposition": f"attachment; filename=benchmark_{benchmark_id}_outputs.tar"},
     )

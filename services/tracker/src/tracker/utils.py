@@ -1,8 +1,9 @@
 import asyncio
+import io
 import json
 import traceback
 from asyncio import Semaphore, gather
-from collections.abc import AsyncGenerator, Coroutine
+from collections.abc import AsyncGenerator, Buffer, Coroutine
 from datetime import datetime
 from enum import Enum
 from functools import cached_property
@@ -881,3 +882,31 @@ def fetch_filtered_benchmark_rows(request: FetchBenchmarksRequest, session: Sess
     benchmark_rows: Sequence[Benchmark] = session.exec(query).all()
 
     return benchmark_rows, total_count
+
+
+class YieldingWriter(io.RawIOBase):
+    """
+    Custom writer that collects bytes and returns them to stream.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self._buffer: bytearray = bytearray()
+
+    def writable(self) -> bool:
+        return True
+
+    def write(self, b: Buffer) -> int:
+        data = bytes(b)
+        self._buffer.extend(data)
+
+        return len(data)
+
+    def pop(self) -> bytes:
+        if not self._buffer:
+            return b""
+
+        chunk = bytes(self._buffer)
+        self._buffer.clear()
+
+        return chunk

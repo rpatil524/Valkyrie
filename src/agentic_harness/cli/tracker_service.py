@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 from httpx._models import Response
 from tracker.database.models import AgentContractRequest
 from tracker.types import (
+    FetchBenchmarkMetadataResponse,
     FetchBenchmarkResponse,
     FetchBenchmarksRequest,
     FetchBenchmarksResponse,
@@ -275,3 +276,43 @@ class TrackerService:
             return FetchBenchmarksResponse.model_validate(response.json())
         except httpx.HTTPError as e:
             raise TrackerServiceError(f"Failed to fetch benchmarks: {e}") from e
+
+    def fetch_agent_outputs(self, benchmark_id: UUID) -> Response:
+        """
+        Fetch agent outputs for a benchmark by its benchmark id.
+
+        Args:
+            benchmark_id: Benchmark id
+
+        Returns:
+            httpx Response with agent outputs
+        """
+        try:
+            response = self._client.get(f"{self._base_url}/fetch-agent-outputs/{benchmark_id}")
+            if response.status_code != 200:
+                details = response.json().get("detail", response.text)
+                raise TrackerServiceError(f"Failed to fetch agent outputs: {details}")
+
+            return response
+        except httpx.HTTPError as e:
+            raise TrackerServiceError(f"Failed to fetch agent outputs: {e}") from e
+
+    def fetch_benchmark_metadata(self, benchmark_id: UUID) -> FetchBenchmarkMetadataResponse:
+        """
+        Fetch benchmark metadata for a benchmark by its benchmark id.
+
+        Args:
+            benchmark_id: Benchmark id
+
+        Returns:
+            FetchBenchmarkMetadataResponse with benchmark metadata
+        """
+        try:
+            response = self._client.get(f"{self._base_url}/fetch-benchmark-metadata/{benchmark_id}")
+            if response.status_code != 200:
+                details = response.json().get("detail", response.text)
+                raise TrackerServiceError(f"Failed to fetch benchmark metadata: {details}")
+
+            return FetchBenchmarkMetadataResponse.model_validate(response.json())
+        except httpx.HTTPError as e:
+            raise TrackerServiceError(f"Failed to fetch benchmark metadata: {e}") from e

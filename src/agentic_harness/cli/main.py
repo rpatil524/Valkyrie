@@ -12,6 +12,7 @@ from agentic_harness.cli.exceptions import BundlerError, TrackerServiceError
 from agentic_harness.cli.tracker_service import TrackerService
 from agentic_harness.cli.utils import (
     check_tracker_service_health,
+    download_agent_outputs,
     format_benchmark_status,
     format_start_benchmark_response,
     paginate_benchmarks,
@@ -374,6 +375,52 @@ def fetch_benchmarks(
             paginate_benchmarks(tracker, agent_name, benchmark_name, status, order_by)
     except TrackerServiceError as e:
         raise click.ClickException(str(e))
+
+
+@cli.command()
+@click.option(
+    "--benchmark-id",
+    type=UUID,
+    required=True,
+    help="Benchmark id (e.g., 123e4567-e89b-12d3-a456-426614174000)",
+)
+@click.option(
+    "--output-dir",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Directory to save agent outputs (defaults to ./agent_outputs/<benchmark-id>)",
+)
+def fetch_agent_outputs(benchmark_id: UUID, output_dir: Path | None):
+    """
+    Fetch agent outputs for a benchmark by its benchmark id.
+
+    Example:
+        harness fetch-agent-outputs --benchmark-id 123e4567-e89b-12d3-a456-426614174000
+    """
+
+    try:
+        with TrackerService() as tracker:
+            if not check_tracker_service_health(tracker):
+                return
+
+            metadata = tracker.fetch_benchmark_metadata(benchmark_id)
+
+            if output_dir is None:
+                output_dir = Path(
+                    f"{metadata.benchmark_name}_{metadata.benchmark_arguments.contract.name}_{metadata.benchmark_id}"
+                )
+
+            click.echo(f"\r\033[KFetching agent outputs for benchmark {benchmark_id}...", nl=False)
+
+            response = tracker.fetch_agent_outputs(benchmark_id)
+
+            download_agent_outputs(response, output_dir)
+
+            click.echo(click.style(f"\r\033[K✓ Agent outputs extracted to: {output_dir}", fg="green"))
+
+    except TrackerServiceError as e:
+        click.echo(click.style(f"✗ Error: {e}", fg="red"), err=True)
+        raise click.Abort()
 
 
 if __name__ == "__main__":
