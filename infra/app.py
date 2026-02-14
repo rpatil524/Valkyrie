@@ -29,9 +29,6 @@ tracker = TrackerStack(
     env=env,
 )
 
-# Subscribe tracker to stack notifications
-tracker.add_notification_topic(shared.notification_topic)
-
 # SWE-bench service (private, only accessible from tracker)
 swebench = SwebenchStack(
     app,
@@ -42,9 +39,6 @@ swebench = SwebenchStack(
     tracker_security_group=tracker.service.service.connections.security_groups[0],
     env=env,
 )
-
-# Subscribe swebench to stack notifications
-swebench.add_notification_topic(shared.notification_topic)
 
 # Deployment order
 tracker.add_dependency(shared)
