@@ -1,5 +1,24 @@
 ## Development
 
+### Tagging
+
+On prod deploy tagging will be automated by including the following in the commit message
+
+- `` (Omitted): Patch bump - ex. v0.4.0 → v0.4.1
+- `#minor`: Minor bump - ex. v0.4.1 → v0.5.0
+- `#major`: Major bump - ex. v0.5.0 → v1.0.0
+
+### Binary Release
+
+Binary verisons of the harness are released when commits are tagged
+
+- Dev: Must manually tag a commit to release the binary
+- Prod: Will automatically be tagged and released
+
+### Deploy
+
+On prod push all changes will be deployed, slack notifications are setup
+
 ### Prerequisites
 
 - Python 3.12

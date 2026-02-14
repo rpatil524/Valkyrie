@@ -2,7 +2,7 @@ name: Auto Tag Release
 
 on:
   push:
-    branches: [dev]
+    branches: [prod]
 
 permissions:
   contents: write
@@ -24,5 +24,5 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GH_PAT }}
           WITH_V: true
           DEFAULT_BUMP: patch
-          RELEASE_BRANCHES: dev
+          RELEASE_BRANCHES: prod
           TAG_CONTEXT: branch
