@@ -24,7 +24,7 @@ from agentic_harness.cli.exceptions import TrackerServiceError
 
 load_dotenv()
 
-TRACKER_URL = os.environ.get("TRACKER_SERVICE_URL", "http://localhost:8000")
+TRACKER_URL = os.environ.get("TRACKER_SERVICE_URL", "https://benchmark-tracker.vals.ai")
 
 
 class TrackerService:
