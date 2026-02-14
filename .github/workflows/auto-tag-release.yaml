@@ -16,6 +16,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          token: ${{ secrets.GH_PAT }}
 
       - name: Get latest tag
         id: get_tag
@@ -46,20 +47,12 @@ jobs:
           echo "New tag: $NEW_TAG"
 
       - name: Create and push tag
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
           NEW_TAG="${{ steps.get_tag.outputs.new_tag }}"
 
-          # Create and push tag
+          # Create and push tag (this will automatically trigger build-cli.yml)
           git tag $NEW_TAG
           git push origin $NEW_TAG
-
-          # Wait a moment for tag to propagate
-          sleep 5
-
-          # Trigger the build-cli workflow
-          gh workflow run build-cli.yml --ref $NEW_TAG
