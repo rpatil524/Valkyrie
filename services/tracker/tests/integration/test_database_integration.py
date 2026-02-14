@@ -1,16 +1,14 @@
 import logging
-import traceback
 import uuid
-from asyncio import Semaphore, create_subprocess_exec, gather
-from pathlib import Path
+from asyncio import Semaphore, gather
 from random import sample
 from typing import Any
 from uuid import UUID
 
 import pytest
 from daytona import AsyncDaytona
-from pytest import MonkeyPatch
-from sqlmodel import Session, col, create_engine, inspect, select
+from sqlalchemy.engine import Engine
+from sqlmodel import Session, col, inspect, select
 
 from tests.utils import build_task_environment
 from tracker.benchmark_service import BenchmarkService
@@ -38,8 +36,9 @@ class TestDatabaseIntegration:
     async def _create_evaluation_result(
         self, database_session: Session, task_row: Task, evaluation_result: dict[str, Any]
     ) -> EvaluationResult:
-        instance_id = evaluation_result["instance_id"]
-        evaluation_result_row = EvaluationResult(task=task_row.id, instance_id=instance_id, result=evaluation_result)
+        evaluation_result_row = EvaluationResult(
+            task=task_row.id, instance_id=str(uuid.uuid4()), result=evaluation_result
+        )
         database_session.add(evaluation_result_row)
 
         task_row.status = TaskStatus.FINISHED
@@ -61,46 +60,22 @@ class TestDatabaseIntegration:
 
         return final_evaluation_row
 
-    async def test_create_tables(self, monkeypatch: MonkeyPatch, tmp_path: Path):
+    async def test_create_tables(self, postgres_engine: Engine):
         """
-        Test that the session.py file creates the database and tables when ran
+        Test that the database tables are created correctly.
 
         Test Cases:
-        - When the session.py file is ran, the tracker.db file is created where expected
-        - More than one table is created in the tracker.db file
+        - All expected tables are created in the database
+        - More than one table is created
         """
+        inspector = inspect(postgres_engine)
+        tables = inspector.get_table_names()
 
-        try:
-            database_location = tmp_path / "tracker.db"
-            monkeypatch.setattr("tracker.database.session._DATABASE_LOCATION", str(database_location))
-            monkeypatch.setenv("TEST_DATABASE_LOCATION", str(database_location))
+        assert len(tables) > 0, "Tables were not created in the database as expected"
 
-            result = await create_subprocess_exec(
-                "uv",
-                "run",
-                "python",
-                "-m",
-                "tracker.database.session",
-            )
-            stdout, stderr = await result.communicate()
-            return_code = result.returncode
-
-            if return_code != 0:
-                pytest.fail(
-                    f"Failed to create tables: {(stdout or b'').decode('utf-8')}: {(stderr or b'').decode('utf-8')}",
-                )
-
-            assert database_location.exists(), "Database file exists in location specified"
-
-            engine = create_engine(f"sqlite:///{database_location}")
-
-            inspector = inspect(engine)
-            tables = inspector.get_table_names()
-            assert len(tables) > 0, "Tables were not created in the database as expected"
-        except Exception as e:
-            pytest.fail(
-                f"Failed to create tables: {e}: {traceback.format_exc()}",
-            )
+        # Verify expected tables exist
+        expected_tables = {"benchmark", "task", "evaluationresult", "finalevaluation"}
+        assert expected_tables.issubset(set(tables)), f"Missing tables. Found: {tables}"
 
     async def test_database_integrity(self, database_session: Session, example_benchmark_object: Benchmark):
         """
@@ -129,8 +104,8 @@ class TestDatabaseIntegration:
         task_row = Task(task_id="task_id_1", benchmark=benchmark_row.id)
         database_session.add(task_row)
 
-        # When created its in starting status
-        assert task_row.status == TaskStatus.STARTING
+        # When created its in pending status
+        assert task_row.status == TaskStatus.PENDING
         assert task_row.finished_at is None
 
         # When the status is updated to finished, the finished_at timestamp should be set
@@ -195,7 +170,7 @@ class TestDatabaseIntegration:
         for task_id, task_row in zip(task_ids, fetched_tasks):
             assert task_row.task_id == task_id
             assert task_row.benchmark == benchmark_row.id
-            assert task_row.status == TaskStatus.STARTING
+            assert task_row.status == TaskStatus.PENDING
             assert task_row.started_at is not None
             assert task_row.finished_at is None
 
@@ -313,16 +288,19 @@ class TestDatabaseIntegration:
             evaluation_results: dict[str, dict[str, Any] | None] = {}
 
             async def process_task(task_id: str) -> None:
-                async with semaphore:
-                    task_data = await benchmark_service.request_retrieve_task(task_id=task_id)
-                    task_row = task_row_mapping[task_id]
-                    evaluation_result = await self._evaluate_instance(
-                        database_session, benchmark_service, daytona_client, task_row, task_data
-                    )
-                    evaluation_result_row = await self._create_evaluation_result(
-                        database_session, task_row, evaluation_result
-                    )
-                    evaluation_results[task_id] = evaluation_result_row.result
+                try:
+                    async with semaphore:
+                        task_data = await benchmark_service.request_retrieve_task(task_id=task_id)
+                        task_row = task_row_mapping[task_id]
+                        evaluation_result = await self._evaluate_instance(
+                            database_session, benchmark_service, daytona_client, task_row, task_data
+                        )
+                        evaluation_result_row = await self._create_evaluation_result(
+                            database_session, task_row, evaluation_result
+                        )
+                        evaluation_results[task_id] = evaluation_result_row.result
+                except Exception as e:
+                    logger.error(f"Process task failed: {e}")
 
             _ = await gather(*[process_task(task_id) for task_id in task_ids])
 

@@ -1,6 +1,8 @@
 from abc import ABC, abstractmethod
+from pathlib import Path
 
 from tracker.database.models import AgentContractRequest
+
 from agentic_harness.schemas import AgentConfig
 
 
@@ -87,6 +89,17 @@ class BaseAgentContract(ABC):
         """
         return []
 
+    @property
+    @abstractmethod
+    def final_output(self) -> Path | None:
+        """
+        Path to the final output of the agent. Needs to be an absolute path.
+
+        Returns:
+            Path | None: The path to the final output that the agent writes to.
+        """
+        pass
+
     def to_request(self) -> AgentContractRequest:
         """
         Convert the contract to a request object for the tracker service.
@@ -100,4 +113,5 @@ class BaseAgentContract(ABC):
             install_cmd=self.install_cmd,
             env=self.env,
             artifacts=self.artifacts,
+            final_output=str(self.final_output) if self.final_output else None,
         )

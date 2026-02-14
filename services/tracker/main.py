@@ -1,35 +1,41 @@
+import tarfile
+import traceback
 from uuid import UUID
 
-from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, UploadFile
+from fastapi import Body, Depends, FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import joinedload
 from sqlmodel import Session, col, func, select
 
 from tracker.benchmark_service import BenchmarkService
+from tracker.cloudwatch import get_cloudwatch_url
 from tracker.database.models import Benchmark, BenchmarkStatus, Task, TaskStatus
-from tracker.database.session import get_session
+from tracker.database.session import check_database_connection, get_session
 from tracker.exceptions import TrackerServiceError
 from tracker.logger import get_logger
-from tracker.s3 import get_contract_s3_key, upload_to_s3
+from tracker.s3 import S3_BENCHMARKS_PREFIX, download_from_s3_stream, get_contract_s3_key, list_s3_objects, upload_to_s3
 from tracker.types import (
     BenchmarkTableRow,
+    FetchBenchmarkMetadataResponse,
     FetchBenchmarkResponse,
     FetchBenchmarksRequest,
     FetchBenchmarksResponse,
-    ResumeRunResponse,
     RetrieveResultsResponse,
-    StartRunErrorResponse,
-    StartRunRequest,
-    StartRunResponse,
-    StopRunResponse,
+    RetryOrResumeBenchmarkResponse,
+    StartBenchmarkErrorResponse,
+    StartBenchmarkRequest,
+    StartBenchmarkResponse,
+    StopBenchmarkResponse,
 )
 from tracker.utils import (
     BenchmarkContext,
+    YieldingWriter,
     commit_benchmark_error,
     fetch_filtered_benchmark_rows,
+    force_stop_sandboxes,
+    initiate_stop_benchmark,
     process_benchmark,
-    resume_benchmark,
-    stop_benchmark,
+    reset_to_in_progress_status,
     stream_benchmark_results,
 )
 
@@ -47,7 +53,7 @@ async def tracker_service_error_handler(_request: Request, exc: TrackerServiceEr
 @app.get("/health")
 def health_check() -> dict[str, str]:
     """
-    Health check to ensure that the tracker service is running.
+    Health check to ensure that the tracker service is running correctly.
 
     Usage:
     curl -X GET http://<endpoint>/health
@@ -58,9 +64,11 @@ def health_check() -> dict[str, str]:
     }
 
     Returns:
-    - 200 OK if the server is running
-    - 500 Internal Server Error if the server is not running
+    - 200 OK if the server is running and database is accessible
+    - 503 Service Unavailable if the database is not accessible
     """
+    if not check_database_connection():
+        raise HTTPException(status_code=503, detail="Database is not accessible")
     return {"status": "ok"}
 
 
@@ -101,26 +109,26 @@ async def upload_contract_to_s3(
     }
 
 
-@app.post("/start-run")
-async def start_run(
-    request: StartRunRequest,
+@app.post("/start-benchmark")
+async def start_benchmark(
+    request: StartBenchmarkRequest,
     session: Session = Depends(get_session),
-) -> StartRunResponse:
+) -> StartBenchmarkResponse:
     """
     Start a benchmark run with the uploaded contract.
 
     Usage:
-    curl -X POST http://<endpoint>/start-run \
+    curl -X POST http://<endpoint>/start-benchmark \
       -H "Content-Type: application/json" \
-      -d '{"contract_name": "claude_code", "benchmark_name": "swebench", "task_ids": ["astropy__astropy-12907"]}'
+      -d '{"agent_name": "claude_code", "benchmark_name": "swebench", "task_ids": ["astropy__astropy-12907"]}'
 
     Returns:
-        StartRunResponse
+        StartBenchmarkResponse
 
     Returns:
-    - 200 OK if run starts successfully
+    - 200 OK if benchmark starts successfully
     - 400 Bad Request if parameters are invalid
-    - 500 Internal Server Error if run fails to start
+    - 500 Internal Server Error if benchmark fails to start
     """
     logger.info(f"Starting benchmark run - contract: {request.contract.name}, benchmark: {request.benchmark_name}")
 
@@ -130,7 +138,7 @@ async def start_run(
     _ = await benchmark_service.request_health_check()
 
     # Create benchmark row inside of database to mark start of the benchmark
-    benchmark_row = BenchmarkService.start_run_request_to_benchmark_object(request)
+    benchmark_row = BenchmarkService.start_benchmark_request_to_benchmark_object(request)
     session.add(benchmark_row)
     session.commit()
 
@@ -140,9 +148,9 @@ async def start_run(
             task_ids=request.task_ids, slice_str=request.slice_str
         )
     except Exception as e:
-        error_message = str(e)
+        error_message = f"{str(e)}\n{traceback.format_exc()}"
         commit_benchmark_error(benchmark_row, session, error_message)
-        error_response = StartRunErrorResponse(
+        error_response = StartBenchmarkErrorResponse(
             benchmark_id=benchmark_row.id,
             error_message=error_message,
         )
@@ -150,18 +158,19 @@ async def start_run(
         raise TrackerServiceError(error_response.model_dump_json()) from e
 
     await process_benchmark.kiq(
-        start_run_request_json=request.model_dump(),
+        start_benchmark_request_json=request.model_dump(),
         benchmark_id_str=str(benchmark_row.id),
         verified_task_ids=verify_response.task_ids,
     )
 
-    return StartRunResponse(
+    return StartBenchmarkResponse(
         benchmark_name=benchmark_row.name,
-        contract_name=request.contract.name,
+        agent_name=request.contract.name,
         benchmark_id=benchmark_row.id,
         concurrency=request.concurrency,
         started_at=benchmark_row.started_at,
         task_count=len(verify_response.task_ids),
+        cloudwatch_url=get_cloudwatch_url(str(benchmark_row.id)),
     )
 
 
@@ -233,6 +242,7 @@ async def retrieve_results(benchmark_id: UUID, session: Session = Depends(get_se
     return RetrieveResultsResponse(
         benchmark_name=benchmark_row.name,
         status=benchmark_row.status,
+        error_message=benchmark_row.error_message,
         benchmark_id=benchmark_row.id,
         benchmark_arguments=benchmark_row.arguments,
         tasks_stopped=tasks_stopped or None,  # NOTE: Only include if we stopped the benchmark
@@ -242,72 +252,102 @@ async def retrieve_results(benchmark_id: UUID, session: Session = Depends(get_se
     )
 
 
-@app.post("/stop-run/{benchmark_id}")
-async def stop_run(benchmark_id: UUID, session: Session = Depends(get_session)) -> StopRunResponse:
+@app.post("/stop-benchmark/{benchmark_id}")
+async def stop_benchmark(
+    benchmark_id: UUID, force: bool = Query(default=False), session: Session = Depends(get_session)
+) -> StopBenchmarkResponse:
     """
-    Stop a benchmark run by its id.
+    Stop a benchmark by its id.
+    If force is True, the sandboxes will be stopped and deleted, even if the tasks are in progress.
 
     Usage:
-    curl -X POST http://<endpoint>/stop-run/<benchmark_id>
+    curl -X POST http://<endpoint>/stop-benchmark/<benchmark_id>?force=true
 
     Returns:
-        StopRunResponse
+        StopBenchmarkResponse
     """
     benchmark_row = session.get(Benchmark, benchmark_id)
     if not benchmark_row:
         raise HTTPException(status_code=404, detail=f"Benchmark with id {benchmark_id} not found")
 
-    # Can only pause a in progress benchmark
-    if benchmark_row.status != BenchmarkStatus.IN_PROGRESS:
+    valid_stop_states = [BenchmarkStatus.IN_PROGRESS, BenchmarkStatus.ERROR, BenchmarkStatus.STOPPING]
+
+    if benchmark_row.status not in valid_stop_states:
         raise HTTPException(
             status_code=400,
-            detail=f"Benchmark {benchmark_id} is currently in the {benchmark_row.status} state. Can only pause an in progress benchmark.",
+            detail=f"Benchmark {benchmark_id} is currently in the {benchmark_row.status} state. Can only pause an in progress or error benchmark.",
         )
 
-    await stop_benchmark(benchmark_row, session)
+    await initiate_stop_benchmark(benchmark_row, session, force)
 
-    return StopRunResponse(
+    if force:
+        await force_stop_sandboxes(benchmark_row, session)
+
+    return StopBenchmarkResponse(
         status="success",
     )
 
 
-@app.post("/resume-run/{benchmark_id}")
-async def resume_run(benchmark_id: UUID, session: Session = Depends(get_session)) -> ResumeRunResponse:
+@app.post("/retry-or-resume-benchmark/{benchmark_id}")
+async def retry_or_resume_benchmark(
+    benchmark_id: UUID,
+    retry: bool = Query(default=False),
+    concurrency: int | None = Query(default=None),
+    task_ids: list[str] = Body(default=[]),
+    session: Session = Depends(get_session),
+) -> RetryOrResumeBenchmarkResponse:
     """
-    Resume a benchmark run by its id.
+    Retry or resume a benchmark run by its id, we only can retry or resume a benchmark if its not currently running.
 
     Usage:
-    curl -X POST http://<endpoint>/resume-run/<benchmark_id>
+    curl -X POST http://<endpoint>/retry-or-resume-benchmark/<benchmark_id>?retry=true&concurrency=20
+      -d '{"task_ids": ["task_id_1", "task_id_2"]}'
+
+    Args:
+        benchmark_id: The benchmark ID to retry/resume
+        retry: If true, retry failed tasks. If false, resume from where it left off
+        concurrency: Optional new concurrency level (overrides original value)
+        task_ids: Optional list of specific task IDs to run
 
     Returns:
-        ResumeRunResponse
+        RetryOrResumeBenchmarkResponse
     """
     benchmark_row = session.get(Benchmark, benchmark_id)
     if not benchmark_row:
         raise HTTPException(status_code=404, detail=f"Benchmark with id {benchmark_id} not found")
 
-    if benchmark_row.status != BenchmarkStatus.STOPPED:
+    invalid_states = [BenchmarkStatus.IN_PROGRESS, BenchmarkStatus.STOPPING]
+
+    if benchmark_row.status in invalid_states:
         raise HTTPException(
             status_code=400,
-            detail=f"Benchmark {benchmark_id} is in the {benchmark_row.status} state. Must be in the stopped state to resume.",
+            detail=f"Benchmark {benchmark_id} is in the {benchmark_row.status} state. Cannot continue a benchmark that is currently running.",
         )
 
-    start_run_request = benchmark_row.start_run_request
+    # NOTE: 0 is not acceptable
+    if concurrency:
+        benchmark_row.arguments.concurrency = concurrency
+        session.add(benchmark_row)
+        session.commit()
 
-    benchmark_service = start_run_request.benchmark_service
-
-    # prepare benchmark and tasks to be resumed
-    verified_task_ids = await resume_benchmark(benchmark_row, session, benchmark_service)
+    # Reset tasks and retry or resume benchmark
+    verified_task_ids = await reset_to_in_progress_status(
+        benchmark_row=benchmark_row,
+        session=session,
+        benchmark_service=benchmark_row.start_benchmark_request.benchmark_service,
+        retry=retry,
+        rerun_task_ids=task_ids,
+    )
 
     # start the benchmark with the same args used to create it
     # we will delegate inside what tasks we are running
     await process_benchmark.kiq(
-        start_run_request_json=start_run_request.model_dump(),
+        start_benchmark_request_json=benchmark_row.start_benchmark_request.model_dump(),
         benchmark_id_str=str(benchmark_row.id),
         verified_task_ids=verified_task_ids,
     )
 
-    return ResumeRunResponse(
+    return RetryOrResumeBenchmarkResponse(
         status="success",
     )
 
@@ -320,7 +360,7 @@ async def fetch_benchmarks(
     Fetch benchmarks based on the request parameters.
 
     Usage:
-    curl -X GET http://<endpoint>/fetch-benchmarks?contract_name=claude_code&benchmark_name=swebench&status=IN_PROGRESS&order_by=DESC&limit=5&offset=0
+    curl -X GET http://<endpoint>/fetch-benchmarks?agent_name=claude_code&benchmark_name=swebench&status=IN_PROGRESS&order_by=DESC&limit=5&offset=0
 
     Returns:
         list[FetchBenchmarksResponse]
@@ -335,4 +375,80 @@ async def fetch_benchmarks(
     return FetchBenchmarksResponse(
         benchmarks=benchmark_table_rows,
         total_count=total_count,
+    )
+
+
+@app.get("/fetch-benchmark-metadata/{benchmark_id}")
+async def fetch_benchmark_metadata(
+    benchmark_id: UUID, session: Session = Depends(get_session)
+) -> FetchBenchmarkMetadataResponse:
+    """
+    Fetch benchmark metadata by its id.
+
+    Usage:
+    curl -X GET http://<endpoint>/fetch-benchmark-metadata/<benchmark_id>
+
+    Returns:
+        FetchBenchmarkMetadataResponse
+    """
+    benchmark_row: Benchmark | None = session.get(Benchmark, benchmark_id)
+
+    if not benchmark_row:
+        raise HTTPException(status_code=404, detail=f"Benchmark with id {benchmark_id} not found")
+
+    return benchmark_row.benchmark_metadata
+
+
+@app.get("/fetch-agent-outputs/{benchmark_id}")
+async def fetch_agent_outputs(benchmark_id: UUID) -> StreamingResponse:
+    """
+    Stream a tar file with agent outputs to the client.
+
+    Usage:
+    curl -X GET http://<endpoint>/fetch-agent-outputs/<benchmark_id>
+
+    Returns:
+        StreamingResponse
+    """
+    prefix = f"{S3_BENCHMARKS_PREFIX}/{benchmark_id}/"
+    s3_keys = list_s3_objects(prefix)
+
+    if not s3_keys:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No outputs found for benchmark '{benchmark_id}'",
+        )
+
+    def tar_generator():
+        writer: YieldingWriter = YieldingWriter()
+
+        with tarfile.open(fileobj=writer, mode="w|") as tar:
+            for s3_key in s3_keys:
+                relative_path: str = s3_key.removeprefix(prefix)
+
+                try:
+                    body, size = download_from_s3_stream(s3_key)
+
+                    tarinfo = tarfile.TarInfo(name=relative_path)
+                    tarinfo.size = size
+
+                    tar.addfile(tarinfo, fileobj=body)
+
+                    chunk = writer.pop()
+                    if chunk:
+                        yield chunk
+
+                except Exception as e:
+                    logger.warning(f"Failed to add {s3_key} to tar: {e}", exc_info=True)
+
+                    continue
+
+        final_chunk = writer.pop()
+        if final_chunk:
+            yield final_chunk
+
+    return StreamingResponse(
+        tar_generator(),
+        media_type="application/x-tar",
+        headers={"Content-Disposition": f"attachment; filename=benchmark_{benchmark_id}_outputs.tar"},
     )

@@ -1,6 +1,7 @@
 import asyncio
 from asyncio import Semaphore, gather
 from typing import Any
+from unittest.mock import MagicMock
 
 import pytest
 from sqlmodel import Session
@@ -31,7 +32,9 @@ class TestTracker:
 
         return {task_id: None}
 
-    async def test_task_monitor(self, database_session: Session, example_benchmark_object: Benchmark) -> None:
+    async def test_task_monitor(
+        self, database_session: Session, example_benchmark_object: Benchmark, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """
         Test functionality of the TaskMonitor class
 
@@ -48,7 +51,6 @@ class TestTracker:
         database_session.add(benchmark_row)
         database_session.commit()
 
-        # Populate the database with tasks we will be tracking
         tasks_to_track: list[str] = ["task_id_1"]
         for task_id in tasks_to_track:
             task_row = Task(task_id=task_id, benchmark=benchmark_row.id)
@@ -59,9 +61,8 @@ class TestTracker:
             task_id: TrackedTask(coro=self._mock_coro(task_id=task_id)) for task_id in tasks_to_track
         }
 
-        # Create the task monitor and start tracking the tasks
-        # NOTE: We copy the mapping so we can still fetch the tasks and check references even if they are removed from the mapping inside of the monitor
-        monitor = TaskMonitor(benchmark_row, database_session, task_tracking.copy())
+        monkeypatch.setattr("tracker.utils.engine", database_session.bind)
+        monitor = TaskMonitor(benchmark_row.id, task_tracking.copy())
 
         # Test case 1. returns true if task is not running
         assert monitor._check_is_waiting(task_tracking["task_id_1"])  # type: ignore
@@ -109,8 +110,18 @@ class TestTracker:
             - When cancelled or finished, it is in the done state
         """
 
+        # Create mock task_row and session for the new TrackedTask.run() signature
+        mock_task_row = MagicMock(spec=Task)
+        mock_task_row.task_id = "task_id_1"
+
         # Pass in a blank method to replace process_task
         mock_coro = self._mock_coro(task_id="task_id_1")
+
+        mock_task_row = MagicMock(spec=Task)
+        mock_task_row.task_id = "task_id_1"
+        mock_task_row_2 = MagicMock(spec=Task)
+        mock_task_row_2.task_id = "task_id_2"
+
         tracked_task = TrackedTask(coro=mock_coro)
 
         # Test case 1. When first created, it is in the waiting state
@@ -121,8 +132,14 @@ class TestTracker:
         # Allows us to test that the task status changes to running once the semaphore is aquired.
         tracked_task_2 = TrackedTask(coro=self._validate_task_state_before_run(tracked_task, "task_id_2"))
 
+        mock_task_row_2 = MagicMock(spec=Task)
+        mock_task_row_2.task_id = "task_id_2"
+
         semaphore = Semaphore(value=2)
-        tasks = [tracked_task.run(semaphore, "task_id_1"), tracked_task_2.run(semaphore, "task_id_2")]
+        tasks = [
+            tracked_task.run(semaphore, mock_task_row),
+            tracked_task_2.run(semaphore, mock_task_row_2),
+        ]
         results = await gather(*tasks)
         assert results == [{"task_id_1": {"result": "task_id_1"}}, {"task_id_2": None}]
 
@@ -138,9 +155,13 @@ class TestTracker:
         # Test case 3. When the task is cancelled, it is in the done state and default response is returned
         tracked_task = TrackedTask(coro=self._mock_coro(task_id="task_id_3"))
 
-        # Create semaphore to run task instantly
+        mock_task_row_3 = MagicMock(spec=Task)
+        mock_task_row_3.task_id = "task_id_3"
+
         semaphore = Semaphore(value=1)
-        run_task = asyncio.create_task(tracked_task.run(semaphore, "task_id_3"))
+        mock_task_row = MagicMock(spec=Task)
+        mock_task_row.task_id = "task_id_3"
+        run_task = asyncio.create_task(tracked_task.run(semaphore, mock_task_row))
 
         # Wait for the task to start running and ensure that the status is running
         await asyncio.sleep(1)
@@ -166,9 +187,19 @@ class TestTracker:
         running_task = TrackedTask(coro=self._mock_coro(task_id="task_id_4"))
         waiting_task = TrackedTask(coro=self._mock_coro(task_id="task_id_5"))
 
+        mock_task_row_4 = MagicMock(spec=Task)
+        mock_task_row_4.task_id = "task_id_4"
+        mock_task_row_5 = MagicMock(spec=Task)
+        mock_task_row_5.task_id = "task_id_5"
+
         semaphore = Semaphore(value=1)
-        running_task_coro = running_task.run(semaphore, "task_id_4")
-        waiting_task_coro = waiting_task.run(semaphore, "task_id_5")
+        mock_task_row = MagicMock(spec=Task)
+        mock_task_row.task_id = "task_id_4"
+        mock_task_row_2 = MagicMock(spec=Task)
+        mock_task_row_2.task_id = "task_id_5"
+
+        running_task_coro = running_task.run(semaphore, mock_task_row)
+        waiting_task_coro = waiting_task.run(semaphore, mock_task_row_2)
 
         results = asyncio.gather(running_task_coro, waiting_task_coro)
 

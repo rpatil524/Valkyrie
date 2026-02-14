@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING, Any
 from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
 
-from pydantic import BaseModel, field_serializer
+from pydantic import BaseModel, computed_field, field_serializer
 from sqlalchemy import Connection, Dialect, event
 from sqlalchemy.orm import Mapped, Mapper
 from sqlmodel import (
@@ -25,24 +25,25 @@ from sqlmodel import (
 from tracker.database.utils import has_field_changed
 
 if TYPE_CHECKING:
-    from tracker.types import BenchmarkTableRow, StartRunRequest
+    from tracker.benchmark_service import BenchmarkService
+    from tracker.types import BenchmarkTableRow, FetchBenchmarkMetadataResponse, StartBenchmarkRequest
 
 
 class TaskStatus(str, Enum):
-    STARTING = "starting"
-    IN_PROGRESS = "in_progress"
-    EVALUATING = "evaluating"
-    STOPPED = "stopped"
-    FINISHED = "finished"
-    ERROR = "error"
+    PENDING = "PENDING"
+    IN_PROGRESS = "IN_PROGRESS"
+    EVALUATING = "EVALUATING"
+    STOPPED = "STOPPED"
+    FINISHED = "FINISHED"
+    ERROR = "ERROR"
 
 
 class BenchmarkStatus(str, Enum):
-    IN_PROGRESS = "in_progress"
-    STOPPING = "stopping"
-    STOPPED = "stopped"
-    FINISHED = "finished"
-    ERROR = "error"
+    IN_PROGRESS = "IN_PROGRESS"
+    STOPPING = "STOPPING"
+    STOPPED = "STOPPED"
+    FINISHED = "FINISHED"
+    ERROR = "ERROR"
 
 
 class AgentContractRequest(BaseModel):
@@ -50,6 +51,7 @@ class AgentContractRequest(BaseModel):
     artifacts: list[str] = []
     install_cmd: str
     run_cmd: str
+    final_output: str | None = None
     env: dict[str, str] = {}
 
 
@@ -148,15 +150,29 @@ class Benchmark(SQLModel, table=True):
         return {task_id: (error_message or "No error message was provided") for task_id, error_message in tasks}
 
     @property
-    def start_run_request(self) -> "StartRunRequest":
-        from tracker.types import StartRunRequest
+    def start_benchmark_request(self) -> "StartBenchmarkRequest":
+        from tracker.types import StartBenchmarkRequest
 
-        return StartRunRequest(
+        return StartBenchmarkRequest(
             contract=self.arguments.contract,
             benchmark_name=self.name,
             concurrency=self.arguments.concurrency,
             task_ids=self.arguments.task_ids,
             slice_str=self.arguments.slice_str,
+        )
+
+    @property
+    def benchmark_service(self) -> "BenchmarkService":
+        return self.start_benchmark_request.benchmark_service
+
+    @property
+    def benchmark_metadata(self) -> "FetchBenchmarkMetadataResponse":
+        from tracker.types import FetchBenchmarkMetadataResponse
+
+        return FetchBenchmarkMetadataResponse(
+            benchmark_id=self.id,
+            benchmark_name=self.name,
+            benchmark_arguments=self.arguments,
         )
 
     def create_benchmark_table_row(self, session: Session) -> "BenchmarkTableRow":
@@ -185,7 +201,7 @@ class Benchmark(SQLModel, table=True):
         return BenchmarkTableRow(
             id=self.id,
             name=self.name,
-            contract_name=self.arguments.contract.name,
+            agent_name=self.arguments.contract.name,
             started_at=self.started_at,
             status=self.status,
             total_tasks=total_tasks,
@@ -228,11 +244,17 @@ class Task(SQLModel, table=True):
 
     id: UUID = Field(default_factory=uuid4, primary_key=True)
     task_id: str
-    status: TaskStatus = Field(default=TaskStatus.STARTING)
+    status: TaskStatus = Field(default=TaskStatus.PENDING)
     started_at: datetime = Field(default_factory=lambda: datetime.now(ZoneInfo("UTC")))
     error_message: str | None = Field(default=None)
     finished_at: datetime | None = None
     benchmark: UUID = Field(foreign_key="benchmark.id")
+
+    @computed_field
+    @property
+    def alias(self) -> str:
+        """Unique alias for the task that is used to uniquely identify the same task when creating sandboxes"""
+        return f"{self.task_id}_{self.id.hex[:5]}"
 
 
 @event.listens_for(Task, "before_insert")
@@ -258,4 +280,3 @@ class EvaluationResult(SQLModel, table=True):
     task: UUID = Field(foreign_key="task.id")
     instance_id: str = Field(unique=True)
     result: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON, nullable=False))
-    agent_output: str = Field(default="")

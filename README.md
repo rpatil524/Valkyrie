@@ -26,6 +26,14 @@ make install
 
 Creates `.venv` and installs dependencies for CLI and harness from `pyproject.toml`.
 
+**Harness (Tool)**
+
+```bash
+make tool-install
+```
+
+Installs an executable into the bin which allows the cli to be ran without the prefix `uv run ...`. Installed using -e, for developing changes will update the executable. `make install` is still required for development. If not added to the path, run `uv tool update-shell` and it will be.
+
 **Services**
 
 Each service maintains its own isolated virtual environment:
@@ -39,16 +47,16 @@ Each service maintains its own isolated virtual environment:
 
 ```bash
 # With specific task IDs:
-uv run harness start-benchmark \
-  --contract <contract_path> \
+harness start-benchmark \
+  --agent <agent_path> \
   --benchmark <benchmark_name> \
   --concurrency 1 \
   --task-ids "task_1_id,task_2_id" \
   --slice "start:stop:step"
 
 # Or run whole benchmark (not recommended for development):
-uv run harness start-benchmark \
-  --contract <contract_path> \
+harness start-benchmark \
+  --agent <agent_path> \
   --benchmark <benchmark_name> \
   --concurrency 1 \
   --slice "start:stop:step"
@@ -60,34 +68,54 @@ Starts the benchmark and exits once successfully created.
 
 ```bash
 # Live updates every 60 seconds
-uv run harness fetch-benchmark --benchmark-id <benchmark_id> --connect
+harness fetch-benchmark --benchmark-id <benchmark_id> --connect
 
 # One-time status check
-uv run harness fetch-benchmark --benchmark-id <benchmark_id>
+harness fetch-benchmark --benchmark-id <benchmark_id>
 ```
 
 #### Download results
 
 ```bash
-uv run harness retrieve-results --benchmark-id <benchmark_id> --path ./results.json
+harness retrieve-results --benchmark-id <benchmark_id> --path ./results.json
 ```
 
 #### Stop a benchmark
 
 ```bash
-uv run harness stop-run --benchmark-id <benchmark_id>
+harness stop-benchmark --benchmark-id <benchmark_id>
+```
+
+Flags
+
+```
+--force: Force stops all tasks in progress or evaluating (default: false)
 ```
 
 #### Resume a benchmark
 
 ```bash
-uv run harness resume-run --benchmark-id <benchmark_id>
+harness resume-benchmark --benchmark-id <benchmark_id>
+```
+
+#### Retry a benchmark
+
+```bash
+harness retry-benchmark --benchmark-id <benchmark_id>
+```
+
+Flags
+
+```
+--retry: Retry tasks with the status `error`
+--force task_1 task_2: force retry tasks with the specified space separated ids (the retry flag is separate and not required to use this flag)
+--concurrency: change the previous concurrency when starting the benchmark, will be modified for all future runs
 ```
 
 #### List and filter benchmarks
 
 ```bash
-uv run harness fetch-benchmarks --contract-name <contract_name> --benchmark-name <benchmark_name> --status <benchmark_status> --order-by <preferred_order>
+harness fetch-benchmarks --agent-name <agent_name> --benchmark-name <benchmark_name> --status <benchmark_status> --order-by <preferred_order>
 ```
 
 ```
@@ -101,6 +129,18 @@ uv run harness fetch-benchmarks --contract-name <contract_name> --benchmark-name
 # Order by options based off when the benchmark was started (Case insensitive)
 > DESC - default
 > ASC
+```
+
+#### Download all agent outputs from benchmark
+
+```bash
+harness fetch-agent-outputs --benchmark-id <benchmark_id> --output-dir <download_directory>
+```
+
+Flags
+
+```
+--output-dir: where you would like the agent outputs to be downloaded (default: ./agent_outputs/<benchmark-id>)
 ```
 
 ### Supported Benchmarks

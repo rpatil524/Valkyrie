@@ -1,0 +1,72 @@
+"""Constants for infrastructure configuration."""
+
+# VPC
+VPC_MAX_AZS = 2
+VPC_NAT_GATEWAYS = 0
+
+# ECS Cluster
+CLUSTER_NAME = "AgenticHarnessCluster"
+
+ALLOWED_IPS: list[tuple[str, str]] = [
+    # (CIDR, description)
+    ("108.192.23.51/32", "Vals Office"),
+]
+
+# Service Discovery
+NAMESPACE = "local"
+
+# Tracker Service
+TRACKER_CPU = 2048
+TRACKER_MEMORY = 4096
+TRACKER_DOMAIN = "benchmark-tracker.vals.ai"
+TRACKER_MIN_TASKS = 1
+TRACKER_MAX_TASKS = 2
+TRACKER_SCALING_CPU_PERCENT = 70
+
+# Swebench Service
+SWEBENCH_CPU = 2048
+SWEBENCH_MEMORY = 4096
+SWEBENCH_MIN_TASKS = 1
+SWEBENCH_MAX_TASKS = 2
+SWEBENCH_SCALING_CPU_PERCENT = 70
+
+# Health Checks
+CONTAINER_HEALTH_INTERVAL_SECONDS = 30
+CONTAINER_HEALTH_RETRIES = 3
+CONTAINER_HEALTH_START_PERIOD_SECONDS = 15
+CONTAINER_HEALTH_TIMEOUT_SECONDS = 5
+ALB_HEALTH_INTERVAL_SECONDS = 20
+
+# Ports
+TRACKER_PORT = 8000
+SWEBENCH_PORT = 8000
+REDIS_PORT = 6379
+POSTGRES_PORT = 5432
+
+# Redis
+REDIS_HEALTH_INTERVAL_SECONDS = 10
+REDIS_HEALTH_START_PERIOD_SECONDS = 5
+
+# PostgreSQL
+POSTGRES_HEALTH_INTERVAL_SECONDS = 10
+POSTGRES_HEALTH_START_PERIOD_SECONDS = 10
+POSTGRES_USER = "tracker"
+POSTGRES_DB = "tracker"
+
+# RDS
+RDS_INSTANCE_CLASS = "t4g.micro"  # Smallest instance, ~$12/month
+RDS_ALLOCATED_STORAGE_GB = 20
+RDS_SECRET_NAME = "tracker-db-credentials"
+
+# Load Balancer
+ALB_IDLE_TIMEOUT_SECONDS = 60
+
+# S3
+S3_BUCKET_NAME = "agentic-harness"
+
+# Secrets Manager
+DAYTONA_SECRET_NAME = "prodAgenticHarnessDaytonaKey"
+
+# Daytona
+DAYTONA_API_URL = "https://app.daytona.io/api"
+DAYTONA_TARGET = "us"

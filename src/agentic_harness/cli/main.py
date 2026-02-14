@@ -5,15 +5,16 @@ from uuid import UUID
 
 import click
 from tracker.database.models import BenchmarkStatus
-from tracker.types import Order, StartRunResponse
+from tracker.types import Order, StartBenchmarkResponse
 
 from agentic_harness.cli.bundler import get_agent_zip_stream, get_contract
 from agentic_harness.cli.exceptions import BundlerError, TrackerServiceError
 from agentic_harness.cli.tracker_service import TrackerService
 from agentic_harness.cli.utils import (
     check_tracker_service_health,
+    download_agent_outputs,
     format_benchmark_status,
-    format_start_run_response,
+    format_start_benchmark_response,
     paginate_benchmarks,
     stream_benchmark_status,
 )
@@ -26,7 +27,9 @@ def cli():
     pass
 
 
-@cli.command()
+@cli.command(
+    help="Start a benchmark run by its benchmark id. \n\nExample:\nharness start-benchmark --agent agents/claude_code --benchmark swebench --concurrency 5"
+)
 @click.option(
     "--agent",
     type=click.Path(exists=True, path_type=Path, file_okay=False, dir_okay=True),
@@ -79,12 +82,13 @@ def start_benchmark(
     Run an agent on a benchmark.
 
     Example:
-        harness run --contract contracts/claude_code --benchmark swebench
+        harness run --agent agents/claude_code --benchmark swebench
     """
     click.echo("Arguments:")
     click.echo(f"  - Benchmark: {benchmark}")
     click.echo(f"  - Agent: {agent}")
-    click.echo(f"  - Model: {model or 'no model specified'}")
+    if model:
+        click.echo(f"  - Model: {model}")
     click.echo(f"  - Concurrency: {concurrency}")
     click.echo(f"  - Slice: {slice_str}")
     if task_ids:
@@ -120,7 +124,7 @@ def start_benchmark(
 
             click.echo(f"\r\033[KStarting benchmark for: {contract.name}...", nl=False)
 
-            response = tracker.start_run(
+            response = tracker.start_benchmark(
                 contract,
                 benchmark,
                 concurrency,
@@ -134,12 +138,14 @@ def start_benchmark(
                 click.echo(response.text)
                 return
 
-            format_start_run_response(StartRunResponse.model_validate(response.json()))
+            format_start_benchmark_response(StartBenchmarkResponse.model_validate(response.json()))
     except (BundlerError, TrackerServiceError) as e:
         raise click.ClickException(str(e))
 
 
-@cli.command()
+@cli.command(
+    help="Fetch a benchmark by its benchmark id. \n\nExample:\nharness fetch-benchmark --benchmark-id 123e4567-e89b-12d3-a456-426614174000 --connect"
+)
 @click.option(
     "--benchmark-id",
     type=UUID,
@@ -175,7 +181,9 @@ def fetch_benchmark(benchmark_id: UUID, connect: bool):
         raise click.ClickException(str(e))
 
 
-@cli.command()
+@cli.command(
+    help="Retrieve benchmark results by its benchmark id. \n\nExample:\nharness retrieve-results --benchmark-id 123e4567-e89b-12d3-a456-426614174000 --path ./results.json"
+)
 @click.option(
     "--benchmark-id",
     type=UUID,
@@ -213,34 +221,52 @@ def retrieve_results(benchmark_id: UUID, path: Path):
                     raise click.Abort()
 
             with open(path, "w") as f:
-                f.write(results_response.model_dump_json(indent=4, exclude_none=True))
+                f.write(
+                    results_response.model_dump_json(
+                        indent=4,
+                        exclude_none=True,
+                        exclude={"benchmark_arguments": {"contract": {"env"}}},
+                    )
+                )
 
             click.echo(f"Results saved to '{path}'")
     except TrackerServiceError as e:
         raise click.ClickException(str(e))
 
 
-@cli.command()
+@cli.command(
+    help="Stop a benchmark run by its benchmark id. \n\nExample:\nharness stop-benchmark --benchmark-id 123e4567-e89b-12d3-a456-426614174000 --force"
+)
 @click.option(
     "--benchmark-id",
     type=UUID,
     required=True,
     help="Benchmark id (e.g., 123e4567-e89b-12d3-a456-426614174000)",
 )
-def stop_run(benchmark_id: UUID):
+@click.option(
+    "--force",
+    is_flag=True,
+    required=False,
+    default=False,
+    help="Force stop the benchmark run",
+)
+def stop_benchmark(benchmark_id: UUID, force: bool):
     """
-    Stop a benchmark run by its benchmark id.
+    Stop a benchmark by its benchmark id.
 
     Example:
-        harness stop-run --benchmark-id 123e4567-e89b-12d3-a456-426614174000
+        harness stop-benchmark --benchmark-id 123e4567-e89b-12d3-a456-426614174000
     """
-    click.echo(f"Stopping run for benchmark: {benchmark_id}")
+    click.echo(f"Stopping benchmark for benchmark: {benchmark_id}")
+
+    if force:
+        click.echo(click.style("Force stopping the benchmark", fg="yellow", bold=True))
     try:
         with TrackerService() as tracker:
             if not check_tracker_service_health(tracker):
                 return
 
-            _ = tracker.stop_run(benchmark_id)
+            _ = tracker.stop_benchmark(benchmark_id, force)
             click.echo(
                 click.style(
                     "Run is currently being stopped. Will be stopped when all tasks in flight are finished.",
@@ -258,28 +284,60 @@ def stop_run(benchmark_id: UUID):
         raise click.ClickException(str(e))
 
 
-@cli.command()
+@cli.command(
+    help="Resume a benchmark run by its benchmark id. \n\nExample:\nharness resume-benchmark --benchmark-id 123e4567-e89b-12d3-a456-426614174000 --retry --concurrency 20"
+)
 @click.option(
     "--benchmark-id",
     type=UUID,
     required=True,
     help="Benchmark id (e.g., 123e4567-e89b-12d3-a456-426614174000)",
 )
-def resume_run(benchmark_id: UUID):
+@click.option(
+    "--retry",
+    is_flag=True,
+    required=False,
+    default=False,
+    help="Retry tasks with the status error",
+)
+@click.option(
+    "--concurrency",
+    type=int,
+    required=False,
+    default=None,
+    help="Override concurrency level (e.g., 20)",
+)
+@click.option(
+    "--task-ids",
+    type=str,
+    required=False,
+    default=None,
+    help="Comma-separated list of task IDs (e.g., astropy__astropy-12907,astropy__astropy-12908)",
+)
+@click.pass_context
+def resume_benchmark(
+    ctx: click.Context, benchmark_id: UUID, retry: bool, concurrency: int | None, task_ids: str | None
+):
     """
     Resume a benchmark run by its benchmark id.
 
     Example:
-        harness resume-run --benchmark-id 123e4567-e89b-12d3-a456-426614174000
+        harness resume-benchmark --benchmark-id 123e4567-e89b-12d3-a456-426614174000 --retry --concurrency 20
     """
-    click.echo(f"Resuming run for benchmark: {benchmark_id}")
+    click.echo("Selected to run a benchmark that has already been created, will rerun valid tasks.")
+
+    # NOTE: workaround for auto retrying tasks when using the retry-benchmark command
+    if ctx.info_name == "retry-benchmark":
+        retry = True
+
     try:
         with TrackerService() as tracker:
             if not check_tracker_service_health(tracker):
                 return
 
-            _ = tracker.resume_run(benchmark_id)
-            click.echo(click.style("Run resumed successfully!", fg="green", bold=True))
+            retry_task_ids = task_ids.split() if task_ids else []
+            _ = tracker.retry_or_resume_benchmark(benchmark_id, retry, concurrency, retry_task_ids)
+            click.echo(click.style("Run continued successfully!", fg="green", bold=True))
             click.echo(
                 click.style(
                     f"Track progress: harness fetch-benchmark --benchmark-id {benchmark_id} --connect",
@@ -290,12 +348,25 @@ def resume_run(benchmark_id: UUID):
         raise click.ClickException(str(e))
 
 
-@cli.command()
+# Alias for resume-benchmark, the logic is the same under the hood
+retry_benchmark_command = click.Command(
+    name="retry-benchmark",
+    callback=resume_benchmark.callback,
+    params=resume_benchmark.params,
+    help="Retry a benchmark run by its benchmark id. \n\nExample:\nharness retry-benchmark --benchmark-id 123e4567-e89b-12d3-a456-426614174000 --retry --concurrency 20",
+    short_help="Retry a benchmark run by its benchmark id.",
+)
+cli.add_command(retry_benchmark_command)
+
+
+@cli.command(
+    help="Fetch benchmarks by providing filter values. \n\nExample:\nharness fetch-benchmarks --agent-name claude_code --benchmark-name swebench --status IN_PROGRESS --order-by DESC"
+)
 @click.option(
-    "--contract-name",
+    "--agent-name",
     type=str,
     required=False,
-    help="Contract name (e.g., claude_code)",
+    help="Agent name (e.g., claude_code)",
 )
 @click.option(
     "--benchmark-name",
@@ -318,7 +389,7 @@ def resume_run(benchmark_id: UUID):
     help="Order by the benchmarks to fetch (e.g., desc, asc)",
 )
 def fetch_benchmarks(
-    contract_name: str | None,
+    agent_name: str | None,
     benchmark_name: str | None,
     status: str | None,
     order_by: str = "desc",
@@ -329,16 +400,64 @@ def fetch_benchmarks(
     Use vim keys to navigate: [h] previous page, [l] next page, [q] quit.
 
     Example:
-        harness fetch-benchmarks --contract-name claude_code --benchmark-name swebench --status IN_PROGRESS --order-by DESC
+        harness fetch-benchmarks --agent-name claude_code --benchmark-name swebench --status IN_PROGRESS --order-by DESC
     """
     try:
         with TrackerService() as tracker:
             if not check_tracker_service_health(tracker):
                 return
 
-            paginate_benchmarks(tracker, contract_name, benchmark_name, status, order_by)
+            paginate_benchmarks(tracker, agent_name, benchmark_name, status, order_by)
     except TrackerServiceError as e:
         raise click.ClickException(str(e))
+
+
+@cli.command(
+    help="Fetch agent outputs by benchmark id. \n\nExample:\nharness fetch-agent-outputs --benchmark-id 123e4567-e89b-12d3-a456-426614174000 --output-dir ./agent_outputs"
+)
+@click.option(
+    "--benchmark-id",
+    type=UUID,
+    required=True,
+    help="Benchmark id (e.g., 123e4567-e89b-12d3-a456-426614174000)",
+)
+@click.option(
+    "--output-dir",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Directory to save agent outputs (defaults to ./agent_outputs/<benchmark-id>)",
+)
+def fetch_agent_outputs(benchmark_id: UUID, output_dir: Path | None):
+    """
+    Fetch agent outputs for a benchmark by its benchmark id.
+
+    Example:
+        harness fetch-agent-outputs --benchmark-id 123e4567-e89b-12d3-a456-426614174000
+    """
+
+    try:
+        with TrackerService() as tracker:
+            if not check_tracker_service_health(tracker):
+                return
+
+            metadata = tracker.fetch_benchmark_metadata(benchmark_id)
+
+            if output_dir is None:
+                output_dir = Path(
+                    f"{metadata.benchmark_name}_{metadata.benchmark_arguments.contract.name}_{metadata.benchmark_id}"
+                )
+
+            click.echo(f"\r\033[KFetching agent outputs for benchmark {benchmark_id}...", nl=False)
+
+            response = tracker.fetch_agent_outputs(benchmark_id)
+
+            download_agent_outputs(response, output_dir)
+
+            click.echo(click.style(f"\r\033[K✓ Agent outputs extracted to: {output_dir}", fg="green"))
+
+    except TrackerServiceError as e:
+        click.echo(click.style(f"✗ Error: {e}", fg="red"), err=True)
+        raise click.Abort()
 
 
 if __name__ == "__main__":

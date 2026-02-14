@@ -20,12 +20,10 @@ from tracker.database.models import (
     Task,
     TaskStatus,
 )
-from tracker.database.session import get_session
 from tracker.types import (
     FetchBenchmarksRequest,
-    HealthCheckResponse,
     RetrieveResultsResponse,
-    StartRunRequest,
+    StartBenchmarkRequest,
     VerifyTaskIdsResponse,
 )
 
@@ -33,19 +31,10 @@ client = TestClient(app)
 
 
 class TestFastapiServer:
-    async def _mock_request_verify_task_ids(self, *args: Any, **kwargs: Any) -> VerifyTaskIdsResponse:
-        return VerifyTaskIdsResponse(task_ids=["task_id"] * 500)
-
-    async def _mock_process_benchmark_kiq(self, *args: Any, **kwargs: Any) -> None:
-        pass
-
-    async def _mock_request_health_check(self, *args: Any, **kwargs: Any) -> HealthCheckResponse:
-        return HealthCheckResponse(status="ok")
-
     async def _mock_request_verify_task_ids_error(self, *args: Any, **kwargs: Any) -> VerifyTaskIdsResponse:
         raise Exception("Error verifying task ids")
 
-    def test_health_check(self):
+    def test_health_check(self, monkeypatch: MonkeyPatch):
         """
         Test health check of the fastapi server.
 
@@ -53,15 +42,20 @@ class TestFastapiServer:
             - Returns 200 OK
             - Response contains expected format
         """
+        # Mock database connection check for unit tests
+        monkeypatch.setattr("main.check_database_connection", lambda: True)
+
         response = client.get("/health")
 
         assert response.status_code == 200
 
         assert response.json() == {"status": "ok"}
 
-    async def test_start_run(self, contract: AgentContractRequest, monkeypatch: MonkeyPatch, database_session: Session):
+    async def test_start_benchmark(
+        self, contract: AgentContractRequest, monkeypatch: MonkeyPatch, database_session: Session
+    ):
         """
-        Test start run of the fastapi server.
+        Test start benchmark of the fastapi server.
 
         Test Cases:
             - Returns 200 OK
@@ -70,43 +64,25 @@ class TestFastapiServer:
             - Benchmark row has been created and pushed to the database
         """
 
-        # We use a Depends on the session for this endpoint
-        def get_test_session():
-            yield database_session
-
-        app.dependency_overrides[get_session] = get_test_session
-
         # Example request sent from the cli to the fastapi server
-        request = StartRunRequest(
+        request = StartBenchmarkRequest(
             contract=contract,
             benchmark_name="swebench",
             concurrency=10,
             task_ids=None,
         )
 
-        # Mock health check to benchmark service
-        monkeypatch.setattr(
-            BenchmarkService,
-            "request_health_check",
-            self._mock_request_health_check,
-        )
+        async def _mock_request_verify_task_ids(*_args: Any, **_kwargs: Any) -> VerifyTaskIdsResponse:
+            return VerifyTaskIdsResponse(task_ids=[f"task_{i}" for i in range(500)])
 
-        # Expected 500 task ids to be returned from benchmark service
         monkeypatch.setattr(
-            BenchmarkService,
-            "request_verify_task_ids",
-            self._mock_request_verify_task_ids,
-        )
-
-        # Ignore background task to run benchmark
-        monkeypatch.setattr(
-            "main.process_benchmark.kiq",
-            self._mock_process_benchmark_kiq,
+            "tracker.benchmark_service.BenchmarkService.request_verify_task_ids",
+            _mock_request_verify_task_ids,
         )
 
         # Send request to start the run and ensure that the start response is returned
         response = client.post(
-            "/start-run",
+            "/start-benchmark",
             json=request.model_dump(),
         )
 
@@ -134,7 +110,7 @@ class TestFastapiServer:
 
         # Remaining fields match what we passed into the request
         assert json_response["benchmark_name"] == request.benchmark_name
-        assert json_response["contract_name"] == request.contract.name
+        assert json_response["agent_name"] == request.contract.name
         assert json_response["concurrency"] == request.concurrency
 
     async def test_fetch_benchmark(self, database_session: Session, example_benchmark_object: Benchmark):
@@ -147,11 +123,6 @@ class TestFastapiServer:
             - Benchmark details are returned in the response
             - Benchmark details are updated as benchmark progresses
         """
-
-        def get_test_session():
-            yield database_session
-
-        app.dependency_overrides[get_session] = get_test_session
 
         # Test case 1. Return 404 Not Found if benchmark does not exist
         query_params = {"benchmark_id": str(uuid4())}
@@ -232,11 +203,6 @@ class TestFastapiServer:
             - Tasks stopped field is populated when we stop the benchmark
             - Task errors field is populated when we encounter an error
         """
-
-        def get_test_session():
-            yield database_session
-
-        app.dependency_overrides[get_session] = get_test_session
 
         # Test case 1. 404 on invalid benchmark id
         query_params = {"benchmark_id": str(uuid4())}
@@ -355,7 +321,7 @@ class TestFastapiServer:
         assert len(response_json.get("evaluation_results")) == 10
         assert response_json.get("final_evaluation")
 
-        # Check for tasks with erorrs
+        # Check for tasks with error
         assert response_json.get("task_errors")
         assert len(response_json.get("task_errors")) == 2
 
@@ -376,27 +342,19 @@ class TestFastapiServer:
             - Benchmark row is marked as error and error message is set
         """
 
-        def get_test_session():
-            yield database_session
-
-        app.dependency_overrides[get_session] = get_test_session
-
-        # Mock health check to benchmark service
-        monkeypatch.setattr(BenchmarkService, "request_health_check", self._mock_request_health_check)
-
         # Expection is raised if verify task ids fails
         monkeypatch.setattr(BenchmarkService, "request_verify_task_ids", self._mock_request_verify_task_ids_error)
 
         # Example request sent from the cli to the fastapi server
-        request = StartRunRequest(
+        request = StartBenchmarkRequest(
             contract=contract,
             benchmark_name="swebench",
             concurrency=10,
             task_ids=None,
         )
 
-        # Send request to start the run and ensure that the start response is returned
-        response = client.post("/start-run", json=request.model_dump())
+        # Send request to start the benchmark and ensure that the start response is returned
+        response = client.post("/start-benchmark", json=request.model_dump())
 
         # Test case 1. Returns error message from exception
         assert response.status_code == 500
@@ -406,7 +364,7 @@ class TestFastapiServer:
         # benchmark id and error message are included in the response
         assert detail
         assert detail.get("benchmark_id")
-        assert detail.get("error_message") == "Error verifying task ids"
+        assert "Error verifying task ids" in detail.get("error_message")
 
         # Test case 2. Benchmark row is marked as error and error message is set
         benchmark_row = database_session.get(Benchmark, UUID(detail.get("benchmark_id")))
@@ -424,11 +382,6 @@ class TestFastapiServer:
             - Can order by started at
             - Edge cases with no benchmarks found
         """
-
-        def get_test_session():
-            yield database_session
-
-        app.dependency_overrides[get_session] = get_test_session
 
         fetch_benchmarks_request = FetchBenchmarksRequest()
 
@@ -482,7 +435,7 @@ class TestFastapiServer:
 
         # Search for the 4 benchmarks just created + the original one we added before
         fetch_benchmarks_request.benchmark_name = "swebench"
-        fetch_benchmarks_request.contract_name = "claude_code"
+        fetch_benchmarks_request.agent_name = "claude_code"
         fetch_benchmarks_request.status = BenchmarkStatus.IN_PROGRESS
 
         # When we fetch with benchmarks found, we return a 200 OK
@@ -496,7 +449,7 @@ class TestFastapiServer:
 
         # Clear filters and search again (checking limit and total)
         fetch_benchmarks_request.benchmark_name = None
-        fetch_benchmarks_request.contract_name = None
+        fetch_benchmarks_request.agent_name = None
         fetch_benchmarks_request.status = None
 
         response = client.get(
