@@ -46,7 +46,6 @@ install:
 	@echo "Installing cli dependencies..."
 	uv cache clean model-library valsai
 	uv sync --dev
-	make update-submodules
 	@echo "🎉 Done! Run 'source .venv/bin/activate' to activate the environment locally."
 
 tool-install:

@@ -69,6 +69,12 @@ make install
 
 Creates `.venv` and installs dependencies for CLI and harness from `pyproject.toml`.
 
+```bash
+make update-submodules
+```
+
+Install submodules for agents and services
+
 **Harness (Tool)**
 
 ```bash
