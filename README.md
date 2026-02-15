@@ -1,3 +1,27 @@
+## Binary package
+
+Instructions may vary depending on architecture
+
+### Download Binary
+
+1. Select latest release from branch [prod](https://github.com/vals-ai/agentic-harness/tree/prod)
+2. Find the [latest release version](https://github.com/vals-ai/agentic-harness/releases)
+3. Download binary, currently only `harness-darwin-amd64` is offered.
+
+### Add to path
+
+You may be able to skip steps 1 and 5 if you already have the directory `~/.local/bin` created. If you are using a shell other than zsh you will need to change the paths.
+
+1. Create local bin if it does not exist, `mkdir -p ~/.local/bin`
+2. Move installed binary to bin `mv harness-darwin-amd64 ~/.local/bin/harness`
+3. Make it an executable `chmod +x ~/.local/bin/harness-darwin-amd64`
+4. Add to path `echo 'export PATH="$HOME/.local/bin/:$PATH"' >> ~/.zshrc`
+5. Source shell `source ~/.zshrc`
+
+If on Macbook you should run `xattr -d com.apple.quarantine ~/.local/bin/harness-darwin-amd64`
+
+Navigate to [usage](#usage) for a list of commands
+
 ## Development
 
 ### Tagging
@@ -44,6 +68,12 @@ make install
 ```
 
 Creates `.venv` and installs dependencies for CLI and harness from `pyproject.toml`.
+
+```bash
+make update-submodules
+```
+
+Install submodules for agents and services
 
 **Harness (Tool)**
 
