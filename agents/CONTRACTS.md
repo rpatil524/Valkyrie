@@ -14,6 +14,7 @@ Create a `contract.py` file in your agent directory that defines a contract clas
 import os
 from dotenv import load_dotenv
 from pathlib import Path
+from typing import Any
 
 from agentic_harness.contract import BaseAgentContract
 from agentic_harness.schemas import AgentConfig
@@ -30,7 +31,7 @@ class MyAgentContract(BaseAgentContract):
 
     @property
     def artifacts(self) -> list[str]:
-        return ["setup.sh", "submodules/my_agent"]
+        return ["setup.sh", "submodule/my_agent"]
 
     @property
     def install_cmd(self) -> str:
@@ -44,9 +45,9 @@ class MyAgentContract(BaseAgentContract):
     def env(self) -> dict[str, str]:
         return {"API_KEY": os.getenv("API_KEY")}
 
-    @property
-    def run_cmd(self) -> str:
-        return "my_agent --task {problem_statement}"
+    @override
+    def run_cmd(self, problem_statement_path: str, task_id: str, kwargs: dict[str, Any]) -> str:
+        return f"my_agent --task {problem_statement_path}"
 
 
 # Export the contract class
@@ -89,15 +90,16 @@ def final_output(self) -> Path | None:
     return Path("/absolute/path/to/output")
 ```
 
-### `run_cmd: str`
+### `run_cmd(problem_statement_path, task_id, extra_args) -> str`
 
-Command to run the agent on a task. Use `{problem_statement}` as a placeholder (single braces!) - it will be replaced with the actual task prompt at runtime.
+Method to build the shell command that runs the agent on a task. The harness calls this method at serialization time with literal placeholder strings — `problem_statement_path` will be `"{problem_statement_path}"` and `task_id` will be `"{task_id}"`. The tracker substitutes the real values at runtime just before executing the command in the sandbox.
+
+> **Do not splice, slice, or transform `problem_statement_path` or `task_id`.** Use them only as-is inside an f-string or string concatenation. If you manipulate the strings (e.g. `problem_statement_path.split("/")[-1]`) the placeholder will be destroyed and the tracker will not be able to substitute the real value.
 
 ```python
-@property
-def run_cmd(self) -> str:
-    # Use single braces for the placeholder
-    return "my_agent --task {problem_statement}"
+@override
+def run_cmd(self, problem_statement_path: str, task_id: str, kwargs: dict[str, Any]) -> str:
+    return f"my_agent --task {problem_statement_path}"
 ```
 
 ## Optional Properties
@@ -109,7 +111,7 @@ Files and directories to bundle with the agent (default: empty list). Paths are 
 ```python
 @property
 def artifacts(self) -> list[str]:
-    return ["setup.sh", "submodules/my_agent", "config/settings.yaml"]
+    return ["setup.sh", "submodule/my_agent", "config/settings.yaml"]
 ```
 
 ### `env: dict[str, str]`
@@ -131,8 +133,8 @@ The `AgentConfig` parameter allows you to pass runtime configuration (like model
 
 ```python
 class MyAgentContract(BaseAgentContract):
-    @property
-    def run_cmd(self) -> str:
+    @abstractmethod
+    def run_cmd(self, problem_statement_path: str, task_id: str, kwargs: dict[str, Any]) -> str:
         # Make agent_config required by removing the default None
         if not agent_config:
             raise ValueError("AgentConfig is required")
@@ -155,7 +157,7 @@ agents/
   my_agent/
     contract.py           # Contract definition (required)
     setup.sh              # Installation script (optional)
-    submodules/           # Agent code and dependencies (optional)
+    submodule/           # Agent code and dependencies (optional)
       my_agent/
         pyproject.toml
         main.py
@@ -178,7 +180,7 @@ curl -fsSL https://example.com/install.sh | bash
 echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
 
 # Install Python dependencies
-cd submodules/my_agent && uv sync
+cd submodule/my_agent && uv sync
 ```
 
 ## Creating Wrapper Scripts
@@ -189,8 +191,8 @@ If your agent requires a virtual environment or specific setup before running, c
 # In setup.sh
 cat > /usr/local/bin/my_agent << 'WRAPPER'
 #!/bin/bash
-source /bundle/my_agent/submodules/my_agent/.venv/bin/activate
-exec python /bundle/my_agent/submodules/my_agent/main.py "$@"
+source /bundle/my_agent/submodule/my_agent/.venv/bin/activate
+exec python /bundle/my_agent/submodule/my_agent/main.py "$@"
 WRAPPER
 chmod +x /usr/local/bin/my_agent
 ```

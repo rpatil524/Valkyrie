@@ -3,6 +3,7 @@
 import json
 import tarfile
 import tempfile
+from datetime import datetime
 from pathlib import Path
 from uuid import UUID
 
@@ -19,6 +20,11 @@ from tracker.types import (
 )
 
 from agentic_harness.cli.tracker_service import TrackerService
+
+
+def local_time(dt: datetime) -> str:
+    """Convert UTC time to users local time"""
+    return dt.astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
 
 
 class BenchmarkFormatter:
@@ -118,7 +124,7 @@ def format_benchmark_status(benchmark_response: FetchBenchmarkResponse) -> None:
     status_color = BenchmarkFormatter.STATUS_COLORS[status.value]
 
     click.echo(f"{click.style('Benchmark:', bold=True)} {benchmark_name}")
-    click.echo(f"{click.style('Started at:', bold=True)} {started_at}")
+    click.echo(f"{click.style('Started at:', bold=True)} {local_time(started_at)}")
     click.echo(f"{click.style('Benchmark ID:', bold=True)} {benchmark_id}")
     click.echo()
 
@@ -142,7 +148,7 @@ def format_start_benchmark_response(start_benchmark_response: StartBenchmarkResp
     click.echo(f"│ Benchmark:     {start_benchmark_response.benchmark_name}")
     click.echo(f"│ Agent:      {start_benchmark_response.agent_name}")
     click.echo(f"│ Benchmark ID:  {start_benchmark_response.benchmark_id}")
-    click.echo(f"│ Started at:    {start_benchmark_response.started_at}")
+    click.echo(f"│ Started at:    {local_time(start_benchmark_response.started_at)}")
     click.echo(f"│ Max concurrency:   {start_benchmark_response.concurrency}")
     click.echo(f"│ Total tasks:   {start_benchmark_response.task_count}")
     click.echo(f"│ CloudWatch:    {start_benchmark_response.cloudwatch_url}")
@@ -150,31 +156,37 @@ def format_start_benchmark_response(start_benchmark_response: StartBenchmarkResp
     click.echo()
     click.echo(
         click.style(
-            f"Track progress: harness fetch-benchmark --benchmark-id {start_benchmark_response.benchmark_id} --connect",
+            f"Track progress: harness benchmark fetch --benchmark-id {start_benchmark_response.benchmark_id} --connect",
             fg="cyan",
         )
     )
     click.echo(
         click.style(
-            f"Retrieve results: harness retrieve-results --benchmark-id {start_benchmark_response.benchmark_id} --path ./results.json",
+            f"Retrieve results: harness benchmark results --benchmark-id {start_benchmark_response.benchmark_id} --path ./results.json",
             fg="cyan",
         )
     )
     click.echo(
         click.style(
-            f"Stop benchmark: harness stop-benchmark --benchmark-id {start_benchmark_response.benchmark_id}",
+            f"Stop benchmark: harness benchmark stop --benchmark-id {start_benchmark_response.benchmark_id}",
             fg="cyan",
         )
     )
     click.echo(
         click.style(
-            f"Resume benchmark: harness resume-benchmark --benchmark-id {start_benchmark_response.benchmark_id}",
+            f"Resume benchmark: harness benchmark resume --benchmark-id {start_benchmark_response.benchmark_id}",
             fg="cyan",
         )
     )
     click.echo(
         click.style(
-            f"Retry benchmark: harness retry-benchmark --benchmark-id {start_benchmark_response.benchmark_id}",
+            f"Retry benchmark: harness benchmark retry --benchmark-id {start_benchmark_response.benchmark_id}",
+            fg="cyan",
+        )
+    )
+    click.echo(
+        click.style(
+            f"Fetch agent outputs: harness agent outputs --benchmark-id {start_benchmark_response.benchmark_id} --output-dir .",
             fg="cyan",
         )
     )
