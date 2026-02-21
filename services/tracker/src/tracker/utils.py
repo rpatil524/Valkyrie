@@ -12,10 +12,10 @@ from typing import Any, NamedTuple, Sequence, cast
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
+from benchmark_service.client import BenchmarkServiceClient, BenchmarkServiceError
 from daytona import AsyncDaytona, AsyncPaginatedSandboxes, AsyncSandbox, SandboxState
 from sqlmodel import Session, asc, case, col, delete, desc, func, or_, select, update
 
-from benchmark_service.client import BenchmarkServiceClient, BenchmarkServiceError
 from tracker.cloudwatch import cloudwatch_stream, create_benchmark_group, reset_cloudwatch_stream
 from tracker.config import broker
 from tracker.database.models import (
@@ -299,6 +299,11 @@ async def process_task(
             "Task": task_row.task_id,
         }
 
+        with Session(bind=engine) as task_session:
+            task = fetch_task_row(task_row.id, task_session)
+            task.status = TaskStatus.BUILDING
+            task_session.commit()
+
         async with create_sandbox(
             daytona=benchmark_service.daytona_client,
             sandbox_name=task_row.alias,
@@ -398,9 +403,10 @@ def set_benchmark_final_status(benchmark_row: Benchmark, session: Session) -> No
     tasks_not_finished: int = session.exec(
         select(func.count(col(Task.id)))
         .where(col(Task.benchmark) == benchmark_row.id)
-        .where(col(Task.status).in_([TaskStatus.PENDING, TaskStatus.IN_PROGRESS]))
+        .where(col(Task.status).in_([TaskStatus.PENDING, TaskStatus.BUILDING, TaskStatus.IN_PROGRESS]))
     ).one()
 
+    # Tasks will be in a non-finished state if something interrupts them while they are running and the state errors here
     if tasks_not_finished:
         raise TrackerServiceError(
             f"Cannot set final status for benchmark {benchmark_row.id} because tasks are still in the pending or in progress state."
@@ -560,6 +566,9 @@ async def process_benchmark(
             error_message = f"{str(e)}\n{traceback.format_exc()}"
             commit_benchmark_error(benchmark_row, session, error_message)
     finally:
+        with Session(bind=engine) as session:
+            catch_errors_during_cleanup(benchmark_id, session)
+
         await benchmark_service.close()
 
 
@@ -660,6 +669,38 @@ def commit_benchmark_error(benchmark_row: Benchmark, session: Session, error_mes
     session.commit()
 
 
+def catch_errors_during_cleanup(benchmark_id: UUID, session: Session) -> None:
+    """
+    On task exit we must clean up any edge cases so that it does not affect the users experience.
+    There are sometimes fishy things that may occur with the sandboxes that if not dealt with could become an issue.
+
+    1. Benchmark status must be in a finished state
+    2. All tasks must be in a finished state
+    """
+    terminal_statuses = [BenchmarkStatus.FINISHED, BenchmarkStatus.ERROR, BenchmarkStatus.STOPPED]
+
+    benchmark_row = fetch_benchmark_row(benchmark_id, session)
+    if benchmark_row.status in terminal_statuses:
+        return
+
+    # Force non exited tasks to be ERROR
+    task_terminal_statuses = [TaskStatus.FINISHED, TaskStatus.ERROR, TaskStatus.STOPPED]
+    session.exec(
+        update(Task)
+        .where(col(Task.benchmark) == benchmark_id)
+        .where(col(Task.status).notin_(task_terminal_statuses))
+        .values(status=TaskStatus.ERROR, error_message="Undetected exit of task")
+    )
+    session.commit()
+
+    # Force benchmark to ERROR so that the user knows they can retry any failed tasks
+    commit_benchmark_error(
+        benchmark_row,
+        session,
+        f"Benchmark {benchmark_id} exited without finishing",
+    )
+
+
 def commit_task_error(task_row: Task, session: Session, error_message: str) -> None:
     task_row.status = TaskStatus.ERROR
     task_row.error_message = error_message
@@ -724,11 +765,11 @@ async def initiate_stop_benchmark(benchmark_row: Benchmark, session: Session, fo
     NOTE: Tasks that have already started will continue to run and finish.
     """
     try:
-        # Update all rows where tasks are pending to stopped
+        # Update all rows where tasks are pending or building to stopped
         result = session.exec(
             update(Task)
             .where(col(Task.benchmark) == benchmark_row.id)
-            .where(col(Task.status) == TaskStatus.PENDING)
+            .where(col(Task.status).in_([TaskStatus.PENDING, TaskStatus.BUILDING]))
             .values(status=TaskStatus.STOPPED)
         )
         session.commit()
@@ -802,7 +843,7 @@ async def force_stop_sandboxes(benchmark_row: Benchmark, session: Session) -> No
     session.exec(
         update(Task)
         .where(col(Task.benchmark) == benchmark_row.id)
-        .where(col(Task.status).in_([TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING]))
+        .where(col(Task.status).in_([TaskStatus.BUILDING, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING]))
         .values(status=TaskStatus.STOPPED)
     )
 
