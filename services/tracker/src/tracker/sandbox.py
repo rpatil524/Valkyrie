@@ -11,6 +11,7 @@ from contextlib import asynccontextmanager
 from pathlib import PurePosixPath
 from typing import Any, AsyncGenerator
 
+from benchmark_service.schemas import Resources as TrackerResources
 from daytona import (
     AsyncDaytona,
     AsyncSandbox,
@@ -27,7 +28,6 @@ from tracker.database.models import AgentContractRequest
 from tracker.exceptions import SandboxError
 from tracker.logger import get_logger
 from tracker.s3 import download_from_s3, get_contract_s3_key, upload_to_s3
-from tracker.types import Resources as TrackerResources
 
 logger = get_logger(__name__)
 
@@ -271,6 +271,7 @@ async def run_agent(
     sandbox: AsyncSandbox,
     contract: AgentContractRequest,
     problem_statement: str,
+    task_id: str,
     log_output: Callable[[str], None],
     cwd: str,
     agent_output_s3_key: str | None = None,
@@ -299,7 +300,7 @@ async def run_agent(
     problem_statement_path = "/tmp/problem_statement.txt"
     await sandbox.fs.upload_file(problem_statement.encode(), problem_statement_path)
 
-    run_cmd = contract.run_cmd.replace("{problem_statement_path}", problem_statement_path)
+    run_cmd = contract.run_cmd.replace("{problem_statement_path}", problem_statement_path).replace("{task_id}", task_id)
 
     # Run the agent without including task directory dependencies
     await stream_command_output(sandbox, f"cd {cwd} && PYTHONSAFEPATH=1 {run_cmd}", log_output)

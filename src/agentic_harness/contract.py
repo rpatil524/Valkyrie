@@ -1,5 +1,6 @@
 from abc import ABC, abstractmethod
 from pathlib import Path
+from typing import Any
 
 from tracker.database.models import AgentContractRequest
 
@@ -33,21 +34,22 @@ class BaseAgentContract(ABC):
         Returns:
             Agent name (e.g., "claude_code", "sweagent")
         """
-        pass
+        ...
 
-    @property
     @abstractmethod
-    def run_cmd(self) -> str:
+    def run_cmd(self, problem_statement_path: str, task_id: str, kwargs: dict[str, Any]) -> str:
         """
         Command to run the agent on a task.
 
-        The command should include {{problem_statement}} as a placeholder,
-        which will be replaced with the actual task prompt at runtime.
+        Args:
+            problem_statement_path: str - Where the problem statement is copied in the sandbox (default: tmp/problem_statement)
+            task_id: str - The readable task id (e.x astropy__astropy-12907)
+            kwargs: dict[str, Any] - Extra args the user specified at run time
 
         Returns:
-            Shell command to execute the agent (e.g., "claude code -p {{problem_statement}}")
+            Shell command to execute the agent (e.g., "claude code -p path/to/problem_statement")
         """
-        pass
+        ...
 
     @property
     @abstractmethod
@@ -61,7 +63,7 @@ class BaseAgentContract(ABC):
         Returns:
             Shell command to install the agent (e.g., "bash setup.sh")
         """
-        pass
+        ...
 
     @property
     def env(self) -> dict[str, str]:
@@ -94,11 +96,12 @@ class BaseAgentContract(ABC):
     def final_output(self) -> Path | None:
         """
         Path to the final output of the agent. Needs to be an absolute path.
+        Will be saved in s3 when the task is done being processed
 
         Returns:
             Path | None: The path to the final output that the agent writes to.
         """
-        pass
+        ...
 
     def to_request(self) -> AgentContractRequest:
         """
@@ -109,7 +112,11 @@ class BaseAgentContract(ABC):
         """
         return AgentContractRequest(
             name=self.name,
-            run_cmd=self.run_cmd,
+            run_cmd=self.run_cmd(  # NOTE: We replace these fillers in the tracker
+                problem_statement_path="{problem_statement_path}",
+                task_id="{task_id}",
+                kwargs=self._agent_config.kwargs,
+            ),
             install_cmd=self.install_cmd,
             env=self.env,
             artifacts=self.artifacts,

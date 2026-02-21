@@ -53,9 +53,17 @@ On prod push all changes will be deployed, slack notifications are setup
 Create `services/tracker/.env` with the following configuration:
 
 ```env
+# Sandbox credentials
 DAYTONA_API_KEY=dtn_5ebxx_xxxx
 DAYTONA_API_URL=https://app.daytona.io/api
 DAYTONA_TARGET=us
+
+# AWS credentials
+AWS_ACCESS_KEY_ID=...
+AWS_SECRET_ACCESS_KEY=...
+AWS_REGION=...
+
+# Where the benchmark service is hosted
 BENCHMARK_SERVICE_URL=http://98.xx.xx:8000
 ```
 
@@ -88,7 +96,6 @@ Installs an executable into the bin which allows the cli to be ran without the p
 Each service maintains its own isolated virtual environment:
 
 - **Tracker service**: `make tracker-service` — Cleans, builds, and runs Docker container
-- **SWE-bench service**: `make swebench-install` — Creates `services/benchmarks/swebench/.venv`
 
 ### Usage
 
@@ -96,19 +103,27 @@ Each service maintains its own isolated virtual environment:
 
 ```bash
 # With specific task IDs:
-harness start-benchmark \
+harness benchmark start \
   --agent <agent_path> \
+  --model <model_key> \
+  -k temperature 7 -k max_tokens 1000 \
   --benchmark <benchmark_name> \
   --concurrency 1 \
   --task-ids "task_1_id,task_2_id" \
   --slice "start:stop:step"
+```
 
-# Or run whole benchmark (not recommended for development):
-harness start-benchmark \
-  --agent <agent_path> \
-  --benchmark <benchmark_name> \
-  --concurrency 1 \
-  --slice "start:stop:step"
+Flags
+
+```
+--agent: Path to the directory with the agent
+--model: Model key
+--benchmark: Name of the benchmark
+--concurrency: The amount of concurrent tasks that are processed concurrently
+--slice: Takes a slice from the dataset between the given values "start:stop:step"
+--kwarg (-k): Single kwarg that is passed into the agent run command
+--task-ids: comma separated list of task ids to run
+--task-ids-file: Path to a .txt file with tasks newline separated
 ```
 
 Starts the benchmark and exits once successfully created.
@@ -117,16 +132,16 @@ Starts the benchmark and exits once successfully created.
 
 ```bash
 # Live updates every 60 seconds
-harness fetch-benchmark --benchmark-id <benchmark_id> --connect
+harness benchmark fetch --benchmark-id <benchmark_id> --connect
 
 # One-time status check
-harness fetch-benchmark --benchmark-id <benchmark_id>
+harness benchmark fetch --benchmark-id <benchmark_id>
 ```
 
 #### Download results
 
 ```bash
-harness retrieve-results --benchmark-id <benchmark_id>
+harness benchmark results --benchmark-id <benchmark_id>
 ```
 
 Flags
@@ -139,7 +154,7 @@ Flags
 #### Stop a benchmark
 
 ```bash
-harness stop-benchmark --benchmark-id <benchmark_id>
+harness benchmark stop --benchmark-id <benchmark_id>
 ```
 
 Flags
@@ -151,13 +166,13 @@ Flags
 #### Resume a benchmark
 
 ```bash
-harness resume-benchmark --benchmark-id <benchmark_id>
+harness benchmark resume --benchmark-id <benchmark_id>
 ```
 
 #### Retry a benchmark
 
 ```bash
-harness retry-benchmark --benchmark-id <benchmark_id>
+harness benchmark retry --benchmark-id <benchmark_id>
 ```
 
 Flags
@@ -171,7 +186,7 @@ Flags
 #### List and filter benchmarks
 
 ```bash
-harness fetch-benchmarks --agent-name <agent_name> --benchmark-name <benchmark_name> --status <benchmark_status> --order-by <preferred_order>
+harness benchmark list --agent-name <agent_name> --benchmark-name <benchmark_name> --status <benchmark_status> --order-by <preferred_order>
 ```
 
 ```
@@ -190,7 +205,7 @@ harness fetch-benchmarks --agent-name <agent_name> --benchmark-name <benchmark_n
 #### Download all agent outputs from benchmark
 
 ```bash
-harness fetch-agent-outputs --benchmark-id <benchmark_id> --output-dir <download_directory>
+harness agent outputs --benchmark-id <benchmark_id> --output-dir <download_directory>
 ```
 
 Flags
