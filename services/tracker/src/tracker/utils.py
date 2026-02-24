@@ -16,6 +16,7 @@ from benchmark_service.client import BenchmarkServiceClient, BenchmarkServiceErr
 from daytona import AsyncDaytona, AsyncPaginatedSandboxes, AsyncSandbox, SandboxState
 from sqlmodel import Session, asc, case, col, delete, desc, func, or_, select, update
 
+from tracker._lambda import invoke_lambda
 from tracker.cloudwatch import cloudwatch_stream, create_benchmark_group, reset_cloudwatch_stream
 from tracker.config import broker
 from tracker.database.models import (
@@ -30,12 +31,18 @@ from tracker.database.models import (
 from tracker.database.session import engine
 from tracker.exceptions import TrackerServiceError
 from tracker.logger import get_logger
-from tracker.s3 import get_agent_result_s3_key
+from tracker.s3 import (
+    S3_BENCHMARKS_PREFIX,
+    create_benchmark_url,
+    get_agent_result_s3_key,
+    upload_to_s3,
+)
 from tracker.sandbox import create_sandbox, run_agent, upload_agent_artifacts
 from tracker.types import (
     BenchmarkDetails,
     FetchBenchmarkResponse,
     FetchBenchmarksRequest,
+    FinalViewResponse,
     Order,
     StartBenchmarkRequest,
 )
@@ -78,6 +85,7 @@ def start_benchmark_request_to_benchmark(request: StartBenchmarkRequest) -> Benc
             concurrency=request.concurrency,
             task_ids=request.task_ids,
             slice_str=request.slice_str,
+            lambda_function=request.lambda_function,
         ),
     )
 
@@ -196,7 +204,7 @@ class TaskMonitor:
 
         exit_condition_met: bool = False
 
-        while not exit_condition_met:
+        while not exit_condition_met and self._task_tracking:
             tasks_to_check: list[str] = list(self._task_tracking.keys())
             for task_id in tasks_to_check:
                 task = self._task_tracking[task_id]
@@ -425,6 +433,7 @@ def set_benchmark_final_status(benchmark_row: Benchmark, session: Session) -> No
         benchmark_status = BenchmarkStatus.STOPPED
 
     benchmark_row.status = benchmark_status
+    benchmark_row.error_message = None
     session.add(benchmark_row)
     session.commit()
 
@@ -527,15 +536,14 @@ async def process_benchmark(
 
         await monitor_task
 
-        if not any(result_dict for result_dict in evaluation_result_rows):
-            raise TrackerServiceError("No tasks were completed successfully")
-
-        # NOTE: Tasks with errors will still need to be included inside of the final score calculation to ensure that they are accounted for
-        evaluation_results: dict[str, dict[str, Any] | None] = {
-            task_id: evaluation_result
-            for result_dict in evaluation_result_rows
-            for task_id, evaluation_result in result_dict.items()
-        }
+        evaluation_results: dict[str, dict[str, Any] | None] = {}
+        if any(result_dict for result_dict in evaluation_result_rows):
+            # NOTE: Tasks with errors will still need to be included inside of the final score calculation to ensure that they are accounted for
+            evaluation_results = {
+                task_id: evaluation_result
+                for result_dict in evaluation_result_rows
+                for task_id, evaluation_result in result_dict.items()
+            }
 
         with Session(bind=engine) as session:
             benchmark_row = fetch_benchmark_row(benchmark_id, session)
@@ -543,6 +551,9 @@ async def process_benchmark(
             remaining_task_results = await fetch_missing_tasks(session, benchmark_row, evaluation_results)
 
         evaluation_results.update(remaining_task_results)
+
+        if not evaluation_results:
+            raise TrackerServiceError("No tasks were completed successfully")
 
         # Calculate the final score based off the tasks that were ran
         final_score_response = await benchmark_service.final_score(evaluation_results=evaluation_results)
@@ -556,10 +567,31 @@ async def process_benchmark(
 
         with Session(bind=engine) as session:
             benchmark_row = fetch_benchmark_row(benchmark_id, session)
+            # Delete existing final evaluation if re-running
+            if benchmark_row.final_evaluation:
+                session.delete(benchmark_row.final_evaluation)
+                session.flush()
+
             session.add(final_evaluation_row)
             session.commit()
 
             set_benchmark_final_status(benchmark_row, session)
+
+            # Push the final benchmark view to the bucket
+            final_view: FinalViewResponse = create_final_view(benchmark_row, session)
+
+            upload_final_view(benchmark_row, final_view)
+
+            # If the user has chosen to invoke a lambda function at the end of the benchmark
+            # We run it but do not let a failure affect the benchmark status
+            arguments = benchmark_row.arguments
+            if arguments.lambda_function:
+                # Expose the benchmark arguments and the benchmark id inside of the lambda
+                lambda_payload: dict[str, Any] = arguments.model_dump()
+                lambda_payload["benchmark_id"] = str(benchmark_id)
+
+                invoke_lambda(arguments.lambda_function, lambda_payload)
+
     except Exception as e:
         with Session(bind=engine) as session:
             benchmark_row = fetch_benchmark_row(benchmark_id, session)
@@ -567,6 +599,7 @@ async def process_benchmark(
             commit_benchmark_error(benchmark_row, session, error_message)
     finally:
         with Session(bind=engine) as session:
+            # Handle any misalignments between the benchmark status and tasks
             catch_errors_during_cleanup(benchmark_id, session)
 
         await benchmark_service.close()
@@ -740,6 +773,7 @@ async def stream_benchmark_results(benchmark_id: UUID, session: Session) -> Asyn
                     benchmark_name=fresh_benchmark.name,
                     benchmark_id=fresh_benchmark.id,
                     details=benchmark_context.benchmark_details,
+                    s3_bucket_url=create_benchmark_url(str(fresh_benchmark.id)),
                 )
 
                 yield f"{DATA_PREFIX} {response_data.model_dump_json()}\n\n"
@@ -908,10 +942,9 @@ async def reset_to_in_progress_status(
                 f"{', '.join(missing_task_ids)} was requested to be force resumed but does not exist in the dataset"
             )
 
+        # Allow re-running the end of the benchmark without running any tasks
         if not task_ids:
-            raise TrackerServiceError(
-                f"No tasks for benchmark {benchmark_row.id} can be resumed because all tasks are finished"
-            )
+            return []
 
         # Verify the task ids are still valid before priming to resume
         # Raises if any task ids are invalid
@@ -1012,3 +1045,39 @@ class YieldingWriter(io.RawIOBase):
         self._buffer.clear()
 
         return chunk
+
+
+def create_final_view(benchmark_row: Benchmark, session: Session) -> FinalViewResponse:
+    """Creates final view of a benchmark that includes metadata about evaluations and score"""
+    tasks_stopped: int = session.exec(
+        select(func.count(col(Task.id)))
+        .where(col(Task.benchmark) == benchmark_row.id)
+        .where(col(Task.status) == TaskStatus.STOPPED)
+    ).one()
+
+    final_view: FinalViewResponse = FinalViewResponse(
+        benchmark_name=benchmark_row.name,
+        status=benchmark_row.status,
+        error_message=benchmark_row.error_message,
+        benchmark_id=benchmark_row.id,
+        benchmark_arguments=benchmark_row.arguments,
+        tasks_stopped=tasks_stopped or None,  # NOTE: Only include if we stopped the benchmark
+        final_evaluation=benchmark_row.final_evaluation,
+        evaluation_results=benchmark_row.fetch_evaluation_results(session),
+        task_errors=benchmark_row.fetch_tasks_with_errors(session),
+    )
+
+    return final_view
+
+
+def upload_final_view(benchmark_row: Benchmark, final_view: FinalViewResponse) -> str:
+    """Uploads the final view to the root of the benchmark folder and returns the s3 key"""
+    s3_key = f"{S3_BENCHMARKS_PREFIX}/{benchmark_row.id}/{benchmark_row.name}.json"
+    upload_to_s3(
+        final_view.model_dump_json(
+            indent=4, exclude_none=True, exclude={"benchmark_arguments": {"contract": {"env"}}}
+        ).encode(),
+        s3_key,
+    )
+
+    return s3_key
