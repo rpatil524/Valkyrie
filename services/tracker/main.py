@@ -3,20 +3,21 @@ import tarfile
 import traceback
 from uuid import UUID
 
+from benchmark_service.client import BenchmarkServiceError
 from fastapi import Body, Depends, FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import joinedload
-from sqlmodel import Session, col, func, select
+from sqlmodel import Session, select
 
-from benchmark_service.client import BenchmarkServiceError
 from tracker.cloudwatch import get_cloudwatch_url
 from tracker.config import AWS_S3_BUCKET
-from tracker.database.models import Benchmark, BenchmarkStatus, Task, TaskStatus
+from tracker.database.models import Benchmark, BenchmarkStatus
 from tracker.database.session import check_database_connection, get_session
 from tracker.exceptions import TrackerServiceError
 from tracker.logger import get_logger
 from tracker.s3 import (
     S3_BENCHMARKS_PREFIX,
+    create_benchmark_url,
     create_console_url,
     create_presigned_url,
     download_from_s3_stream,
@@ -31,7 +32,6 @@ from tracker.types import (
     FetchBenchmarkResponse,
     FetchBenchmarksRequest,
     FetchBenchmarksResponse,
-    FinalViewResponse,
     RetrieveResultsResponse,
     RetryOrResumeBenchmarkResponse,
     S3UploadResultsResponse,
@@ -44,6 +44,7 @@ from tracker.utils import (
     BenchmarkContext,
     YieldingWriter,
     commit_benchmark_error,
+    create_final_view,
     fetch_filtered_benchmark_rows,
     force_stop_sandboxes,
     initiate_stop_benchmark,
@@ -51,6 +52,7 @@ from tracker.utils import (
     reset_to_in_progress_status,
     start_benchmark_request_to_benchmark,
     stream_benchmark_results,
+    upload_final_view,
 )
 
 logger = get_logger(__name__)
@@ -200,6 +202,7 @@ async def start_benchmark(
         started_at=benchmark_row.started_at,
         task_count=len(verify_response.task_ids),
         cloudwatch_url=get_cloudwatch_url(str(benchmark_row.id)),
+        s3_bucket_url=create_benchmark_url(str(benchmark_row.id)),
     )
 
 
@@ -243,6 +246,7 @@ async def fetch_benchmark(
         benchmark_name=benchmark_row.name,
         benchmark_id=benchmark_row.id,
         details=benchmark_context.benchmark_details,
+        s3_bucket_url=create_benchmark_url(str(benchmark_row.id)),
     )
 
 
@@ -264,34 +268,12 @@ async def retrieve_results(
     if not benchmark_row:
         raise HTTPException(status_code=404, detail=f"Benchmark with id {benchmark_id} not found")
 
-    tasks_stopped: int = session.exec(
-        select(func.count(col(Task.id)))
-        .where(col(Task.benchmark) == benchmark_row.id)
-        .where(col(Task.status) == TaskStatus.STOPPED)
-    ).one()
-
-    final_view: FinalViewResponse = FinalViewResponse(
-        benchmark_name=benchmark_row.name,
-        status=benchmark_row.status,
-        error_message=benchmark_row.error_message,
-        benchmark_id=benchmark_row.id,
-        benchmark_arguments=benchmark_row.arguments,
-        tasks_stopped=tasks_stopped or None,  # NOTE: Only include if we stopped the benchmark
-        final_evaluation=benchmark_row.final_evaluation,
-        evaluation_results=benchmark_row.fetch_evaluation_results(session),
-        task_errors=benchmark_row.fetch_tasks_with_errors(session),
-    )
+    final_view = create_final_view(benchmark_row, session)
 
     if s3:
-        s3_key = f"{S3_BENCHMARKS_PREFIX}/{benchmark_id}/{benchmark_row.name}.json"
-        upload_to_s3(
-            final_view.model_dump_json(
-                indent=4, exclude_none=True, exclude={"benchmark_arguments": {"contract": {"env"}}}
-            ).encode(),
-            s3_key,
-        )
+        s3_key = upload_final_view(benchmark_row, final_view)
 
-        https_url = f"https://{AWS_S3_BUCKET}.s3.amazonaws.com/{s3_key}"
+        https_url = f"s3://{AWS_S3_BUCKET}/{s3_key}"
         presigned_url = create_presigned_url(s3_key)
         console_url = create_console_url(s3_key)
 
