@@ -174,7 +174,8 @@ async def upload_agent_artifacts(sandbox: AsyncSandbox, contract: AgentContractR
             if not file_info.is_dir()
         ]
 
-    await sandbox.fs.upload_files(files_to_upload)
+    if files_to_upload:
+        await sandbox.fs.upload_files(files_to_upload)
 
 
 @retry(retry=retry_if_exception_type(SandboxError), reraise=True, stop=stop_after_attempt(3))
