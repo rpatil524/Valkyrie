@@ -10,7 +10,6 @@ from sqlalchemy.orm import joinedload
 from sqlmodel import Session, select
 
 from tracker.cloudwatch import get_cloudwatch_url
-from tracker.config import AWS_S3_BUCKET
 from tracker.database.models import Benchmark, BenchmarkStatus
 from tracker.database.session import check_database_connection, get_session
 from tracker.exceptions import TrackerServiceError
@@ -32,6 +31,7 @@ from tracker.types import (
     FetchBenchmarkResponse,
     FetchBenchmarksRequest,
     FetchBenchmarksResponse,
+    HarnessConfig,
     RetrieveResultsResponse,
     RetryOrResumeBenchmarkResponse,
     S3UploadResultsResponse,
@@ -46,6 +46,7 @@ from tracker.utils import (
     commit_benchmark_error,
     create_final_view,
     fetch_filtered_benchmark_rows,
+    fetch_harness_config,
     force_stop_sandboxes,
     initiate_stop_benchmark,
     process_benchmark,
@@ -106,6 +107,7 @@ def health_check() -> dict[str, str]:
 @app.post("/upload")
 async def upload_contract_to_s3(
     contract: UploadFile = File(..., description="Contract directory zip file"),
+    harness_config: HarnessConfig = Depends(fetch_harness_config),
 ) -> dict[str, str]:
     """
     Upload contract to S3.
@@ -132,7 +134,7 @@ async def upload_contract_to_s3(
     # Extract contract name from filename (remove .zip extension)
     contract_name = contract.filename.rsplit(".zip", 1)[0]
     contract_s3_key = get_contract_s3_key(contract_name)
-    upload_to_s3(contract_content, contract_s3_key)
+    upload_to_s3(contract_content, contract_s3_key, harness_config.aws, harness_config.s3_bucket)
 
     return {
         "status": "success",
@@ -201,14 +203,21 @@ async def start_benchmark(
         concurrency=request.concurrency,
         started_at=benchmark_row.started_at,
         task_count=len(verify_response.task_ids),
-        cloudwatch_url=get_cloudwatch_url(str(benchmark_row.id)),
-        s3_bucket_url=create_benchmark_url(str(benchmark_row.id)),
+        cloudwatch_url=get_cloudwatch_url(
+            str(benchmark_row.id), request.harness_config.aws.aws_default_region, request.harness_config.log_group
+        ),
+        s3_bucket_url=create_benchmark_url(
+            str(benchmark_row.id), request.harness_config.aws.aws_default_region, request.harness_config.s3_bucket
+        ),
     )
 
 
 @app.get("/fetch-benchmark", response_model=None)
 async def fetch_benchmark(
-    benchmark_id: UUID, connect: bool = Query(default=False), session: Session = Depends(get_session)
+    benchmark_id: UUID,
+    connect: bool = Query(default=False),
+    session: Session = Depends(get_session),
+    harness_config: HarnessConfig = Depends(fetch_harness_config),
 ) -> FetchBenchmarkResponse | StreamingResponse:
     """
     Fetch a benchmark by its id.
@@ -231,7 +240,7 @@ async def fetch_benchmark(
     # and additional updates about the tasks completed
     if connect:
         return StreamingResponse(
-            stream_benchmark_results(benchmark_id, session),
+            stream_benchmark_results(benchmark_id, session, harness_config),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -246,13 +255,18 @@ async def fetch_benchmark(
         benchmark_name=benchmark_row.name,
         benchmark_id=benchmark_row.id,
         details=benchmark_context.benchmark_details,
-        s3_bucket_url=create_benchmark_url(str(benchmark_row.id)),
+        s3_bucket_url=create_benchmark_url(
+            str(benchmark_row.id), harness_config.aws.aws_default_region, harness_config.s3_bucket
+        ),
     )
 
 
 @app.get("/retrieve-results")
 async def retrieve_results(
-    benchmark_id: UUID, s3: bool = Query(default=False), session: Session = Depends(get_session)
+    benchmark_id: UUID,
+    s3: bool = Query(default=False),
+    session: Session = Depends(get_session),
+    harness_config: HarnessConfig = Depends(fetch_harness_config),
 ) -> RetrieveResultsResponse:
     """
     Retrieve the results of a benchmark by its id.
@@ -271,11 +285,11 @@ async def retrieve_results(
     final_view = create_final_view(benchmark_row, session)
 
     if s3:
-        s3_key = upload_final_view(benchmark_row, final_view)
+        s3_key = upload_final_view(benchmark_row, final_view, harness_config)
 
-        https_url = f"s3://{AWS_S3_BUCKET}/{s3_key}"
-        presigned_url = create_presigned_url(s3_key)
-        console_url = create_console_url(s3_key)
+        https_url = f"s3://{harness_config.s3_bucket}/{s3_key}"
+        presigned_url = create_presigned_url(s3_key, harness_config.aws, harness_config.s3_bucket)
+        console_url = create_console_url(s3_key, harness_config.aws.aws_default_region, harness_config.s3_bucket)
 
         return S3UploadResultsResponse(s3_url=https_url, presigned_url=presigned_url, console_url=console_url)
 
@@ -283,7 +297,10 @@ async def retrieve_results(
 
 
 @app.get("/check-results-exist")
-async def check_results_exist(benchmark_id: UUID) -> dict[str, bool]:
+async def check_results_exist(
+    benchmark_id: UUID,
+    harness_config: HarnessConfig = Depends(fetch_harness_config),
+) -> dict[str, bool]:
     """
     Check if results.json already exists in S3 for the given benchmark.
 
@@ -294,7 +311,7 @@ async def check_results_exist(benchmark_id: UUID) -> dict[str, bool]:
         {"exists": true/false}
     """
     s3_key = f"{S3_BENCHMARKS_PREFIX}/{benchmark_id}/results.json"
-    exists = s3_object_exists(s3_key)
+    exists = s3_object_exists(s3_key, harness_config.aws, harness_config.s3_bucket)
     return {"exists": exists}
 
 
@@ -341,6 +358,7 @@ async def retry_or_resume_benchmark(
     concurrency: int | None = Query(default=None),
     task_ids: list[str] = Body(default=[]),
     session: Session = Depends(get_session),
+    harness_config: HarnessConfig = Depends(fetch_harness_config),
 ) -> RetryOrResumeBenchmarkResponse:
     """
     Retry or resume a benchmark run by its id, we only can retry or resume a benchmark if its not currently running.
@@ -380,15 +398,18 @@ async def retry_or_resume_benchmark(
     verified_task_ids = await reset_to_in_progress_status(
         benchmark_row=benchmark_row,
         session=session,
-        benchmark_service=benchmark_row.start_benchmark_request.benchmark_service,
+        benchmark_service=benchmark_row.benchmark_service,
         retry=retry,
         rerun_task_ids=task_ids,
     )
 
+    # Ensure that credentials are included with the model dump
+    resume_request_json = benchmark_row.start_benchmark_request(harness_config).model_dump()
+
     # start the benchmark with the same args used to create it
     # we will delegate inside what tasks we are running
     await process_benchmark.kiq(
-        start_benchmark_request_json=benchmark_row.start_benchmark_request.model_dump(),
+        start_benchmark_request_json=resume_request_json,
         benchmark_id_str=str(benchmark_row.id),
         verified_task_ids=verified_task_ids,
     )
@@ -446,7 +467,10 @@ async def fetch_benchmark_metadata(
 
 
 @app.get("/fetch-agent-outputs/{benchmark_id}")
-async def fetch_agent_outputs(benchmark_id: UUID) -> StreamingResponse:
+async def fetch_agent_outputs(
+    benchmark_id: UUID,
+    harness_config: HarnessConfig = Depends(fetch_harness_config),
+) -> StreamingResponse:
     """
     Stream a tar file with agent outputs to the client.
 
@@ -457,7 +481,7 @@ async def fetch_agent_outputs(benchmark_id: UUID) -> StreamingResponse:
         StreamingResponse
     """
     prefix = f"{S3_BENCHMARKS_PREFIX}/{benchmark_id}/"
-    s3_keys = list_s3_objects(prefix)
+    s3_keys = list_s3_objects(prefix, harness_config.aws, harness_config.s3_bucket)
 
     if not s3_keys:
         raise HTTPException(
@@ -473,7 +497,7 @@ async def fetch_agent_outputs(benchmark_id: UUID) -> StreamingResponse:
                 relative_path: str = s3_key.removeprefix(prefix)
 
                 try:
-                    body, size = download_from_s3_stream(s3_key)
+                    body, size = download_from_s3_stream(s3_key, harness_config.aws, harness_config.s3_bucket)
 
                     tarinfo = tarfile.TarInfo(name=relative_path)
                     tarinfo.size = size
