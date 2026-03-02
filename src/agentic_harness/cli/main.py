@@ -49,7 +49,7 @@ def config():
     pass
 
 
-CONFIG_LOCATION: Path = Path("~/.config/harness/harness.yaml")
+_CONFIG_LOCATION: Path = Path("~/.config/harness/harness.yaml").expanduser()
 
 
 @config.command()
@@ -66,16 +66,26 @@ def init() -> None:
         "AWS_SECRET_ACCESS_KEY": None,  # AWS SECRETS KEY
         "AWS_DEFAULT_REGION": None,  # What region your secrets are in
         "AWS_S3_BUCKET": None,  # Center point where all agents and benchmark results are uploaded
+        "DAYTONA_SECRET_NAME": None,  # AWS Secrets Manager name for Daytona credentials
         "LOG_GROUP": "benchmarks",  # the prefix to the cloudwatch logs (e.x. benchmarks/<benchmark_id>)
         "LOG_RETENTION_POLICY": 365,  # How long logs are kept until auto deleted
     }
 
-    collected_keys: dict[str, str] = {}
+    current_config: dict[str, str] = {}
+    if _CONFIG_LOCATION.exists():
+        with open(_CONFIG_LOCATION) as f:
+            try:
+                current_config = yaml.safe_load(f)
+            except Exception:
+                pass
 
+    collected_keys: dict[str, str] = {}
     for key, default in environment_variables.items():
-        sourced = os.environ.get(key)
+        sourced = current_config.get(key) or os.environ.get(key)
         if sourced:
-            click.echo(f"  {key}: sourced from environment")
+            click.echo(
+                f"  {key}: sourced from {'environment' if not current_config.get(key) else 'already created config'}"
+            )
             collected_keys[key] = sourced
             continue
 
@@ -94,13 +104,12 @@ def init() -> None:
 
         collected_keys[key] = value
 
-    config_location = CONFIG_LOCATION.expanduser()
-    config_location.parent.mkdir(parents=True, exist_ok=True)
+    _CONFIG_LOCATION.parent.mkdir(parents=True, exist_ok=True)
 
-    with open(config_location, "w") as f:
+    with open(_CONFIG_LOCATION, "w") as f:
         yaml.dump(collected_keys, f, default_flow_style=False)
 
-    click.echo(click.style(f"\nConfig written to {config_location}", fg="green", bold=True))
+    click.echo(click.style(f"\nConfig written to {_CONFIG_LOCATION}", fg="green", bold=True))
 
 
 @config.command()
@@ -112,12 +121,11 @@ def modify(key: str, value: str) -> None:
 
     Example: harness config modify AWS_DEFAULT_REGION us-west-2
     """
-    config_location = CONFIG_LOCATION.expanduser()
 
-    if not config_location.exists():
+    if not _CONFIG_LOCATION.exists():
         raise click.ClickException("Config not found. Run `harness config init` first.")
 
-    with open(config_location) as f:
+    with open(_CONFIG_LOCATION) as f:
         current: dict[str, str] = yaml.safe_load(f) or {}
 
     if key not in current:
@@ -125,7 +133,7 @@ def modify(key: str, value: str) -> None:
 
     current[key] = value
 
-    with open(config_location, "w") as f:
+    with open(_CONFIG_LOCATION, "w") as f:
         yaml.dump(current, f, default_flow_style=False)
 
     click.echo(click.style(f"  {key} updated.", fg="green"))
