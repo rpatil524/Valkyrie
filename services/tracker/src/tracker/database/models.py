@@ -54,7 +54,7 @@ class AgentContractRequest(BaseModel):
     install_cmd: str
     run_cmd: str
     final_output: str | None = None
-    env: dict[str, str] = {}
+    secrets: dict[str, str] = {}
 
 
 class BenchmarkArguments(BaseModel):

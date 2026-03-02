@@ -65,7 +65,7 @@ def init() -> None:
         "AWS_ACCESS_KEY_ID": None,  # AWS ACCESS KEY
         "AWS_SECRET_ACCESS_KEY": None,  # AWS SECRETS KEY
         "AWS_DEFAULT_REGION": None,  # What region your secrets are in
-        "AWS_S3_BUCKET": None,  # Center point where all agents and benchmark results are uploaded
+        "S3_BUCKET": None,  # Center point where all agents and benchmark results are uploaded
         "DAYTONA_SECRET_NAME": None,  # AWS Secrets Manager name for Daytona credentials
         "LOG_GROUP": "benchmarks",  # the prefix to the cloudwatch logs (e.x. benchmarks/<benchmark_id>)
         "LOG_RETENTION_POLICY": 365,  # How long logs are kept until auto deleted
@@ -206,6 +206,15 @@ def modify(key: str, value: str) -> None:
     type=(str, str),
     help="Kwargs as key value (e.g., -k temperature 7 -k max_tokens 1000)",
 )
+@click.option(
+    "--secret",
+    "-s",
+    "secrets",
+    multiple=True,
+    nargs=2,
+    type=(str, str),
+    help="Secret as ENV_VAR aws_secret_name (e.g., -s ANTHROPIC_API_KEY devEvalInfraAnthropicKey)",
+)
 def start(
     agent: Path,
     model: str | None,
@@ -216,6 +225,7 @@ def start(
     task_ids_file: Path | None,
     slice_str: str | None,
     kwargs: tuple[tuple[str, str]],
+    secrets: tuple[tuple[str, str]],
 ):
     """
     Run an agent on a benchmark.
@@ -259,6 +269,10 @@ def start(
         agent_config = AgentConfig(**config_kwargs)
 
         contract = get_contract(contract_path, agent_config)
+
+        # Merge CLI secrets into contract defaults (override with cli secret)
+        if secrets:
+            contract.secrets.update({key: value for key, value in secrets})
 
         with TrackerService() as tracker:
             if not check_tracker_service_health(tracker):

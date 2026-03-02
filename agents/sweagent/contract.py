@@ -1,8 +1,6 @@
 from pathlib import Path
 from typing import Any, override
 
-from dotenv import dotenv_values
-
 from agentic_harness.contract import BaseAgentContract
 
 
@@ -20,10 +18,6 @@ class SWEAgentContract(BaseAgentContract):
     @property
     def install_cmd(self) -> str:
         return "bash setup.sh"
-
-    @property
-    def env(self) -> dict[str, str]:
-        return {k: v for k, v in dotenv_values().items() if v is not None}
 
     @property
     def final_output(self) -> Path | None:
