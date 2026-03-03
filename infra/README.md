@@ -6,14 +6,12 @@ AWS CDK infrastructure for the Agentic Harness benchmark platform.
 
 - **Shared Stack**: VPC, ECS cluster, service discovery namespace, S3 bucket, Route53 hosted zone
 - **Tracker Stack**: Public-facing API (benchmark-tracker.vals.ai) with ALB, Fargate, and Redis/Postgres sidecars
-- **SWE-bench Stack**: Private benchmark execution service accessible via service discovery (`swebench.local`)
 
 ## Prerequisites
 
 - AWS CLI configured with appropriate credentials
 - Python 3.12+
 - [uv](https://github.com/astral-sh/uv) package manager
-- Daytona API key stored in AWS Secrets Manager as `prodAgenticHarnessDaytonaKey`
 
 ## Setup
 
@@ -38,8 +36,6 @@ make deploy
 # Deploy individual stacks
 make deploy-shared
 make deploy-tracker
-make deploy-swebench
-
 # Preview changes
 make diff
 
@@ -60,7 +56,7 @@ make hotswap
 
 ## Connecting to Private Services
 
-Private services (like SWE-bench) can be accessed directly via their task's public IP for debugging:
+Private services can be accessed directly via their task's public IP for debugging:
 
 1. Whitelist your IP:
 

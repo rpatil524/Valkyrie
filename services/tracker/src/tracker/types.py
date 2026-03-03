@@ -7,9 +7,9 @@ from enum import Enum
 from typing import Any
 from uuid import UUID
 
+from benchmark_service.client import BenchmarkServiceClient
 from pydantic import BaseModel
 
-from benchmark_service.client import BenchmarkServiceClient
 from tracker.config import BENCHMARK_SERVICE_URL
 from tracker.database.models import (
     AgentContractRequest,
@@ -28,6 +28,20 @@ class BenchmarkDetails(BaseModel):
     task_breakdown: dict[TaskStatus, int]
 
 
+class AWSCredentials(BaseModel):
+    aws_access_key_id: str
+    aws_secret_access_key: str
+    aws_default_region: str
+
+
+class HarnessConfig(BaseModel):
+    aws: AWSCredentials
+    s3_bucket: str
+    log_group: str
+    log_retention_policy: int
+    daytona_secret_name: str
+
+
 class StartBenchmarkRequest(BaseModel):
     contract: AgentContractRequest
     benchmark_name: str
@@ -35,12 +49,17 @@ class StartBenchmarkRequest(BaseModel):
     task_ids: list[str] | None = None
     slice_str: str | None = None
     lambda_function: str | None = None
+    harness_config: HarnessConfig
 
     @property
     def benchmark_service(self) -> BenchmarkServiceClient:
         from tracker.utils import create_benchmark_service_client
 
-        return create_benchmark_service_client(url=BENCHMARK_SERVICE_URL)
+        return create_benchmark_service_client(
+            url=BENCHMARK_SERVICE_URL,
+            daytona_secret_name=self.harness_config.daytona_secret_name,
+            aws=self.harness_config.aws,
+        )
 
 
 class StartBenchmarkErrorResponse(BaseModel):

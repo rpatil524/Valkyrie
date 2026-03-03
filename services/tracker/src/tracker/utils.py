@@ -1,7 +1,6 @@
 import asyncio
 import io
 import json
-import os
 import time
 import traceback
 from asyncio import Semaphore, gather
@@ -15,6 +14,7 @@ from zoneinfo import ZoneInfo
 
 from benchmark_service.client import BenchmarkServiceClient, BenchmarkServiceError
 from daytona import AsyncDaytona, AsyncPaginatedSandboxes, AsyncSandbox, SandboxState
+from fastapi import Request
 from sqlmodel import Session, asc, case, col, delete, desc, func, or_, select, update
 
 from tracker._lambda import invoke_lambda
@@ -39,11 +39,14 @@ from tracker.s3 import (
     upload_to_s3,
 )
 from tracker.sandbox import create_sandbox, run_agent, upload_agent_artifacts
+from tracker.secrets import fetch_aws_secret, resolve_secrets
 from tracker.types import (
+    AWSCredentials,
     BenchmarkDetails,
     FetchBenchmarkResponse,
     FetchBenchmarksRequest,
     FinalViewResponse,
+    HarnessConfig,
     Order,
     StartBenchmarkRequest,
 )
@@ -51,30 +54,33 @@ from tracker.types import (
 logger = get_logger(__name__)
 
 
-def get_daytona_headers() -> dict[str, str]:
-    """Read and validate Daytona environment variables, returning headers for BenchmarkServiceClient."""
-    keys = {
-        "DAYTONA_API_KEY": os.getenv("DAYTONA_API_KEY") or "",
-        "DAYTONA_API_URL": os.getenv("DAYTONA_API_URL") or "",
-        "DAYTONA_TARGET": os.getenv("DAYTONA_TARGET") or "",
-    }
+def fetch_daytona_headers(daytona_secret_name: str, aws: AWSCredentials) -> dict[str, str]:
+    """Fetch Daytona credentials from AWS Secrets Manager and return as headers for BenchmarkServiceClient."""
+    daytona_keys: list[str] = ["DAYTONA_API_KEY", "DAYTONA_API_URL", "DAYTONA_TARGET"]
 
-    missing = [k for k, v in keys.items() if not v]
-    if missing:
-        raise ValueError(
-            f"The following environment variables are not set: {', '.join(missing)}. Please set them in your `.env` file so that they can be sourced."
-        )
+    secret = fetch_aws_secret(daytona_secret_name, aws)
+
+    if not isinstance(secret, dict):
+        raise TrackerServiceError(f"Expected a dict with all daytona keys inside, received a string {secret}")
+
+    missing_keys = set(daytona_keys) - set(secret.keys())
+    if missing_keys:
+        raise TrackerServiceError(f"Missing following keys to use daytona {', '.join(missing_keys)}")
+
+    missing_values = [key for key, value in secret.items() if not value]
+    if missing_values:
+        raise TrackerServiceError(f"Missing values for the following keys {', '.join(missing_values)}")
 
     return {
-        "x-api-key": keys["DAYTONA_API_KEY"],
-        "x-api-url": keys["DAYTONA_API_URL"],
-        "x-target": keys["DAYTONA_TARGET"],
+        "x-api-key": secret["DAYTONA_API_KEY"],
+        "x-api-url": secret["DAYTONA_API_URL"],
+        "x-target": secret["DAYTONA_TARGET"],
     }
 
 
-def create_benchmark_service_client(url: str) -> BenchmarkServiceClient:
-    """Create a BenchmarkServiceClient using Daytona environment variables."""
-    return BenchmarkServiceClient(url=url, headers=get_daytona_headers())
+def create_benchmark_service_client(url: str, daytona_secret_name: str, aws: AWSCredentials) -> BenchmarkServiceClient:
+    """Create a BenchmarkServiceClient using Daytona credentials from AWS Secrets Manager."""
+    return BenchmarkServiceClient(url=url, headers=fetch_daytona_headers(daytona_secret_name, aws))
 
 
 def start_benchmark_request_to_benchmark(request: StartBenchmarkRequest) -> Benchmark:
@@ -248,7 +254,9 @@ def fetch_task_row(task_id: UUID, session: Session) -> Task:
     return task_row
 
 
-def buffer_logs(log_queue: asyncio.Queue[str], stream_key: str, force_flush: bool = False) -> None:
+def buffer_logs(
+    log_queue: asyncio.Queue[str], stream_key: str, aws: AWSCredentials, log_group: str, force_flush: bool = False
+) -> None:
     """
     Buffers the logs in the queue and waits till they are full before streaming them to CloudWatch.
     """
@@ -261,7 +269,7 @@ def buffer_logs(log_queue: asyncio.Queue[str], stream_key: str, force_flush: boo
 
     message = "".join(messages)
     loop = asyncio.get_running_loop()
-    loop.run_in_executor(None, cloudwatch_stream, stream_key, message)
+    loop.run_in_executor(None, cloudwatch_stream, stream_key, message, aws, log_group)
 
 
 async def process_task(
@@ -270,6 +278,7 @@ async def process_task(
     benchmark_service: BenchmarkServiceClient,
     benchmark_id: UUID,
     task_id: str,
+    harness_config: HarnessConfig,
 ) -> dict[str, dict[str, Any] | None]:
     """
     Processes a task and returns the evaluation result
@@ -291,7 +300,7 @@ async def process_task(
     log_queue: asyncio.Queue[str] = asyncio.Queue(maxsize=20)
 
     # If we are retrying the task we clear logs from previous run
-    reset_cloudwatch_stream(stream_key)
+    reset_cloudwatch_stream(stream_key, harness_config.aws, harness_config.log_group)
 
     last_log_time: float = time.monotonic()
 
@@ -300,7 +309,7 @@ async def process_task(
         nonlocal last_log_time
         last_log_time = time.monotonic()
         log_queue.put_nowait(data)
-        buffer_logs(log_queue, stream_key)
+        buffer_logs(log_queue, stream_key, harness_config.aws, harness_config.log_group)
 
     # Auto flush if process takes a while to produce next log
     # If a process pauses without producing anymore logs, the logs we have collected get stuck
@@ -308,7 +317,7 @@ async def process_task(
         while True:
             await asyncio.sleep(1)
             if not log_queue.empty() and time.monotonic() - last_log_time >= 10:
-                buffer_logs(log_queue, stream_key, force_flush=True)
+                buffer_logs(log_queue, stream_key, harness_config.aws, harness_config.log_group, force_flush=True)
 
     flush_task = asyncio.create_task(auto_flush_logs())
 
@@ -332,7 +341,7 @@ async def process_task(
             sandbox_name=task_row.alias,
             image=task_data.docker_image,
             labels=labels,
-            env_vars=start_benchmark_request.contract.env,
+            env_vars=resolve_secrets(start_benchmark_request.contract.secrets, harness_config.aws),
             resources=task_data.resources,
         ) as sandbox:
             try:
@@ -342,14 +351,16 @@ async def process_task(
                     task_session.commit()
 
                 # Upload the contract to the sandbox after creating and install the dependencies
-                await upload_agent_artifacts(sandbox, start_benchmark_request.contract)
+                await upload_agent_artifacts(
+                    sandbox, start_benchmark_request.contract, harness_config.aws, harness_config.s3_bucket
+                )
 
                 # Setup task if requested
                 if task_data.request_setup:
                     _ = await benchmark_service.setup_task(task_row.task_id, sandbox.id, on_message=log_output)
 
                     # Force flush the logs if anything has been buffered
-                    buffer_logs(log_queue, stream_key, force_flush=True)
+                    buffer_logs(log_queue, stream_key, harness_config.aws, harness_config.log_group, force_flush=True)
 
                 # Compute the S3 key for the agent's output archive
                 agent_output_s3_key = None
@@ -364,6 +375,8 @@ async def process_task(
                     task_id,
                     log_output,
                     task_data.cwd,
+                    aws=harness_config.aws,
+                    s3_bucket=harness_config.s3_bucket,
                     agent_output_s3_key=agent_output_s3_key,
                 )
 
@@ -380,7 +393,7 @@ async def process_task(
                 )
 
                 # Force flush the logs, maybe redundant since we have the one in finally:
-                buffer_logs(log_queue, stream_key, force_flush=True)
+                buffer_logs(log_queue, stream_key, harness_config.aws, harness_config.log_group, force_flush=True)
 
                 # Save the evaluation result to the database with the task row
                 evaluation_result_row = EvaluationResult(
@@ -415,7 +428,7 @@ async def process_task(
         return {task_id: None}
     finally:
         flush_task.cancel()
-        buffer_logs(log_queue, stream_key, force_flush=True)
+        buffer_logs(log_queue, stream_key, harness_config.aws, harness_config.log_group, force_flush=True)
 
 
 def set_benchmark_final_status(benchmark_row: Benchmark, session: Session) -> None:
@@ -515,10 +528,13 @@ async def process_benchmark(
     start_benchmark_request: StartBenchmarkRequest = StartBenchmarkRequest(**start_benchmark_request_json)
     benchmark_id: UUID = UUID(benchmark_id_str)
     benchmark_service = start_benchmark_request.benchmark_service
+    harness_config: HarnessConfig = start_benchmark_request.harness_config
 
     try:
         # Create benchmark cloudwatch log group
-        create_benchmark_group(str(benchmark_id))
+        create_benchmark_group(
+            str(benchmark_id), harness_config.aws, harness_config.log_group, harness_config.log_retention_policy
+        )
 
         # Create tasks inside of the database for each task id
         with Session(bind=engine) as session:
@@ -535,7 +551,9 @@ async def process_benchmark(
         # Load the tasks we are going to be tracking
         tracked_tasks: dict[str, TrackedTask] = {
             task_id: TrackedTask(
-                process_task(task_row, start_benchmark_request, benchmark_service, benchmark_id, task_id)
+                process_task(
+                    task_row, start_benchmark_request, benchmark_service, benchmark_id, task_id, harness_config
+                )
             )
             for task_id, task_row in task_rows
         }
@@ -596,7 +614,7 @@ async def process_benchmark(
             # Push the final benchmark view to the bucket
             final_view: FinalViewResponse = create_final_view(benchmark_row, session)
 
-            upload_final_view(benchmark_row, final_view)
+            upload_final_view(benchmark_row, final_view, harness_config)
 
             # If the user has chosen to invoke a lambda function at the end of the benchmark
             # We run it but do not let a failure affect the benchmark status
@@ -606,7 +624,7 @@ async def process_benchmark(
                 lambda_payload: dict[str, Any] = arguments.model_dump()
                 lambda_payload["benchmark_id"] = str(benchmark_id)
 
-                invoke_lambda(arguments.lambda_function, lambda_payload)
+                invoke_lambda(arguments.lambda_function, lambda_payload, harness_config.aws)
 
     except Exception as e:
         with Session(bind=engine) as session:
@@ -757,7 +775,9 @@ def commit_task_error(task_row: Task, session: Session, error_message: str) -> N
     session.commit()
 
 
-async def stream_benchmark_results(benchmark_id: UUID, session: Session) -> AsyncGenerator[str]:
+async def stream_benchmark_results(
+    benchmark_id: UUID, session: Session, harness_config: HarnessConfig
+) -> AsyncGenerator[str]:
     """
     Generate Server-Sent Events with benchmark updates. User connects to this when they want to view live updates of a benchmark.
 
@@ -789,7 +809,9 @@ async def stream_benchmark_results(benchmark_id: UUID, session: Session) -> Asyn
                     benchmark_name=fresh_benchmark.name,
                     benchmark_id=fresh_benchmark.id,
                     details=benchmark_context.benchmark_details,
-                    s3_bucket_url=create_benchmark_url(str(fresh_benchmark.id)),
+                    s3_bucket_url=create_benchmark_url(
+                        str(fresh_benchmark.id), harness_config.aws.aws_default_region, harness_config.s3_bucket
+                    ),
                 )
 
                 yield f"{DATA_PREFIX} {response_data.model_dump_json()}\n\n"
@@ -879,7 +901,9 @@ async def sandbox_generator(
         paginated_sandboxes = await fetch_sandboxes(benchmark_row, daytona_client, int(paginated_sandboxes.page))
 
 
-async def force_stop_sandboxes(benchmark_row: Benchmark, session: Session) -> None:
+async def force_stop_sandboxes(
+    benchmark_row: Benchmark, session: Session, daytona_secret_name: str, aws: AWSCredentials
+) -> None:
     """
     Stops and deletes all sandboxes which are in progress or evaluating.
     NOTE: If task is not in progress but sandbox exists, we kill it and leave the task status as is.
@@ -887,7 +911,7 @@ async def force_stop_sandboxes(benchmark_row: Benchmark, session: Session) -> No
     Raises:
         TrackerServiceError: If there are any errors stopping the sandboxes
     """
-    daytona_client: AsyncDaytona = benchmark_row.benchmark_service.daytona_client
+    daytona_client: AsyncDaytona = benchmark_row.benchmark_service(daytona_secret_name, aws).daytona_client
 
     # Update all tasks being processed to stopped
     session.exec(
@@ -1086,14 +1110,33 @@ def create_final_view(benchmark_row: Benchmark, session: Session) -> FinalViewRe
     return final_view
 
 
-def upload_final_view(benchmark_row: Benchmark, final_view: FinalViewResponse) -> str:
+def upload_final_view(benchmark_row: Benchmark, final_view: FinalViewResponse, harness_config: HarnessConfig) -> str:
     """Uploads the final view to the root of the benchmark folder and returns the s3 key"""
     s3_key = f"{S3_BENCHMARKS_PREFIX}/{benchmark_row.id}/{benchmark_row.name}.json"
     upload_to_s3(
-        final_view.model_dump_json(
-            indent=4, exclude_none=True, exclude={"benchmark_arguments": {"contract": {"env"}}}
-        ).encode(),
+        final_view.model_dump_json(indent=4, exclude_none=True).encode(),
         s3_key,
+        harness_config.aws,
+        harness_config.s3_bucket,
     )
 
     return s3_key
+
+
+def fetch_harness_config(request: Request) -> HarnessConfig:
+    """Constructs HarnessConfig from X-Harness-* request headers."""
+    prefix = "x-harness-"
+    flat = {
+        key[len(prefix) :].replace("-", "_"): value for key, value in request.headers.items() if key.startswith(prefix)
+    }
+    return HarnessConfig(
+        aws=AWSCredentials(
+            aws_access_key_id=flat["aws_access_key_id"],
+            aws_secret_access_key=flat["aws_secret_access_key"],
+            aws_default_region=flat["aws_default_region"],
+        ),
+        s3_bucket=flat["s3_bucket"],
+        log_group=flat["log_group"],
+        log_retention_policy=int(flat["log_retention_policy"]),
+        daytona_secret_name=flat["daytona_secret_name"],
+    )

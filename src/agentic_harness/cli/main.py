@@ -1,10 +1,12 @@
 """CLI views/commands for the agentic harness."""
 
+import os
 from pathlib import Path
 from typing import Any
 from uuid import UUID
 
 import click
+import yaml
 from tracker.database.models import BenchmarkStatus
 from tracker.types import FinalViewResponse, Order, RetrieveResultsResponse, StartBenchmarkResponse
 
@@ -39,6 +41,102 @@ def benchmark():
 def agent():
     """Agent command group"""
     pass
+
+
+@cli.group()
+def config():
+    """Config command group"""
+    pass
+
+
+_CONFIG_LOCATION: Path = Path("~/.config/harness/harness.yaml").expanduser()
+
+
+@config.command()
+def init() -> None:
+    """
+    Initializes a config we can trust to have references to dependencies to run the harness,
+    this becomes our source of truth for secrets required to run the harness
+    """
+
+    # Mapping between the expected key and default value
+    # None means its user provided if not found
+    environment_variables: dict[str, str | None | int] = {
+        "AWS_ACCESS_KEY_ID": None,  # AWS ACCESS KEY
+        "AWS_SECRET_ACCESS_KEY": None,  # AWS SECRETS KEY
+        "AWS_DEFAULT_REGION": None,  # What region your secrets are in
+        "S3_BUCKET": None,  # Center point where all agents and benchmark results are uploaded
+        "DAYTONA_SECRET_NAME": None,  # AWS Secrets Manager name for Daytona credentials
+        "LOG_GROUP": "benchmarks",  # the prefix to the cloudwatch logs (e.x. benchmarks/<benchmark_id>)
+        "LOG_RETENTION_POLICY": 365,  # How long logs are kept until auto deleted
+    }
+
+    current_config: dict[str, str] = {}
+    if _CONFIG_LOCATION.exists():
+        with open(_CONFIG_LOCATION) as f:
+            try:
+                current_config = yaml.safe_load(f)
+            except Exception:
+                pass
+
+    collected_keys: dict[str, str] = {}
+    for key, default in environment_variables.items():
+        sourced = current_config.get(key) or os.environ.get(key)
+        if sourced:
+            click.echo(
+                f"  {key}: sourced from {'environment' if not current_config.get(key) else 'already created config'}"
+            )
+            collected_keys[key] = sourced
+            continue
+
+        if not default:
+            value = click.prompt(
+                f"  {key} (required, Enter to cancel)",
+                default="",
+                show_default=False,
+            )
+
+            if not value.strip():
+                click.echo(click.style(f"\n  {key} is required. Aborting.", fg="red"))
+                raise click.Abort()
+        else:
+            value = click.prompt(f"  {key}", default=str(default))
+
+        collected_keys[key] = value
+
+    _CONFIG_LOCATION.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(_CONFIG_LOCATION, "w") as f:
+        yaml.dump(collected_keys, f, default_flow_style=False)
+
+    click.echo(click.style(f"\nConfig written to {_CONFIG_LOCATION}", fg="green", bold=True))
+
+
+@config.command()
+@click.argument("key")
+@click.argument("value")
+def modify(key: str, value: str) -> None:
+    """
+    Modify a single key in the harness config.
+
+    Example: harness config modify AWS_DEFAULT_REGION us-west-2
+    """
+
+    if not _CONFIG_LOCATION.exists():
+        raise click.ClickException("Config not found. Run `harness config init` first.")
+
+    with open(_CONFIG_LOCATION) as f:
+        current: dict[str, str] = yaml.safe_load(f) or {}
+
+    if key not in current:
+        raise click.ClickException(f"Key '{key}' not found in config. Valid keys: {', '.join(current)}")
+
+    current[key] = value
+
+    with open(_CONFIG_LOCATION, "w") as f:
+        yaml.dump(current, f, default_flow_style=False)
+
+    click.echo(click.style(f"  {key} updated.", fg="green"))
 
 
 @benchmark.command(
@@ -108,6 +206,15 @@ def agent():
     type=(str, str),
     help="Kwargs as key value (e.g., -k temperature 7 -k max_tokens 1000)",
 )
+@click.option(
+    "--secret",
+    "-s",
+    "secrets",
+    multiple=True,
+    nargs=2,
+    type=(str, str),
+    help="Secret as ENV_VAR aws_secret_name (e.g., -s ANTHROPIC_API_KEY devEvalInfraAnthropicKey)",
+)
 def start(
     agent: Path,
     model: str | None,
@@ -118,6 +225,7 @@ def start(
     task_ids_file: Path | None,
     slice_str: str | None,
     kwargs: tuple[tuple[str, str]],
+    secrets: tuple[tuple[str, str]],
 ):
     """
     Run an agent on a benchmark.
@@ -161,6 +269,10 @@ def start(
         agent_config = AgentConfig(**config_kwargs)
 
         contract = get_contract(contract_path, agent_config)
+
+        # Merge CLI secrets into contract defaults (override with cli secret)
+        if secrets:
+            contract.secrets.update({key: value for key, value in secrets})
 
         with TrackerService() as tracker:
             if not check_tracker_service_health(tracker):

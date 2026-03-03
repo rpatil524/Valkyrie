@@ -15,8 +15,13 @@ config/**.yaml
 # fab
 logs
 
+# mac
+.DS_Store
 
 tracker.db*
 dump.rdb*
 dist
 build
+
+*claude*
+*CLAUDE*

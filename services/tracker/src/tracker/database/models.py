@@ -27,7 +27,13 @@ from tracker.database.utils import has_field_changed
 if TYPE_CHECKING:
     from benchmark_service.client import BenchmarkServiceClient
 
-    from tracker.types import BenchmarkTableRow, FetchBenchmarkMetadataResponse, StartBenchmarkRequest
+    from tracker.types import (
+        AWSCredentials,
+        BenchmarkTableRow,
+        FetchBenchmarkMetadataResponse,
+        HarnessConfig,
+        StartBenchmarkRequest,
+    )
 
 
 class TaskStatus(str, Enum):
@@ -54,7 +60,7 @@ class AgentContractRequest(BaseModel):
     install_cmd: str
     run_cmd: str
     final_output: str | None = None
-    env: dict[str, str] = {}
+    secrets: dict[str, str] = {}
 
 
 class BenchmarkArguments(BaseModel):
@@ -152,8 +158,7 @@ class Benchmark(SQLModel, table=True):
 
         return {task_id: (error_message or "No error message was provided") for task_id, error_message in tasks}
 
-    @property
-    def start_benchmark_request(self) -> "StartBenchmarkRequest":
+    def start_benchmark_request(self, harness_config: "HarnessConfig") -> "StartBenchmarkRequest":
         from tracker.types import StartBenchmarkRequest
 
         return StartBenchmarkRequest(
@@ -163,11 +168,16 @@ class Benchmark(SQLModel, table=True):
             task_ids=self.arguments.task_ids,
             slice_str=self.arguments.slice_str,
             lambda_function=self.arguments.lambda_function,
+            harness_config=harness_config,
         )
 
-    @property
-    def benchmark_service(self) -> "BenchmarkServiceClient":
-        return self.start_benchmark_request.benchmark_service
+    def benchmark_service(self, daytona_secret_name: str, aws: "AWSCredentials") -> "BenchmarkServiceClient":
+        from tracker.config import BENCHMARK_SERVICE_URL
+        from tracker.utils import create_benchmark_service_client
+
+        return create_benchmark_service_client(
+            url=BENCHMARK_SERVICE_URL, daytona_secret_name=daytona_secret_name, aws=aws
+        )
 
     @property
     def benchmark_metadata(self) -> "FetchBenchmarkMetadataResponse":
