@@ -12,7 +12,20 @@ from tracker.task_protection import TaskProtectionMiddleware
 
 load_dotenv()
 
-BENCHMARK_SERVICE_URL = os.environ.get("BENCHMARK_SERVICE_URL", "http://localhost:8001")
+BENCHMARK_SERVICE_NAMESPACE = os.environ.get("BENCHMARK_SERVICE_NAMESPACE")
+BENCHMARK_SERVICE_PORT = 8000
+
+
+def benchmark_service_url(benchmark_name: str) -> str:
+    """
+    Derive the benchmark service URL from the benchmark name and namespace
+
+    NOTE: If we are running this locally the namespace is blank
+    """
+    host = f"{benchmark_name}.{BENCHMARK_SERVICE_NAMESPACE}" if BENCHMARK_SERVICE_NAMESPACE else benchmark_name
+    return f"http://{host}:{BENCHMARK_SERVICE_PORT}"
+
+
 AWS_S3_BUCKET = os.environ.get("AWS_S3_BUCKET", "agentic-harness")
 BROKER_ENVIRONMENT = os.environ.get("BROKER_ENVIRONMENT", "production")
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379")
