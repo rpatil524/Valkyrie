@@ -27,6 +27,12 @@ def local_time(dt: datetime) -> str:
     return dt.astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
 
 
+def short_local_time(dt: datetime, include_date: bool = True) -> str:
+    """Convert UTC time to a short local time string."""
+    fmt = "%m/%d %H:%M" if include_date else "%H:%M"
+    return dt.astimezone().strftime(fmt)
+
+
 class BenchmarkFormatter:
     STATUS_COLORS = {
         "PENDING": "yellow",
@@ -283,6 +289,7 @@ def format_fetch_benchmarks_response(
     name_width = max(len("Benchmark"), max(len(benchmark.name) for benchmark in benchmarks))
     agent_width = max(len("Agent"), max(len(benchmark.agent_name) for benchmark in benchmarks))
     status_width = max(len("Status"), max(len(benchmark.status.value) for benchmark in benchmarks))
+    time_width = 19
     progress_width = 8
 
     header_line = (
@@ -290,6 +297,7 @@ def format_fetch_benchmarks_response(
         f"{'Benchmark':<{name_width}}  "
         f"{'Agent':<{agent_width}}  "
         f"{'Status':<{status_width}}  "
+        f"{'Started / Finished':<{time_width}}  "
         f"{'Progress':>{progress_width}}"
     )
     separator = "─" * len(header_line)
@@ -302,12 +310,16 @@ def format_fetch_benchmarks_response(
         _, progress_percentage = BenchmarkFormatter.create_progress_bar(benchmark.finished_tasks, benchmark.total_tasks)
         status_color = BenchmarkFormatter.STATUS_COLORS[benchmark.status.value]
         status_display = benchmark.status.value.replace("_", " ").title()
+        started_short = short_local_time(benchmark.started_at)
+        finished_short = short_local_time(benchmark.finished_at, include_date=False) if benchmark.finished_at else "-"
+        time_display = f"{started_short} / {finished_short}"
 
         click.echo(
             f"{str(benchmark.id):<{id_width}}  "
             f"{benchmark.name:<{name_width}}  "
             f"{benchmark.agent_name:<{agent_width}}  "
             f"{click.style(status_display, fg=status_color):<{status_width + 9}}  "
+            f"{time_display}  "
             f"{progress_percentage:>{progress_width}.1f}%"
         )
 
