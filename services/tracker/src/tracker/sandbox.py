@@ -23,7 +23,6 @@ from daytona import (
     SessionExecuteRequest,
 )
 from tenacity import before_sleep_log, retry, retry_if_exception_type, stop_after_attempt, wait_fixed
-
 from tracker.database.models import AgentContractRequest
 from tracker.exceptions import SandboxError
 from tracker.logger import get_logger
@@ -180,6 +179,8 @@ async def upload_agent_artifacts(
 
     if files_to_upload:
         await sandbox.fs.upload_files(files_to_upload)
+    else:
+        await sandbox.fs.create_folder(str(bundle_path / contract.name), "755")
 
 
 @retry(retry=retry_if_exception_type(SandboxError), reraise=True, stop=stop_after_attempt(3))
