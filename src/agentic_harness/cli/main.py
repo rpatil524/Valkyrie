@@ -32,6 +32,7 @@ from agentic_harness.cli.utils import (
     format_start_benchmark_response,
     paginate_agents,
     paginate_benchmarks,
+    paginate_services,
     stream_benchmark_status,
 )
 from agentic_harness.schemas import AgentConfig
@@ -146,6 +147,82 @@ def modify(key: str, value: str) -> None:
         yaml.dump(current, f, default_flow_style=False)
 
     click.echo(click.style(f"  {key} updated.", fg="green"))
+
+
+@config.group()
+def service() -> None:
+    """Manage custom benchmark service URL overrides."""
+    pass
+
+
+@service.command("set")
+@click.argument("name")
+@click.argument("url")
+def service_set(name: str, url: str) -> None:
+    """Set a custom URL for a benchmark service (creates or updates).
+
+    Example: harness config service set swebench https://my-tunnel.ngrok.io
+    """
+    if not CONFIG_LOCATION.exists():
+        raise click.ClickException("Config not found. Run `harness config init` first.")
+
+    with open(CONFIG_LOCATION) as f:
+        harness_config: dict[str, Any] = yaml.safe_load(f) or {}
+
+    if "custom_benchmark_services" not in harness_config:
+        harness_config["custom_benchmark_services"] = {}
+
+    harness_config["custom_benchmark_services"][name] = url
+
+    with open(CONFIG_LOCATION, "w") as f:
+        yaml.dump(harness_config, f, default_flow_style=False)
+
+    click.echo(click.style(f"Service '{name}' has been set set", fg="green"))
+
+
+@service.command("remove")
+@click.argument("name")
+def service_remove(name: str) -> None:
+    """Remove a custom URL override for a benchmark service.
+
+    Example: harness config service remove swebench
+    """
+    if not CONFIG_LOCATION.exists():
+        raise click.ClickException("Config not found. Run `harness config init` first.")
+
+    with open(CONFIG_LOCATION) as f:
+        current: dict[str, Any] = yaml.safe_load(f) or {}
+
+    services = current.get("custom_benchmark_services") or {}
+    if name not in services:
+        raise click.ClickException(f"Service '{name}' not configured.")
+
+    del services[name]
+    current["custom_benchmark_services"] = services
+
+    with open(CONFIG_LOCATION, "w") as f:
+        yaml.dump(current, f, default_flow_style=False)
+
+    click.echo(click.style(f"Service '{name}' has been removed.", fg="green"))
+
+
+@service.command("list")
+def service_list() -> None:
+    """List all custom benchmark service URL overrides."""
+    if not CONFIG_LOCATION.exists():
+        raise click.ClickException("Config not found. Run `harness config init` first.")
+
+    with open(CONFIG_LOCATION) as f:
+        current: dict[str, Any] = yaml.safe_load(f) or {}
+
+    services: dict[str, str] = current.get("custom_benchmark_services") or {}
+    if not services:
+        click.echo(click.style("No custom service URLs configured.", fg="yellow"))
+        return
+
+    # Create a table of all the services that the user has inside of their config
+    services_list = list(services.items())
+    paginate_services(services_list)
 
 
 @benchmark.command(
