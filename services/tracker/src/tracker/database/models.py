@@ -269,8 +269,9 @@ class Task(SQLModel, table=True):
     @computed_field
     @property
     def alias(self) -> str:
-        """Unique alias for the task that is used to uniquely identify the same task when creating sandboxes"""
-        return f"{self.task_id}_{self.id.hex[:5]}"
+        """Unique alias for the current task attempt, used when creating sandboxes."""
+        attempt_suffix = f"{int(self.started_at.timestamp() * 1_000_000):x}"
+        return f"{self.task_id}_{self.id.hex[:5]}_{attempt_suffix}"
 
 
 @event.listens_for(Task, "before_insert")

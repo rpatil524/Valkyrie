@@ -134,6 +134,15 @@ class TrackedTask:
             return await self._task
         except asyncio.CancelledError:
             logger.warning(f"Task {task_row.task_id} was cancelled")
+            with Session(bind=engine) as session:
+                task = fetch_task_row(task_row.id, session)
+                benchmark = fetch_benchmark_row(task.benchmark, session)
+
+                if benchmark.status == BenchmarkStatus.STOPPING or task.status == TaskStatus.STOPPED:
+                    task.status = TaskStatus.STOPPED
+                    session.add(task)
+                    session.commit()
+
             # Need to clean up the coroutine if we cancelled the task
             self._coro.close()
 
@@ -173,8 +182,6 @@ class TaskMonitor:
 
     def _validate_task(self, task_id: str) -> bool:
         """
-        Runs while waiting to be aquired by the semaphore.
-
         If the task status has been set to stopped we return False to exit the task early.
 
         Returns:
@@ -185,29 +192,18 @@ class TaskMonitor:
             benchmark_row = fetch_benchmark_row(self._benchmark_id, session)
             task_row = self._fetch_task_row(task_id)
 
-            # If task has been stopped or benchmark has occured an error we need to exit
-            if task_row.status == TaskStatus.STOPPED or benchmark_row.status == BenchmarkStatus.ERROR:
+            # If task has been stopped or benchmark is stopping / errored we need to exit
+            if task_row.status == TaskStatus.STOPPED or benchmark_row.status in [
+                BenchmarkStatus.ERROR,
+                BenchmarkStatus.STOPPING
+            ]:
                 return False
 
         return True
 
-    def _check_is_waiting(self, task: TrackedTask) -> bool:
-        """
-        Checks if the task is waiting to be aquired by the semaphore.
-
-        Returns:
-            True if the task is waiting to be aquired by the semaphore, False if it has been aquired
-        """
-        if task.task is None or task.status == TrackedTaskStatus.WAITING:
-            return True
-
-        return False
-
     async def track_tasks(self) -> None:
         """
-        Tracks all the tasks and removes the tasks that are no longer waiting to be aquired by the semaphore.
-
-        Removes the tasks that are no longer waiting to be aquired by the semaphore.
+        Tracks tasks and cancels them when they are no longer valid.
         """
 
         exit_condition_met: bool = False
@@ -217,14 +213,12 @@ class TaskMonitor:
             for task_id in tasks_to_check:
                 task = self._task_tracking[task_id]
 
-                if not self._check_is_waiting(task):
+                if task.status == TrackedTaskStatus.DONE:
                     del self._task_tracking[task_id]
+                    continue
 
-                if not self._validate_task(task_id) and task.task:
+                if not self._validate_task(task_id) and task.task is not None and not task.task.done():
                     task.task.cancel(f"Task {task_id} has been invalidated. Benchmark has been requested to stop")
-
-                    if task_id in self._task_tracking:
-                        del self._task_tracking[task_id]
 
             if not self._task_tracking:
                 exit_condition_met = True
