@@ -216,7 +216,7 @@ class TestStopAndResume:
             tracked_task._status = TrackedTaskStatus.DONE  # type: ignore[attr-defined]
 
         cancel_mock.side_effect = _cancel
-        tracked_task.task = Mock(cancel=cancel_mock, done=lambda: False)
+        tracked_task._task = Mock(cancel=cancel_mock, done=lambda: False)  # type: ignore[assignment]
 
         monitor = TaskMonitor(benchmark_row.id, {task_row.task_id: tracked_task})
         monitor._TRACK_INTERVAL = 0
