@@ -225,6 +225,82 @@ def service_list() -> None:
     paginate_services(services_list)
 
 
+@config.group()
+def auth() -> None:
+    """Manage benchmark service auth tokens."""
+    pass
+
+
+@auth.command("set")
+@click.argument("name")
+@click.argument("token")
+def auth_set(name: str, token: str) -> None:
+    """Set an auth token for a benchmark service.
+
+    Example: harness config auth set swebench my-secret-token
+    """
+    if not CONFIG_LOCATION.exists():
+        raise click.ClickException("Config not found. Run `harness config init` first.")
+
+    with open(CONFIG_LOCATION) as f:
+        harness_config: dict[str, Any] = yaml.safe_load(f) or {}
+
+    if "benchmark_auth" not in harness_config:
+        harness_config["benchmark_auth"] = {}
+
+    harness_config["benchmark_auth"][name] = token
+
+    with open(CONFIG_LOCATION, "w") as f:
+        yaml.dump(harness_config, f, default_flow_style=False)
+
+    click.echo(click.style(f"Auth for '{name}' has been set.", fg="green"))
+
+
+@auth.command("remove")
+@click.argument("name")
+def auth_remove(name: str) -> None:
+    """Remove an auth token for a benchmark service.
+
+    Example: harness config auth remove swebench
+    """
+    if not CONFIG_LOCATION.exists():
+        raise click.ClickException("Config not found. Run `harness config init` first.")
+
+    with open(CONFIG_LOCATION) as f:
+        current: dict[str, Any] = yaml.safe_load(f) or {}
+
+    auth_tokens = current.get("benchmark_auth") or {}
+    if name not in auth_tokens:
+        raise click.ClickException(f"Auth for '{name}' not configured.")
+
+    del auth_tokens[name]
+    current["benchmark_auth"] = auth_tokens
+
+    with open(CONFIG_LOCATION, "w") as f:
+        yaml.dump(current, f, default_flow_style=False)
+
+    click.echo(click.style(f"Auth for '{name}' has been removed.", fg="green"))
+
+
+@auth.command("list")
+def auth_list() -> None:
+    """List all configured benchmark auth tokens."""
+    if not CONFIG_LOCATION.exists():
+        raise click.ClickException("Config not found. Run `harness config init` first.")
+
+    with open(CONFIG_LOCATION) as f:
+        current: dict[str, Any] = yaml.safe_load(f) or {}
+
+    auth_tokens: dict[str, str] = current.get("benchmark_auth") or {}
+    if not auth_tokens:
+        click.echo(click.style("No benchmark auth tokens configured.", fg="yellow"))
+        return
+
+    for name, token in auth_tokens.items():
+        masked = token[:4] + "***" if len(token) > 4 else "***"
+        click.echo(f"  {name}: {masked}")
+
+
 @benchmark.command(
     help="Start a benchmark run. \n\nExample:\nharness benchmark start --agent agents/claude_code --benchmark swebench --concurrency 5"
 )
@@ -308,6 +384,15 @@ def service_list() -> None:
     type=(str, str),
     help="Secret as ENV_VAR aws_secret_name (e.g., -s ANTHROPIC_API_KEY devEvalInfraAnthropicKey)",
 )
+@click.option(
+    "--header",
+    "-H",
+    "headers",
+    multiple=True,
+    nargs=2,
+    type=(str, str),
+    help="Custom header for benchmark service requests (e.g., -H Authorization my-token)",
+)
 def start(
     agent: str,
     model: str | None,
@@ -320,6 +405,7 @@ def start(
     dataset: str | None,
     kwargs: tuple[tuple[str, str]],
     secrets: tuple[tuple[str, str]],
+    headers: tuple[tuple[str, str]],
 ):
     """
     Run an agent on a benchmark.
@@ -347,6 +433,16 @@ def start(
         click.echo(f"  - Task IDs: {task_ids[:100]}{'...' if len(task_ids) > 100 else ''}")
     else:
         click.echo("  - Task IDs: all tasks")
+
+    benchmark_headers: dict[str, str] = {}
+    auth_token = TrackerService.get_benchmark_auth(benchmark)
+    if auth_token:
+        benchmark_headers["Authorization"] = str(auth_token)
+    for name, value in headers:
+        benchmark_headers[name] = value
+
+    if benchmark_headers:
+        click.echo(f"  - Benchmark headers: {', '.join(benchmark_headers.keys())}")
 
     formatted_task_ids: list[str] | None = None
     if task_ids:
@@ -389,6 +485,7 @@ def start(
                 slice_str,
                 lambda_function,
                 dataset,
+                benchmark_headers=benchmark_headers or None,
             )
 
             click.echo("\r\033[K", nl=False)

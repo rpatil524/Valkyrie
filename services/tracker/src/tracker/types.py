@@ -52,6 +52,7 @@ class StartBenchmarkRequest(BaseModel):
     dataset: str | None = None
     harness_config: HarnessConfig
     custom_benchmark_service: str | None = None
+    benchmark_headers: dict[str, str] = {}
 
     @property
     def benchmark_service(self) -> BenchmarkServiceClient:
@@ -63,6 +64,7 @@ class StartBenchmarkRequest(BaseModel):
             url=benchmark_service_url,
             daytona_secret_name=self.harness_config.daytona_secret_name,
             aws=self.harness_config.aws,
+            benchmark_headers=self.benchmark_headers,
         )
 
 
