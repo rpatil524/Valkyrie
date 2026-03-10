@@ -355,7 +355,7 @@ async def process_task(
                 await run_agent(
                     sandbox,
                     start_benchmark_request.contract,
-                    task_data.problem_statement,
+                    task_data.problem_path,
                     task_id,
                     log_output,
                     task_data.cwd,

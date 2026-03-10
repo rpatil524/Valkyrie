@@ -24,7 +24,7 @@ class TestStopAndResume:
     async def _mock_request_retrieve_task(*args: Any, **kwargs: Any) -> RetrieveTaskResponse:
         return RetrieveTaskResponse(
             docker_image="test-image:latest",
-            problem_statement="Test problem statement",
+            problem_path="/tmp/problem_statement.txt",
             request_setup=False,
             cwd="/testbed",
             resources=Resources(vcpu=2, memory=4, disk=5),
