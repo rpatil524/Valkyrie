@@ -225,6 +225,82 @@ def service_list() -> None:
     paginate_services(services_list)
 
 
+@config.group()
+def auth() -> None:
+    """Manage benchmark service auth credentials."""
+    pass
+
+
+@auth.command("set")
+@click.argument("name")
+@click.argument("credential")
+def auth_set(name: str, credential: str) -> None:
+    """Set an auth credential for a benchmark service.
+
+    Example: harness config auth set swebench my-secret-credential
+    """
+    if not CONFIG_LOCATION.exists():
+        raise click.ClickException("Config not found. Run `harness config init` first.")
+
+    with open(CONFIG_LOCATION) as f:
+        harness_config: dict[str, Any] = yaml.safe_load(f) or {}
+
+    if "benchmark_auth" not in harness_config:
+        harness_config["benchmark_auth"] = {}
+
+    harness_config["benchmark_auth"][name] = credential
+
+    with open(CONFIG_LOCATION, "w") as f:
+        yaml.dump(harness_config, f, default_flow_style=False)
+
+    click.echo(click.style(f"Auth for '{name}' has been set.", fg="green"))
+
+
+@auth.command("remove")
+@click.argument("name")
+def auth_remove(name: str) -> None:
+    """Remove an auth credential for a benchmark service.
+
+    Example: harness config auth remove swebench
+    """
+    if not CONFIG_LOCATION.exists():
+        raise click.ClickException("Config not found. Run `harness config init` first.")
+
+    with open(CONFIG_LOCATION) as f:
+        current: dict[str, Any] = yaml.safe_load(f) or {}
+
+    auth_credentials = current.get("benchmark_auth") or {}
+    if name not in auth_credentials:
+        raise click.ClickException(f"Auth for '{name}' not configured.")
+
+    del auth_credentials[name]
+    current["benchmark_auth"] = auth_credentials
+
+    with open(CONFIG_LOCATION, "w") as f:
+        yaml.dump(current, f, default_flow_style=False)
+
+    click.echo(click.style(f"Auth for '{name}' has been removed.", fg="green"))
+
+
+@auth.command("list")
+def auth_list() -> None:
+    """List all configured benchmark auth credentials."""
+    if not CONFIG_LOCATION.exists():
+        raise click.ClickException("Config not found. Run `harness config init` first.")
+
+    with open(CONFIG_LOCATION) as f:
+        current: dict[str, Any] = yaml.safe_load(f) or {}
+
+    auth_credentials: dict[str, str] = current.get("benchmark_auth") or {}
+    if not auth_credentials:
+        click.echo(click.style("No benchmark auth credentials configured.", fg="yellow"))
+        return
+
+    for name, credential in auth_credentials.items():
+        masked = credential[:4] + "***" if len(credential) > 4 else "***"
+        click.echo(f"  {name}: {masked}")
+
+
 @benchmark.command(
     help="Start a benchmark run. \n\nExample:\nharness benchmark start --agent agents/claude_code --benchmark swebench --concurrency 5"
 )
@@ -308,6 +384,15 @@ def service_list() -> None:
     type=(str, str),
     help="Secret as ENV_VAR aws_secret_name (e.g., -s ANTHROPIC_API_KEY devEvalInfraAnthropicKey)",
 )
+@click.option(
+    "--header",
+    "-H",
+    "headers",
+    multiple=True,
+    nargs=2,
+    type=(str, str),
+    help="Custom header for benchmark service requests (e.g., -H Authorization my-credential)",
+)
 def start(
     agent: str,
     model: str | None,
@@ -320,6 +405,7 @@ def start(
     dataset: str | None,
     kwargs: tuple[tuple[str, str]],
     secrets: tuple[tuple[str, str]],
+    headers: tuple[tuple[str, str]],
 ):
     """
     Run an agent on a benchmark.
@@ -347,6 +433,16 @@ def start(
         click.echo(f"  - Task IDs: {task_ids[:100]}{'...' if len(task_ids) > 100 else ''}")
     else:
         click.echo("  - Task IDs: all tasks")
+
+    service_headers: dict[str, str] = {}
+    auth_credential = TrackerService.get_benchmark_auth(benchmark)
+    if auth_credential:
+        service_headers["Authorization"] = str(auth_credential)
+    for name, value in headers:
+        service_headers[name] = value
+
+    if service_headers:
+        click.echo(f"  - Service headers: {', '.join(service_headers.keys())}")
 
     formatted_task_ids: list[str] | None = None
     if task_ids:
@@ -389,6 +485,7 @@ def start(
                 slice_str,
                 lambda_function,
                 dataset,
+                service_headers=service_headers or None,
             )
 
             click.echo("\r\033[K", nl=False)
