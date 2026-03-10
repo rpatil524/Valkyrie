@@ -95,13 +95,13 @@ class TrackerService:
     @staticmethod
     def get_benchmark_auth(benchmark_name: str) -> str | None:
         """
-        Get benchmark auth token from config if it exists.
+        Get benchmark auth credential from config if it exists.
 
         Args:
             benchmark_name: Name of the benchmark
 
         Returns:
-            Auth token if configured, None otherwise
+            Auth credential if configured, None otherwise
         """
         config_path = _CONFIG_LOCATION.expanduser()
         if not config_path.exists():

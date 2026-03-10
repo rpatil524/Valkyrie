@@ -227,17 +227,17 @@ def service_list() -> None:
 
 @config.group()
 def auth() -> None:
-    """Manage benchmark service auth tokens."""
+    """Manage benchmark service auth credentials."""
     pass
 
 
 @auth.command("set")
 @click.argument("name")
-@click.argument("token")
-def auth_set(name: str, token: str) -> None:
-    """Set an auth token for a benchmark service.
+@click.argument("credential")
+def auth_set(name: str, credential: str) -> None:
+    """Set an auth credential for a benchmark service.
 
-    Example: harness config auth set swebench my-secret-token
+    Example: harness config auth set swebench my-secret-credential
     """
     if not CONFIG_LOCATION.exists():
         raise click.ClickException("Config not found. Run `harness config init` first.")
@@ -248,7 +248,7 @@ def auth_set(name: str, token: str) -> None:
     if "benchmark_auth" not in harness_config:
         harness_config["benchmark_auth"] = {}
 
-    harness_config["benchmark_auth"][name] = token
+    harness_config["benchmark_auth"][name] = credential
 
     with open(CONFIG_LOCATION, "w") as f:
         yaml.dump(harness_config, f, default_flow_style=False)
@@ -259,7 +259,7 @@ def auth_set(name: str, token: str) -> None:
 @auth.command("remove")
 @click.argument("name")
 def auth_remove(name: str) -> None:
-    """Remove an auth token for a benchmark service.
+    """Remove an auth credential for a benchmark service.
 
     Example: harness config auth remove swebench
     """
@@ -269,12 +269,12 @@ def auth_remove(name: str) -> None:
     with open(CONFIG_LOCATION) as f:
         current: dict[str, Any] = yaml.safe_load(f) or {}
 
-    auth_tokens = current.get("benchmark_auth") or {}
-    if name not in auth_tokens:
+    auth_credentials = current.get("benchmark_auth") or {}
+    if name not in auth_credentials:
         raise click.ClickException(f"Auth for '{name}' not configured.")
 
-    del auth_tokens[name]
-    current["benchmark_auth"] = auth_tokens
+    del auth_credentials[name]
+    current["benchmark_auth"] = auth_credentials
 
     with open(CONFIG_LOCATION, "w") as f:
         yaml.dump(current, f, default_flow_style=False)
@@ -284,20 +284,20 @@ def auth_remove(name: str) -> None:
 
 @auth.command("list")
 def auth_list() -> None:
-    """List all configured benchmark auth tokens."""
+    """List all configured benchmark auth credentials."""
     if not CONFIG_LOCATION.exists():
         raise click.ClickException("Config not found. Run `harness config init` first.")
 
     with open(CONFIG_LOCATION) as f:
         current: dict[str, Any] = yaml.safe_load(f) or {}
 
-    auth_tokens: dict[str, str] = current.get("benchmark_auth") or {}
-    if not auth_tokens:
-        click.echo(click.style("No benchmark auth tokens configured.", fg="yellow"))
+    auth_credentials: dict[str, str] = current.get("benchmark_auth") or {}
+    if not auth_credentials:
+        click.echo(click.style("No benchmark auth credentials configured.", fg="yellow"))
         return
 
-    for name, token in auth_tokens.items():
-        masked = token[:4] + "***" if len(token) > 4 else "***"
+    for name, credential in auth_credentials.items():
+        masked = credential[:4] + "***" if len(credential) > 4 else "***"
         click.echo(f"  {name}: {masked}")
 
 
@@ -391,7 +391,7 @@ def auth_list() -> None:
     multiple=True,
     nargs=2,
     type=(str, str),
-    help="Custom header for benchmark service requests (e.g., -H Authorization my-token)",
+    help="Custom header for benchmark service requests (e.g., -H Authorization my-credential)",
 )
 def start(
     agent: str,
@@ -435,9 +435,9 @@ def start(
         click.echo("  - Task IDs: all tasks")
 
     service_headers: dict[str, str] = {}
-    auth_token = TrackerService.get_benchmark_auth(benchmark)
-    if auth_token:
-        service_headers["Authorization"] = str(auth_token)
+    auth_credential = TrackerService.get_benchmark_auth(benchmark)
+    if auth_credential:
+        service_headers["Authorization"] = str(auth_credential)
     for name, value in headers:
         service_headers[name] = value
 
