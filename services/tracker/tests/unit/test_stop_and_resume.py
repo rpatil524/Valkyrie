@@ -227,29 +227,3 @@ class TestStopAndResume:
         assert monitor._task_tracking == {}
         tracked_task._coro.close()
 
-    async def test_tracked_task_cancel_marks_task_stopped_when_benchmark_is_stopping(
-        self, example_benchmark_object: Benchmark, database_session: Session, monkeypatch: MonkeyPatch
-    ):
-        benchmark_row = example_benchmark_object
-        benchmark_row.status = BenchmarkStatus.STOPPING
-        database_session.add(benchmark_row)
-        database_session.commit()
-
-        task_row = Task(task_id="task_1", benchmark=benchmark_row.id, status=TaskStatus.IN_PROGRESS)
-        database_session.add(task_row)
-        database_session.commit()
-
-        monkeypatch.setattr("tracker.utils.engine", database_session.bind)
-
-        tracked_task = TrackedTask(asyncio.sleep(10))
-        semaphore = asyncio.Semaphore(1)
-
-        run_task = asyncio.create_task(tracked_task.run(semaphore, task_row))
-        await asyncio.sleep(0)
-        run_task.cancel()
-
-        result = await run_task
-        database_session.refresh(task_row)
-
-        assert result == {"task_1": None}
-        assert task_row.status == TaskStatus.STOPPED

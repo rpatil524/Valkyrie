@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, Mock
 import pytest
 from sqlmodel import Session
 
-from tracker.database.models import Benchmark, BenchmarkStatus, Task, TaskStatus
+from tracker.database.models import Benchmark, Task, TaskStatus
 from tracker.utils import TaskMonitor, TrackedTask, TrackedTaskStatus
 
 
@@ -44,7 +44,6 @@ class TestTracker:
         Test Cases:
             - _validate_task fetches from updates database
             - _validate_task returns false if the task status has been set to stopped
-            - _validate_task returns false if the benchmark is stopping
             - running tasks remain tracked until they finish
         """
         benchmark_row = example_benchmark_object
@@ -89,13 +88,7 @@ class TestTracker:
         # NOTE: ensures that the database change gets picked up by the session
         assert not monitor._validate_task("task_id_1")  # type: ignore
 
-        # Test case 3. Validate task returns false if the benchmark is stopping
-        benchmark_row.status = BenchmarkStatus.STOPPING
-        database_session.add(benchmark_row)
-        database_session.commit()
-        assert not monitor._validate_task("task_id_1")  # type: ignore
-
-        # Test case 4. Running tasks stay tracked until they are done
+        # Test case 3. Running tasks stay tracked until they are done
         await monitor.track_tasks()
         assert task_tracking["task_id_1"].task
         cancel_mock.assert_called_once()
@@ -103,12 +96,7 @@ class TestTracker:
         assert monitor._task_tracking == {}
         task_tracking["task_id_1"]._coro.close()  # type: ignore[attr-defined]
 
-    async def test_tracked_task(
-        self,
-        database_session: Session,
-        example_benchmark_object: Benchmark,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
+    async def test_tracked_task(self) -> None:
         """
         Test functionality of the TrackedTask class
 
@@ -162,20 +150,12 @@ class TestTracker:
         assert tracked_task_2.task.result() == {"task_id_2": None}
 
         # Test case 3. When the task is cancelled, it is in the done state and default response is returned
-        benchmark_row = example_benchmark_object
-        benchmark_row.status = BenchmarkStatus.STOPPING
-        database_session.add(benchmark_row)
-        database_session.commit()
-
-        task_row = Task(task_id="task_id_3", benchmark=benchmark_row.id, status=TaskStatus.IN_PROGRESS)
-        database_session.add(task_row)
-        database_session.commit()
-
-        monkeypatch.setattr("tracker.utils.engine", database_session.bind)
+        mock_task_row_3 = MagicMock(spec=Task)
+        mock_task_row_3.task_id = "task_id_3"
 
         tracked_task = TrackedTask(coro=self._mock_coro(task_id="task_id_3"))
         semaphore = Semaphore(value=1)
-        run_task = asyncio.create_task(tracked_task.run(semaphore, task_row))
+        run_task = asyncio.create_task(tracked_task.run(semaphore, mock_task_row_3))
 
         # Wait for the task to start running and ensure that the status is running
         await asyncio.sleep(1)
@@ -190,8 +170,6 @@ class TestTracker:
 
         # The response of the tracked result should be None since the task was cancelled
         assert tracked_task.task is not None
-        database_session.refresh(task_row)
-        assert task_row.status == TaskStatus.STOPPED
 
         # Ensurance of cancellation
         with pytest.raises(asyncio.CancelledError):
@@ -200,19 +178,18 @@ class TestTracker:
         assert result == {"task_id_3": None}
 
         # Test case 4. When a task is waiting to be aquired it is kept inside of the waiting state
+        mock_task_row_4 = MagicMock(spec=Task)
+        mock_task_row_4.task_id = "task_id_4"
+        mock_task_row_5 = MagicMock(spec=Task)
+        mock_task_row_5.task_id = "task_id_5"
+
         running_task = TrackedTask(coro=self._mock_coro(task_id="task_id_4"))
         waiting_task = TrackedTask(coro=self._mock_coro(task_id="task_id_5"))
 
-        running_task_row = Task(task_id="task_id_4", benchmark=benchmark_row.id, status=TaskStatus.IN_PROGRESS)
-        waiting_task_row = Task(task_id="task_id_5", benchmark=benchmark_row.id, status=TaskStatus.IN_PROGRESS)
-        database_session.add(running_task_row)
-        database_session.add(waiting_task_row)
-        database_session.commit()
-
         semaphore = Semaphore(value=1)
 
-        running_task_coro = running_task.run(semaphore, running_task_row)
-        waiting_task_coro = waiting_task.run(semaphore, waiting_task_row)
+        running_task_coro = running_task.run(semaphore, mock_task_row_4)
+        waiting_task_coro = waiting_task.run(semaphore, mock_task_row_5)
 
         results = asyncio.gather(running_task_coro, waiting_task_coro)
 

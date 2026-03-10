@@ -273,11 +273,11 @@ class Task(SQLModel, table=True):
     def alias(self) -> str:
         """Unique alias for the current task attempt, used when creating sandboxes.
 
-        Format: {task_id}_{attempt_suffix}
-        - attempt_suffix: hex-encoded microsecond timestamp from started_at, changes on each retry
+        Format: {task_id}_{suffix}
+        - suffix: hex-encoded microsecond timestamp from started_at, changes on each retry/resume
         """
-        attempt_suffix = f"{int(self.started_at.timestamp() * 1_000_000):x}"
-        return f"{self.task_id}_{attempt_suffix}"
+        suffix = f"{int(self.started_at.timestamp() * 1_000_000):x}"
+        return f"{self.task_id}_{suffix}"
 
 
 @event.listens_for(Task, "before_insert")

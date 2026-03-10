@@ -135,15 +135,6 @@ class TrackedTask:
             return await self._task
         except asyncio.CancelledError:
             logger.warning(f"Task {task_row.task_id} was cancelled")
-            with Session(bind=engine) as session:
-                task = fetch_task_row(task_row.id, session)
-                benchmark = fetch_benchmark_row(task.benchmark, session)
-
-                if benchmark.status == BenchmarkStatus.STOPPING or task.status == TaskStatus.STOPPED:
-                    task.status = TaskStatus.STOPPED
-                    session.add(task)
-                    session.commit()
-
             # Need to clean up the coroutine if we cancelled the task
             self._coro.close()
 
@@ -193,11 +184,8 @@ class TaskMonitor:
             benchmark_row = fetch_benchmark_row(self._benchmark_id, session)
             task_row = self._fetch_task_row(task_id)
 
-            # If task has been stopped or benchmark is stopping / errored we need to exit
-            if task_row.status == TaskStatus.STOPPED or benchmark_row.status in [
-                BenchmarkStatus.ERROR,
-                BenchmarkStatus.STOPPING
-            ]:
+            # If task has been stopped or benchmark has errored we need to exit
+            if task_row.status == TaskStatus.STOPPED or benchmark_row.status == BenchmarkStatus.ERROR:
                 return False
 
         return True
