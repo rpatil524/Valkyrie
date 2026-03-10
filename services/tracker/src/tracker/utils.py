@@ -79,12 +79,12 @@ def fetch_daytona_headers(daytona_secret_name: str, aws: AWSCredentials) -> dict
 
 
 def create_benchmark_service_client(
-    url: str, daytona_secret_name: str, aws: AWSCredentials, benchmark_headers: dict[str, str] | None = None
+    url: str, daytona_secret_name: str, aws: AWSCredentials, service_headers: dict[str, str] | None = None
 ) -> BenchmarkServiceClient:
     """Create a BenchmarkServiceClient using Daytona credentials from AWS Secrets Manager."""
     headers = fetch_daytona_headers(daytona_secret_name, aws)
-    if benchmark_headers:
-        headers.update(benchmark_headers)
+    if service_headers:
+        headers.update(service_headers)
     return BenchmarkServiceClient(url=url, headers=headers)
 
 

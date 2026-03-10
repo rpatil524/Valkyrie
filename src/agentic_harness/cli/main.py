@@ -434,15 +434,15 @@ def start(
     else:
         click.echo("  - Task IDs: all tasks")
 
-    benchmark_headers: dict[str, str] = {}
+    service_headers: dict[str, str] = {}
     auth_token = TrackerService.get_benchmark_auth(benchmark)
     if auth_token:
-        benchmark_headers["Authorization"] = str(auth_token)
+        service_headers["Authorization"] = str(auth_token)
     for name, value in headers:
-        benchmark_headers[name] = value
+        service_headers[name] = value
 
-    if benchmark_headers:
-        click.echo(f"  - Benchmark headers: {', '.join(benchmark_headers.keys())}")
+    if service_headers:
+        click.echo(f"  - Service headers: {', '.join(service_headers.keys())}")
 
     formatted_task_ids: list[str] | None = None
     if task_ids:
@@ -485,7 +485,7 @@ def start(
                 slice_str,
                 lambda_function,
                 dataset,
-                benchmark_headers=benchmark_headers or None,
+                service_headers=service_headers or None,
             )
 
             click.echo("\r\033[K", nl=False)
