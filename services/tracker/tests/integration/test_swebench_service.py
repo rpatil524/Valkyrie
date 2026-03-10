@@ -137,7 +137,6 @@ class TestSWEBenchmarkService:
                 task_data = await benchmark_service.retrieve_task(task_id=task_id)
 
                 assert task_data.docker_image == docker_image_format.format(task_id=task_id)
-                assert task_data.request_setup
                 assert task_data.problem_path
 
                 # Verify docker image exists

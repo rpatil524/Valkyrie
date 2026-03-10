@@ -25,7 +25,6 @@ class TestStopAndResume:
         return RetrieveTaskResponse(
             docker_image="test-image:latest",
             problem_path="/tmp/problem_statement.txt",
-            request_setup=False,
             cwd="/testbed",
             resources=Resources(vcpu=2, memory=4, disk=5),
         )
