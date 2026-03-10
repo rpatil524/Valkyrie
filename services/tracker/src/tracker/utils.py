@@ -339,12 +339,10 @@ async def process_task(
                     sandbox, start_benchmark_request.contract, harness_config.aws, harness_config.s3_bucket
                 )
 
-                # Setup task if requested
-                if task_data.request_setup:
-                    _ = await benchmark_service.setup_task(task_row.task_id, sandbox.id, on_message=log_output, dataset=start_benchmark_request.dataset)
+                _ = await benchmark_service.setup_task(task_row.task_id, sandbox.id, on_message=log_output, dataset=start_benchmark_request.dataset)
 
-                    # Force flush the logs if anything has been buffered
-                    buffer_logs(log_queue, stream_key, harness_config.aws, harness_config.log_group, force_flush=True)
+                # Force flush the logs if anything has been buffered
+                buffer_logs(log_queue, stream_key, harness_config.aws, harness_config.log_group, force_flush=True)
 
                 # Compute the S3 key for the agent's output archive
                 agent_output_s3_key = None
@@ -355,7 +353,7 @@ async def process_task(
                 await run_agent(
                     sandbox,
                     start_benchmark_request.contract,
-                    task_data.problem_statement,
+                    task_data.problem_path,
                     task_id,
                     log_output,
                     task_data.cwd,
