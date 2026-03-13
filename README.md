@@ -213,8 +213,10 @@ harness benchmark start \
   --benchmark swebench \
   --model kimi/kimi-k2.5-thinking \
   --concurrency 5 \
+  --dataset default \
   -s ANTHROPIC_API_KEY devEvalInfraAnthropicKey \
   -k temperature 7 \
+  -H X-Custom-Header my-value \
   --task-ids "task_1,task_2" \
   --slice "0:10"
 ```
