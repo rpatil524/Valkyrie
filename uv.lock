@@ -570,7 +570,7 @@ wheels = [
 [[package]]
 name = "create-benchmark-service"
 version = "0.1.0"
-source = { git = "https://github.com/vals-ai/create-benchmark-service.git?rev=main#506a1d8a5ac0c3610a296a5ddc2df3bceebb3a17" }
+source = { git = "https://github.com/vals-ai/create-benchmark-service.git?rev=main#fcb7dcea8d7f05e9c83f24bec0d90cf5c8cc1754" }
 dependencies = [
     { name = "click" },
     { name = "daytona" },
