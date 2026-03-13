@@ -114,6 +114,95 @@ harness config service remove swebench
 
 Removes a custom benchmark service.
 
+## Authentication & Custom Headers
+
+Benchmark services may require authentication. The harness CLI provides built-in support for storing per-benchmark credentials and passing custom HTTP headers to benchmark service requests.
+
+### How authentication works
+
+When you start a benchmark, the harness checks `~/.config/harness/harness.yaml` for a stored credential under `benchmark_auth.<benchmark-name>`. If one exists it is automatically sent as the `Authorization` header on every request to that benchmark service. You can also pass arbitrary headers at runtime with `-H` — these are merged with (and can override) the stored credential.
+
+### Set an auth credential
+
+```bash
+harness config auth set <benchmark-name> <credential>
+```
+
+Stores the credential in `~/.config/harness/harness.yaml` under `benchmark_auth`. On subsequent `harness benchmark start --benchmark <benchmark-name>` calls the credential is sent as the `Authorization` header automatically.
+
+```bash
+# Example: store a bearer token for the swebench service
+harness config auth set swebench "Bearer sk-my-secret-token"
+```
+
+### List stored auth credentials
+
+```bash
+harness config auth list
+```
+
+Displays all configured benchmark credentials. Values are masked (only the first four characters are shown) for safety.
+
+Example output:
+
+```
+  swebench: Bear***
+  finance:  my-s***
+```
+
+### Remove an auth credential
+
+```bash
+harness config auth remove <benchmark-name>
+```
+
+Deletes the stored credential for the given benchmark.
+
+```bash
+harness config auth remove swebench
+```
+
+### Passing custom headers at runtime
+
+Use the `-H` (or `--header`) flag on `harness benchmark start` to send arbitrary HTTP headers to the benchmark service. Each `-H` takes two arguments: the header name and its value. You can specify `-H` multiple times.
+
+```bash
+harness benchmark start \
+  --agent sweagent \
+  --benchmark my-benchmark \
+  -H X-Custom-Header my-value \
+  -H X-Another-Header another-value
+```
+
+### Combining stored auth with runtime headers
+
+Stored `benchmark_auth` credentials and `-H` flags are merged into a single set of headers. If you pass `-H Authorization <value>`, it will **override** the stored credential for that run.
+
+```bash
+# Uses the stored credential from `harness config auth set`
+harness benchmark start --benchmark swebench --agent sweagent
+
+# Override the stored credential for a one-off run
+harness benchmark start --benchmark swebench --agent sweagent \
+  -H Authorization "Bearer one-time-token"
+
+# Add extra headers alongside the stored credential
+harness benchmark start --benchmark swebench --agent sweagent \
+  -H X-Request-ID abc123
+```
+
+### Config file reference
+
+All auth credentials are stored in `~/.config/harness/harness.yaml`. The relevant section looks like:
+
+```yaml
+benchmark_auth:
+  swebench: "Bearer sk-my-secret-token"
+  finance: "my-api-key"
+```
+
+This file is also where custom benchmark service URLs (`custom_benchmark_services`) and other harness configuration values live. Run `harness config init` to create it for the first time.
+
 ## Usage
 
 ### Start a benchmark
@@ -142,6 +231,8 @@ harness benchmark start \
 | `--task-ids` | Comma-separated task IDs to run |
 | `--task-ids-file` | Path to a text file with one task ID per line |
 | `--slice` | Slice the benchmark dataset (`start:stop:step`) |
+| `--dataset` | Dataset name to use from the benchmark service (defaults to `default`) |
+| `-H` / `--header` | Custom header for benchmark service requests as `NAME VALUE`. Repeatable. See [Authentication & Custom Headers](#authentication--custom-headers) |
 
 ### Monitor a benchmark
 
