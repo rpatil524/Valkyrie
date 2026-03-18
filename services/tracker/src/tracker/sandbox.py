@@ -16,6 +16,7 @@ from daytona import (
     AsyncDaytona,
     AsyncSandbox,
     CreateSandboxFromImageParams,
+    CreateSandboxFromSnapshotParams,
     DaytonaNotFoundError,
     FileUpload,
     Resources,
@@ -23,10 +24,10 @@ from daytona import (
     SessionExecuteRequest,
 )
 from daytona.common.errors import DaytonaError
-from tenacity import before_sleep_log, retry, retry_if_exception_type, stop_after_attempt, wait_fixed
+from tenacity import before_sleep_log, retry, retry_if_exception_type, retry_if_not_exception_type, stop_after_attempt, wait_fixed
 
 from tracker.database.models import AgentContractRequest
-from tracker.exceptions import SandboxError
+from tracker.exceptions import InvalidSandboxConfigurationError, SandboxError
 from tracker.logger import get_logger
 from tracker.s3 import download_from_s3, get_contract_s3_key, upload_to_s3
 from tracker.types import AWSCredentials
@@ -35,6 +36,7 @@ logger = get_logger(__name__)
 
 
 bundle_path = PurePosixPath("/bundle")
+SNAPSHOT_IMAGE_PREFIX = "snapshot:"
 
 
 def get_contract_path(contract_name: str) -> PurePosixPath:
@@ -61,6 +63,7 @@ _sandbox_creation_semaphore = Semaphore(_SANBDOX_CREATION_CAP)
 
 
 @retry(
+    retry=retry_if_not_exception_type(InvalidSandboxConfigurationError),
     stop=stop_after_attempt(3),
     wait=wait_fixed(120),
     before_sleep=before_sleep_log(logger, logger.level),
@@ -90,6 +93,24 @@ async def _create_sandbox(
         return sandbox
     except DaytonaNotFoundError:
         pass
+
+    if image.startswith(SNAPSHOT_IMAGE_PREFIX):
+        snapshot_name = image[len(SNAPSHOT_IMAGE_PREFIX) :].strip()
+        if not snapshot_name:
+            raise InvalidSandboxConfigurationError("Snapshot-based sandbox requested without a snapshot name")
+
+        return await daytona.create(
+            CreateSandboxFromSnapshotParams(
+                auto_delete_interval=60,
+                name=sandbox_name,
+                labels=labels,
+                snapshot=snapshot_name,
+                language="python",
+                network_block_all=False,
+                env_vars=env_vars,
+            ),
+            timeout=360,
+        )
 
     # Create a new sandbox from scratch, if it stops we delete it within a minute
     return await daytona.create(
