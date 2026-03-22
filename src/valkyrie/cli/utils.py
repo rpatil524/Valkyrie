@@ -45,7 +45,7 @@ async def run_with_spinner(coro: Coroutine[Any, Any, T], message: str) -> T:
 
     # Truncate message to fit terminal width (leaving room for spinner: 2 chars)
     max_width = shutil.get_terminal_size().columns - 2
-    display_message = message if len(message) <= max_width else message[:max_width - 1] + "…"
+    display_message = message if len(message) <= max_width else message[: max_width - 1] + "…"
 
     async def show_spinner() -> None:
         """Show animated spinner until task completes."""
@@ -651,6 +651,60 @@ def paginate_agents(agents: list[tuple[str, datetime]], limit: int = 10) -> None
             offset -= limit
         elif char == "q" or char == "\x03":
             break
+
+
+def validate_intervals(intervals: tuple[int, ...]) -> list[int]:
+    """Validate notification interval values.
+
+    Args:
+        intervals: Tuple of percentage thresholds for Slack notifications.
+
+    Raises:
+        click.UsageError: If intervals are invalid.
+
+    Returns:
+        Validated list of intervals.
+    """
+    interval_list = list(intervals)
+    if len(interval_list) > 3:
+        raise click.UsageError("Maximum of 3 intervals allowed.")
+    for val in interval_list:
+        if val < 5 or val > 100:
+            raise click.UsageError(f"Interval {val} out of range. Must be between 5 and 100.")
+        if val % 5 != 0:
+            raise click.UsageError(f"Interval {val} must be divisible by 5.")
+    return interval_list
+
+
+def resolve_webhook_config(
+    intervals: tuple[int, ...], webhook_url: str | None
+) -> tuple[str | None, list[int] | None]:
+    """Resolve webhook URL and intervals for a benchmark run.
+
+    Args:
+        intervals: User-provided interval flags from CLI.
+        webhook_url: Webhook URL from config, or None.
+
+    Returns:
+        Tuple of (webhook_url, webhook_intervals) to pass to the tracker.
+    """
+    if intervals and not webhook_url:
+        click.echo(
+            click.style(
+                "  Warning: --interval specified but no webhook URL configured. "
+                "Run `valkyrie config webhook set <url>` first. Ignoring intervals.",
+                fg="yellow",
+            )
+        )
+        return None, None
+
+    if intervals:
+        return webhook_url, validate_intervals(intervals)
+
+    if webhook_url:
+        return webhook_url, [100]
+
+    return None, None
 
 
 def paginate_services(services: list[tuple[str, str]], limit: int = 10) -> None:
