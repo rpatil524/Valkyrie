@@ -740,6 +740,12 @@ run.add_command(retry_command)
     help="Benchmark name (e.g., swebench)",
 )
 @click.option(
+    "--model",
+    type=str,
+    required=False,
+    help="Model name (e.g., anthropic/claude-sonnet-4-20250514)",
+)
+@click.option(
     "--status",
     type=click.Choice([option.value for option in BenchmarkStatus], case_sensitive=False),
     required=False,
@@ -756,6 +762,7 @@ run.add_command(retry_command)
 def list_benchmarks(
     agent_name: str | None,
     benchmark_name: str | None,
+    model: str | None,
     status: str | None,
     order_by: str = "desc",
 ):
@@ -772,7 +779,7 @@ def list_benchmarks(
             if not check_tracker_service_health(tracker):
                 return
 
-            paginate_benchmarks(tracker, agent_name, benchmark_name, status, order_by)
+            paginate_benchmarks(tracker, agent_name, benchmark_name, model, status, order_by)
     except TrackerServiceError as e:
         raise click.ClickException(str(e))
 
