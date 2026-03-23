@@ -15,6 +15,7 @@ from zoneinfo import ZoneInfo
 from benchmark_service.client import BenchmarkServiceClient, BenchmarkServiceError
 from daytona import AsyncDaytona, AsyncPaginatedSandboxes, AsyncSandbox, SandboxState
 from fastapi import Request
+from sqlalchemy import JSON, type_coerce
 from sqlmodel import Session, asc, case, col, delete, desc, func, or_, select, update
 
 from tracker._lambda import invoke_lambda
@@ -1067,8 +1068,13 @@ def fetch_filtered_benchmark_rows(request: FetchBenchmarksRequest, session: Sess
     """
     query = select(Benchmark)
 
+    arguments_json = type_coerce(col(Benchmark.arguments), JSON)
+
     if request.agent_name:
-        query = query.where(func.json_extract(Benchmark.arguments, "$.contract.name") == request.agent_name)
+        query = query.where(arguments_json["contract"]["name"].as_string() == request.agent_name)
+
+    if request.model:
+        query = query.where(arguments_json["contract"]["model"].as_string() == request.model)
 
     if request.benchmark_name:
         query = query.where(Benchmark.name == request.benchmark_name)
