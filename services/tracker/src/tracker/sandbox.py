@@ -1,6 +1,4 @@
 """Sandbox management utilities for the tracker service."""
-
-import asyncio
 import base64
 import io
 import shlex
@@ -9,7 +7,6 @@ import zipfile
 from asyncio import Semaphore
 from collections.abc import Callable
 from contextlib import asynccontextmanager
-from contextlib import suppress
 from pathlib import PurePosixPath
 from typing import Any, AsyncGenerator
 
@@ -112,6 +109,7 @@ async def _create_sandbox(
 
         return await daytona.create(
             CreateSandboxFromSnapshotParams(
+                auto_stop_interval=0,
                 auto_delete_interval=60,
                 name=sandbox_name,
                 labels=labels,
@@ -126,6 +124,7 @@ async def _create_sandbox(
     # Create a new sandbox from scratch, if it stops we delete it within a minute
     return await daytona.create(
         CreateSandboxFromImageParams(
+            auto_stop_interval=0,
             auto_delete_interval=60,
             name=sandbox_name,
             labels=labels,
@@ -236,7 +235,6 @@ async def install_agent_dependencies(
     log_output(f"Finished installing dependencies for contract: {contract.name}")
 
 
-SESSION_COMMAND_POLL_INTERVAL_SECONDS = 5.0
 LOG_STREAM_RETRY_DELAY_SECONDS = 1.0
 WEBSOCKET_STREAM_ERRORS = ("websocket", "http 502", "opening handshake", "no close frame", "1011")
 
@@ -287,20 +285,6 @@ async def stream_session_command_logs(
         on_output(f"[WARNING] {warning}\n")
 
 
-async def wait_for_session_command_completion(
-    sandbox: AsyncSandbox,
-    session_id: str,
-    command_id: str,
-    poll_interval_seconds: float = SESSION_COMMAND_POLL_INTERVAL_SECONDS,
-) -> Any:
-    """Poll command status until the command exits."""
-    while True:
-        cmd = await sandbox.process.get_session_command(session_id, command_id)
-        if cmd.exit_code is not None:
-            return cmd
-        await asyncio.sleep(poll_interval_seconds)
-
-
 async def stream_command_output(
     sandbox: AsyncSandbox,
     command: str,
@@ -308,10 +292,9 @@ async def stream_command_output(
 ) -> None:
     """
     Execute a command inside of a sandbox using a session and stream the output to the given callbacks.
-    Command completion is authoritative; log streaming is best-effort only.
+    Log streaming is best-effort. Command status is checked once before cleanup.
     """
     session_id = f"{sandbox.id}:{str(uuid.uuid4())}"
-    log_task: asyncio.Task[None] | None = None
     try:
         await sandbox.process.create_session(session_id)
         cmd_id = await start_session_command(
@@ -319,30 +302,25 @@ async def stream_command_output(
             session_id,
             command,
         )
-        log_task = asyncio.create_task(
-            stream_session_command_logs(
-                sandbox,
-                session_id=session_id,
-                command_id=cmd_id,
-                on_output=on_output,
-            )
+        await stream_session_command_logs(
+            sandbox,
+            session_id=session_id,
+            command_id=cmd_id,
+            on_output=on_output,
         )
-        cmd = await wait_for_session_command_completion(sandbox, session_id, cmd_id)
-        if log_task is not None and not log_task.done():
-            with suppress(asyncio.TimeoutError):
-                await asyncio.wait_for(asyncio.shield(log_task), timeout=1)
 
-        # Exit code 124 = timeout(1) killed the process; treat as success so evaluation still runs
-        if cmd.exit_code not in (0, 124):
-            raise SandboxError(f"Failed to run command {command}, exit code: {cmd.exit_code}")
+        try:
+            cmd = await sandbox.process.get_session_command(session_id, cmd_id)
+
+            # Exit code 124 = timeout(1) killed the process; treat as success so evaluation still runs
+            if cmd.exit_code not in (0, 124):
+                raise SandboxError(f"Failed to run command {command}, exit code: {cmd.exit_code}")
+        except SandboxError:
+            raise
+        except Exception as error:
+            logger.warning(f"Failed to get session command for {session_id}: {error}")
 
     finally:
-        if log_task is not None and not log_task.done():
-            log_task.cancel()
-            try:
-                await log_task
-            except asyncio.CancelledError:
-                pass
         try:
             await sandbox.process.delete_session(session_id)
         except Exception:
