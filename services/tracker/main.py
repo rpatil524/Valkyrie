@@ -7,11 +7,13 @@ from uuid import UUID
 from benchmark_service.client import BenchmarkServiceError
 from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import joinedload
 from sqlmodel import Session
 
 from tracker.cloudwatch import get_cloudwatch_url
-from tracker.auth import get_current_org
+from tracker.config import AUTH_REQUIRED
+from tracker.auth import extract_api_key, find_org_by_tenant, get_current_org, resolve_descope_tenant
 from tracker.database.models import Benchmark, BenchmarkStatus, Org
 from tracker.database.scoping import assert_org, get_scoped
 from tracker.database.session import check_database_connection, get_session
@@ -118,6 +120,29 @@ def health_check() -> dict[str, str]:
     if not check_database_connection():
         raise HTTPException(status_code=503, detail="Database is not accessible")
     return {"status": "ok"}
+
+
+@app.post("/init")
+def init_org(
+    request: Request,
+    session: Session = Depends(get_session),
+) -> dict[str, str | bool]:
+    """Initialize org for hosted mode. Validates Descope key and creates org if needed."""
+    if not AUTH_REQUIRED:
+        raise HTTPException(status_code=405, detail="Init is only available in hosted mode")
+
+    api_key = extract_api_key(request)
+    tenant_name = resolve_descope_tenant(api_key)
+
+    stmt = pg_insert(Org).values(name=tenant_name).on_conflict_do_nothing(index_elements=["name"])
+    result = session.execute(stmt)
+    created = result.rowcount > 0
+    session.commit()
+
+    org = find_org_by_tenant(tenant_name, session)
+    if not org:
+        raise HTTPException(status_code=500, detail="Internal error during org creation")
+    return {"org_name": org.name, "created": created}
 
 
 @app.post("/start-benchmark")

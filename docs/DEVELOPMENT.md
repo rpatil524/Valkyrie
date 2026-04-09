@@ -51,6 +51,23 @@ The CLI reads credentials from `~/.config/valkyrie/valkyrie.yaml`. Run `valkyrie
 valkyrie config init
 ```
 
+### Testing with hosted mode (Descope auth)
+
+Start the tracker with auth enabled:
+
+```bash
+AUTH_REQUIRED=true DESCOPE_PROJECT_ID=<your-project-id> make tracker-service
+```
+
+Then configure the CLI for hosted mode:
+
+```bash
+valkyrie config init
+# Choose "hosted", provide your Descope API key and AWS credentials
+```
+
+Without the env vars, the service runs in self-hosted mode (no auth, default org).
+
 ## Code Quality
 
 ```bash
