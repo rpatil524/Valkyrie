@@ -10,11 +10,13 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import BinaryIO, Generator
 
+import yaml
+from pydantic import ValidationError as PydanticValidationError
 from tracker.database.models import AgentContractRequest
 
-from valkyrie.cli.exceptions import BundlerError
+from valkyrie.cli.exceptions import BundlerError, ContractValidationError
 from valkyrie.contract import BaseAgentContract
-from valkyrie.schemas import AgentConfig
+from valkyrie.schemas import AgentConfig, AgentContract
 
 
 def _zip_directory_to_file(directory: Path, output_path: Path) -> None:
@@ -95,36 +97,89 @@ def get_agent_zip_stream(agent_name: str | None, agent_path: Path) -> Generator[
 
 
 def get_contract_from_zip_bytes(agent_name: str, zip_bytes: bytes, agent_config: AgentConfig) -> AgentContractRequest:
-    """Extract contract.py from zip bytes into a temp dir and load it."""
+    """Extract contract from zip bytes into a temp dir and load it. Tries .yaml/.yml first, then .py."""
     try:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
-            contract_member = f"{agent_name}/contract.py"
             with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
-                zf.extract(contract_member, tmp_path)
+                names = zf.namelist()
+                for ext in (".yaml", ".yml", ".py"):
+                    contract_member = f"{agent_name}/contract{ext}"
+                    if contract_member in names:
+                        zf.extract(contract_member, tmp_path)
+                        return get_contract(tmp_path / contract_member, agent_config)
 
-            return get_contract(tmp_path / contract_member, agent_config)
+            raise BundlerError(f"No contract file found in zip for agent '{agent_name}'")
     except BundlerError:
         raise
     except Exception as e:
-        raise BundlerError(f"Failed to load contract from zip for agent '{agent_name}': {e}") from e
+        raise BundlerError(f"Failed to load contract from zip for agent '{agent_name}':\n{e}") from e
+
+
+def _parse_python_contract(contract_path: Path, agent_config: AgentConfig) -> AgentContractRequest:
+    spec = importlib.util.spec_from_file_location("contract", contract_path)
+
+    if not spec or not spec.loader:
+        raise ImportError(f"Failed to import contract from {contract_path}")
+
+    module = importlib.util.module_from_spec(spec)
+
+    spec.loader.exec_module(module)
+
+    Contract: type[BaseAgentContract] = module.contract
+
+    contract = Contract(agent_config)
+
+    return contract.to_request()
+
+
+def _parse_yaml_contract(contract_path: Path, agent_config: AgentConfig) -> AgentContractRequest:
+    try:
+        with open(contract_path, "r") as f:
+            contract_dict = yaml.safe_load(f)
+
+        contract_dict.pop("provided", None)
+
+        try:
+            agent_contract = AgentContract(**contract_dict)
+        except PydanticValidationError as e:
+            contract_name = "/".join(contract_path.parts[-2:])
+            raise ContractValidationError(e, context=f"Invalid contract `{contract_name}`") from e
+
+        all_schema = {**agent_contract.defaults, **agent_contract.kwargs}
+
+        user_values = {**agent_config.kwargs}
+        if agent_config.model and "model" not in user_values:
+            user_values["model"] = agent_config.model
+
+        validated_kwargs = agent_contract.validate_kwargs(all_schema, user_values)
+
+        return AgentContractRequest(
+            name=agent_contract.name,
+            model=agent_config.model,
+            run_cmd=agent_contract.format_run_cmd(validated_kwargs),
+            install_cmd=agent_contract.install_cmd,
+            final_output=str(agent_contract.final_output) if agent_contract.final_output is not None else None,
+            secrets=agent_contract.secrets,
+        )
+    except ContractValidationError:
+        raise
+    except Exception as e:
+        raise ValueError(f"Failed to parse YAML contract from `{'/'.join(contract_path.parts[-2:])}`:\n{e}") from e
 
 
 def get_contract(contract_path: Path, agent_config: AgentConfig) -> AgentContractRequest:
     try:
-        spec = importlib.util.spec_from_file_location("contract", contract_path)
-
-        if not spec or not spec.loader:
-            raise ImportError(f"Failed to import contract from {contract_path}")
-
-        module = importlib.util.module_from_spec(spec)
-
-        spec.loader.exec_module(module)
-
-        Contract: type[BaseAgentContract] = module.contract
-
-        contract = Contract(agent_config)
-
-        return contract.to_request()
+        match contract_path.suffix:
+            case ".py":
+                return _parse_python_contract(contract_path, agent_config)
+            case ".yaml" | ".yml":
+                return _parse_yaml_contract(contract_path, agent_config)
+            case _:
+                raise ValueError(
+                    f"Unsupported contract format: `{contract_path.suffix}`. Expected '.py', '.yaml', or '.yml'"
+                )
+    except ValueError:
+        raise
     except Exception as e:
-        raise BundlerError(f"Failed to get contract from {contract_path}: {e}") from e
+        raise BundlerError(f"Failed to get contract from `{contract_path}`: {e}") from e

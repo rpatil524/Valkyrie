@@ -13,7 +13,7 @@ from tracker.exceptions import S3Error
 from tracker.types import FinalViewResponse, Order, RetrieveResultsResponse, StartBenchmarkResponse
 
 from valkyrie.cli.bundler import get_contract
-from valkyrie.cli.exceptions import BundlerError, TrackerServiceError
+from valkyrie.cli.exceptions import BundlerError, ContractValidationError, TrackerServiceError
 from valkyrie.cli.s3_client import (
     download_agent,
     get_contract_from_s3,
@@ -77,6 +77,7 @@ _REQUIRED_ENVIRONMENT_VARIABLES: dict[str, str | None | int] = {
 }
 
 
+
 @config.command()
 def init() -> None:
     """
@@ -84,14 +85,32 @@ def init() -> None:
     this becomes our source of truth for secrets required to run Valkyrie
     """
 
-    current_config: dict[str, str] = {}
+    current_config: dict[str, Any] = {}
     if CONFIG_LOCATION.exists():
         with open(CONFIG_LOCATION) as f:
             try:
-                current_config = yaml.safe_load(f)
+                current_config = yaml.safe_load(f) or {}
             except Exception:
                 pass
 
+    mode = click.prompt(
+        "Setup mode",
+        type=click.Choice(["hosted", "self-hosted"]),
+        default="self-hosted",
+    )
+
+    if mode == "hosted":
+        api_key = os.environ.get("VALKYRIE_API_KEY") or click.prompt("API Key")
+        current_config["api_key"] = api_key
+
+        # Validate the key and create/confirm org (uses default tracker URL)
+        try:
+            result = TrackerService.init_org(api_key)
+        except TrackerServiceError as e:
+            raise click.ClickException(str(e))
+        click.echo(f"Organization '{result['org_name']}' configured successfully.\n")
+
+    # Both modes require AWS credentials
     collected_keys: dict[str, str] = {}
     for key, default in _REQUIRED_ENVIRONMENT_VARIABLES.items():
         sourced = current_config.get(key) or os.environ.get(key)
@@ -117,10 +136,15 @@ def init() -> None:
 
         collected_keys[key] = value
 
+    current_config.update(collected_keys)
+
+    if mode != "hosted":
+        current_config.pop("api_key", None)
+
     CONFIG_LOCATION.parent.mkdir(parents=True, exist_ok=True)
 
     with open(CONFIG_LOCATION, "w") as f:
-        yaml.dump(collected_keys, f, default_flow_style=False)
+        yaml.dump(current_config, f, default_flow_style=False)
 
     click.echo(click.style(f"\nConfig written to {CONFIG_LOCATION}", fg="green", bold=True))
 
@@ -528,7 +552,15 @@ def start(
         # If the user specified an agent on their machine we upload it first
         if agent_path.is_dir():
             asyncio.run(push_agent(agent_path.stem, agent_path))
-            contract = get_contract(agent_path / "contract.py", agent_config)
+            contract_file = next(
+                (
+                    agent_path / f"contract{ext}"
+                    for ext in (".yaml", ".yml", ".py")
+                    if (agent_path / f"contract{ext}").exists()
+                ),
+                agent_path / "contract.py",
+            )
+            contract = get_contract(contract_file, agent_config)
             contract.name = agent_path.stem
         else:
             contract = asyncio.run(get_contract_from_s3(agent, agent_config))
@@ -565,7 +597,7 @@ def start(
                 return
 
             format_start_benchmark_response(StartBenchmarkResponse.model_validate(response.json()))
-    except (BundlerError, TrackerServiceError) as e:
+    except (BundlerError, TrackerServiceError, ContractValidationError) as e:
         raise click.ClickException(str(e))
 
 

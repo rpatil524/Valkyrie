@@ -1,5 +1,6 @@
 """Tracker service stack - public-facing API with ALB and shared RDS database."""
 
+import os
 from typing import Any
 
 import aws_cdk as cdk
@@ -81,6 +82,7 @@ class TrackerStack(Stack):
         shared_env = {
             "BROKER_ENVIRONMENT": "production",
             "AWS_S3_BUCKET": bucket.bucket_name,
+            "ENVIRONMENT": "production",
         }
 
         # ── RDS ──────────────────────────────────────────────────────────
@@ -156,9 +158,11 @@ class TrackerStack(Stack):
                 **shared_env,
                 **db_env,
                 "REDIS_URL": redis_url,
+                "AUTH_REQUIRED": os.environ.get("AUTH_REQUIRED", "false"),
+                "DESCOPE_PROJECT_ID": os.environ.get("DESCOPE_PROJECT_ID", ""),
             },
             secrets=db_secrets,
-            command=["uv", "run", "--no-sync", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"],
+            command=["uv", "run", "--no-sync", "python", "-m", "tracker.serve"],
             health_check=aws_ecs.HealthCheck(
                 command=["CMD-SHELL", f"curl -f http://localhost:{TRACKER_PORT}/health || exit 1"],
                 interval=Duration.seconds(CONTAINER_HEALTH_INTERVAL_SECONDS),

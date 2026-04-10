@@ -8,9 +8,12 @@ Benchmark orchestration platform for testing AI agents against standardized benc
 
 ## Pre requisites
 
-- AWS account
-- S3 bucket created for the purpose of storing all artifacts produced by benchmarks ran
-- API key for sandbox provider supported (daytona). [Documentation for setting that up](docs/PROVIDER.md)
+Valkyrie supports **hosted** and **self-hosted** modes. Both require your own AWS credentials. See [Hosted vs Self-Hosted Mode](docs/HOSTED_MODE.md) for full details.
+
+- AWS account with S3, CloudWatch, and Secrets Manager access
+- S3 bucket for storing benchmark artifacts and agents
+- API key for sandbox provider (Daytona). [Setup docs](docs/PROVIDER.md)
+- **Hosted mode only:** Descope API key (provided by Vals)
 
 ## Installation
 
@@ -24,7 +27,7 @@ uv tool install git+https://github.com/vals-ai/Valkyrie@prod
 valkyrie config init
 ```
 
-This will prompt for required credentials (AWS, S3 bucket, Daytona secret name) and write them to `~/.config/valkyrie/valkyrie.yaml`. Values can be sourced from the environment or an existing config. These are required to run Valkyrie and be in any environment that you use Valkyrie in.
+This will prompt you to choose between **hosted** and **self-hosted** mode, then collect the required credentials. See [Hosted vs Self-Hosted Mode](docs/HOSTED_MODE.md) for detailed setup instructions.
 
 To upsert a single key:
 
@@ -299,6 +302,7 @@ valkyrie agent outputs <id> --output-dir ./outputs
 
 | Topic | Link |
 | --- | --- |
+| Hosted vs self-hosted | [HOSTED_MODE.md](docs/HOSTED_MODE.md) |
 | Local development | [DEVELOPMENT.md](docs/DEVELOPMENT.md) |
 | Lambda integration | [LAMBDA_USAGE.md](docs/LAMBDA_USAGE.md) |
 | Agent contracts | [CONTRACTS.md](docs/CONTRACTS.md) |
