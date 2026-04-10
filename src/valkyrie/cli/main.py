@@ -13,7 +13,7 @@ from tracker.exceptions import S3Error
 from tracker.types import FinalViewResponse, Order, RetrieveResultsResponse, StartBenchmarkResponse
 
 from valkyrie.cli.bundler import get_contract
-from valkyrie.cli.exceptions import BundlerError, TrackerServiceError
+from valkyrie.cli.exceptions import BundlerError, ContractValidationError, TrackerServiceError
 from valkyrie.cli.s3_client import (
     download_agent,
     get_contract_from_s3,
@@ -552,7 +552,15 @@ def start(
         # If the user specified an agent on their machine we upload it first
         if agent_path.is_dir():
             asyncio.run(push_agent(agent_path.stem, agent_path))
-            contract = get_contract(agent_path / "contract.py", agent_config)
+            contract_file = next(
+                (
+                    agent_path / f"contract{ext}"
+                    for ext in (".yaml", ".yml", ".py")
+                    if (agent_path / f"contract{ext}").exists()
+                ),
+                agent_path / "contract.py",
+            )
+            contract = get_contract(contract_file, agent_config)
             contract.name = agent_path.stem
         else:
             contract = asyncio.run(get_contract_from_s3(agent, agent_config))
@@ -589,7 +597,7 @@ def start(
                 return
 
             format_start_benchmark_response(StartBenchmarkResponse.model_validate(response.json()))
-    except (BundlerError, TrackerServiceError) as e:
+    except (BundlerError, TrackerServiceError, ContractValidationError) as e:
         raise click.ClickException(str(e))
 
 
