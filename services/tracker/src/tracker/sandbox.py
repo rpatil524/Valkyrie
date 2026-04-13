@@ -5,6 +5,7 @@ import logging
 import shlex
 import uuid
 from asyncio import Semaphore
+from collections import deque
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 from pathlib import PurePosixPath
@@ -17,16 +18,15 @@ from daytona import (
     CreateSandboxFromImageParams,
     CreateSandboxFromSnapshotParams,
     DaytonaNotFoundError,
+    ExecuteResponse,
     Resources,
     SandboxState,
-    SessionExecuteRequest,
 )
 from daytona.common.errors import DaytonaError
+from daytona.handle.async_pty_handle import AsyncPtyHandle
 from tenacity import (
-    AsyncRetrying,
     before_sleep_log,
     retry,
-    retry_if_exception,
     retry_if_exception_type,
     retry_if_not_exception_type,
     stop_after_attempt,
@@ -60,7 +60,6 @@ async def delete_sandbox(sandbox: AsyncSandbox, daytona: AsyncDaytona) -> None:
     except DaytonaNotFoundError:
         # If we error here that means the sandbox has just been deleted before we could refresh the state
         logger.warning(f"Sandbox `{sandbox.name}` has already been terminated")
-        pass
     except Exception as e:
         logger.error(f"Unexpected error deleting sandbox {sandbox.name}: {e}")
 
@@ -173,8 +172,8 @@ async def create_sandbox(
     try:
         yield sandbox
     except Exception as e:
-        logger.error(f"Error creating sandbox {sandbox.name}: {e}")
-        raise e from e
+        logger.error(f"Error during sandbox execution {sandbox.name}: {e}")
+        raise
     finally:
         await delete_sandbox(sandbox, daytona)
 
@@ -234,7 +233,7 @@ async def upload_agent_artifacts(
     script = " && ".join(steps)
 
     try:
-        result = await sandbox.process.exec(script)
+        result = await _exec(sandbox, script)
 
         if result.exit_code != 0:
             raise RuntimeError(f"Command failed with exit code {result.exit_code}: {result.result}")
@@ -257,65 +256,230 @@ async def install_agent_dependencies(
 
     contract_path = get_contract_path(contract.name)
 
-    await stream_command_output(sandbox, f"cd {str(contract_path)} && {contract.install_cmd}", log_output)
+    await stream_command_output(sandbox, f"cd {shlex.quote(str(contract_path))} && {contract.install_cmd}", log_output)
 
     log_output(f"Finished installing dependencies for contract: {contract.name}")
-
-
-LOG_STREAM_RETRY_DELAY_SECONDS = 1.0
-WEBSOCKET_STREAM_ERRORS = ("websocket", "http 502", "opening handshake", "no close frame", "1011")
-
-
-def is_websocket_stream_error(error: BaseException) -> bool:
-    return isinstance(error, DaytonaError) and any(pattern in str(error).lower() for pattern in WEBSOCKET_STREAM_ERRORS)
-
-
-async def start_session_command(
-    sandbox: AsyncSandbox,
-    session_id: str,
-    command: str,
-) -> str:
-    session_exec_resp = await sandbox.process.execute_session_command(
-        session_id, SessionExecuteRequest(command=command, run_async=True)
-    )
-    if not session_exec_resp.cmd_id:
-        raise SandboxError(f"Failed to execute command {command} in session {session_id}")
-    return session_exec_resp.cmd_id
-
-
-async def stream_session_command_logs(
-    sandbox: AsyncSandbox,
-    *,
-    session_id: str,
-    command_id: str,
-    on_output: Callable[[str], None],
-) -> None:
-    try:
-        async for attempt in AsyncRetrying(
-            retry=retry_if_exception(is_websocket_stream_error),
-            stop=stop_after_attempt(10),
-            wait=wait_fixed(LOG_STREAM_RETRY_DELAY_SECONDS),
-            before_sleep=before_sleep_log(logger, logging.WARNING),
-            reraise=True,
-        ):
-            with attempt:
-                await sandbox.process.get_session_command_logs_async(
-                    session_id=session_id,
-                    command_id=command_id,
-                    on_stdout=on_output,
-                    on_stderr=on_output,
-                )
-        return
-    except Exception as error:
-        warning = f"Log streaming unavailable; continuing without live logs: {error}"
-        logger.warning(warning)
-        on_output(f"[WARNING] {warning}\n")
 
 
 # NOTE: If this gets too big move it into a mapping
 # these are decoupled since its just 2 exit codes we need to track
 _TIMEOUT_EXIT_CODE: int = 124
 _SUCCESS_EXIT_CODE: int = 0
+
+# Process exec retry settings
+_EXEC_MAX_ATTEMPTS: int = 3
+_EXEC_DELAY_SECONDS: float = 2.0
+
+# Reconnect to the PTY retry settings
+_PTY_RECONNECT_MAX_ATTEMPTS: int = 10
+_PTY_RECONNECT_DELAY_SECONDS: float = 1.0
+
+# Creating a PTY retry settings
+_PTY_CREATE_MAX_ATTEMPTS: int = 3
+_PTY_CREATE_DELAY_SECONDS: float = 2.0
+
+# States that determine if the sandbox has been killed
+_DEAD_SANDBOX_STATES = (SandboxState.DESTROYING, SandboxState.DESTROYED, SandboxState.STOPPED)
+
+
+@retry(
+    retry=retry_if_exception_type(DaytonaError),
+    stop=stop_after_attempt(_EXEC_MAX_ATTEMPTS),
+    wait=wait_fixed(_EXEC_DELAY_SECONDS),
+    before_sleep=before_sleep_log(logger, logging.WARNING),
+    reraise=True,
+)
+async def _exec(sandbox: AsyncSandbox, command: str) -> ExecuteResponse:
+    """
+    Execute a command inside the sandbox with retries for transient network failures.
+
+    Raises:
+        DaytonaError: If all retry attempts are exhausted
+    """
+
+    return await sandbox.process.exec(command)
+
+
+@retry(
+    retry=retry_if_exception_type(DaytonaError),
+    stop=stop_after_attempt(_PTY_CREATE_MAX_ATTEMPTS),
+    wait=wait_fixed(_PTY_CREATE_DELAY_SECONDS),
+    before_sleep=before_sleep_log(logger, logging.WARNING),
+    reraise=True,
+)
+async def _create_pty_session(
+    sandbox: AsyncSandbox,
+    session_id: str,
+    on_data: Callable[[bytes], None],
+    envs: dict[str, str] | None = None,
+) -> tuple[AsyncPtyHandle, str]:
+    """
+    Create a PTY session, retried since network errors do happen.
+
+    Raises:
+        DaytonaError: If all retry attempts are exhausted
+    """
+
+    # Salt the session id to ensure that no collisions occur
+    salted_id = f"{session_id}-{uuid.uuid4().hex[:8]}"
+
+    # Each time we run this we want it to be logged, makes debugging easier
+    on_data(f"[Debug]: Creating PTY session with the following id {salted_id}\n".encode())
+
+    # Attempt to make the PTY session, timeouts occur under load
+    handle = await sandbox.process.create_pty_session(id=salted_id, on_data=on_data, envs=envs)
+
+    # Handle to access the PTY and the session id to pass on
+    return handle, salted_id
+
+
+async def _check_sandbox_health(sandbox: AsyncSandbox) -> None:
+    """
+    Checks if we can connect to a sandbox
+
+    Raises:
+         SandboxError: if the sandbox cannot be connected to
+    """
+    try:
+        await sandbox.refresh_data()
+        if sandbox.state in _DEAD_SANDBOX_STATES:
+            raise SandboxError(f"Sandbox {sandbox.name} crashed during command execution (state: {sandbox.state})")
+    except SandboxError:
+        raise
+    except Exception as e:
+        raise SandboxError(f"Failed to check sandbox {sandbox.name} health: {e}") from e
+
+
+@retry(
+    retry=retry_if_not_exception_type(SandboxError),
+    stop=stop_after_attempt(_PTY_RECONNECT_MAX_ATTEMPTS),
+    wait=wait_fixed(_PTY_RECONNECT_DELAY_SECONDS),
+    reraise=True,
+)
+async def _reconnect_and_wait_pty(
+    sandbox: AsyncSandbox,
+    session_id: str,
+    on_data: Callable[[bytes], None],
+    on_output: Callable[[str], None],
+) -> None:
+    """
+    Reconnect to a PTY session and wait for it to close,
+    Used to determine if a connection issue happened or if the sandbox was killed while the run was in progress
+
+    Raises:
+        SandboxError: If we cannot successfully check the sandbox health status
+    """
+
+    # Check if the sandbox has been closed
+    await _check_sandbox_health(sandbox)
+
+    # Log so the user can see we have seen a disconnection from the websocket (easier to pickup in logs)
+    on_output("[Debug]: Disconnected from websocket, creating a new reader and reconnecting\n")
+
+    # Reconnect to the PTY
+    handle = await sandbox.process.connect_pty_session(session_id, on_data)
+
+    # Wait until the command has finished running
+    await handle.wait()
+
+
+async def _wait_for_pty(
+    sandbox: AsyncSandbox,
+    session_id: str,
+    handle: Any,
+    on_data: Callable[[bytes], None],
+    on_output: Callable[[str], None],
+    status_path: str,
+) -> None:
+    """
+    Wait for the PTY to close, reconnecting on WebSocket failures.
+    If the PTY closes prematurely (e.g. WebSocket idle timeout) but the status file
+    hasn't been written yet, reconnect and wait again until the command actually finishes.
+
+    Raises:
+        SandboxError: Failed to wait until the command has been completed
+    """
+    try:
+        await handle.wait()
+        on_output("[Debug]: PTY has been disconnected, handler has stopped polling\n")
+    except Exception as e:
+        on_output(f"[Debug]: PTY stream has been disconnected (Attempting reconnection): {e}\n")
+        try:
+            await _reconnect_and_wait_pty(sandbox, session_id, on_data, on_output)
+        except SandboxError:
+            raise
+        except Exception as e:
+            raise SandboxError(f"PTY reconnect failed after {_PTY_RECONNECT_MAX_ATTEMPTS} attempts") from e
+
+    # If the PTY closed cleanly but the command is still running (e.g. idle WebSocket timeout),
+    # breaks when the file with the command status code is made
+    while True:
+        await _check_sandbox_health(sandbox)
+        if (await _exec(sandbox, f"test -e {status_path}")).exit_code == 0:
+            break
+
+        on_output("[Debug]: PTY closed but status file not written yet, reconnecting\n")
+        try:
+            await _reconnect_and_wait_pty(sandbox, session_id, on_data, on_output)
+        except SandboxError:
+            raise
+        except Exception as e:
+            raise SandboxError(f"PTY reconnect failed after {_PTY_RECONNECT_MAX_ATTEMPTS} attempts") from e
+
+
+async def _read_exit_code(sandbox: AsyncSandbox, status_path: str) -> int:
+    """
+    Read the command exit code from the status file (Important to determine reason for exiting)
+
+    Raises:
+        SandboxError: If we fail to read the exit code from the status file
+    """
+    try:
+        # Read the status file, extracting the exit code
+        result = await _exec(sandbox, f"cat {status_path}")
+
+        # If file does not exist or we have no content the command has not produced an exit code
+        # That would suggest the sandbox was killed or something interrupted the program
+        if result.exit_code != 0 or not result.result.strip():
+            raise SandboxError(f"Failed to read exit status from {status_path}")
+
+        # Should always be a integer
+        return int(result.result.strip())
+
+    except SandboxError:
+        raise
+    except Exception as e:
+        raise SandboxError(f"Failed to read exit status from {status_path}: {e}") from e
+
+
+async def _disconnect_pty(handle: AsyncPtyHandle | None) -> None:
+    """
+    Disconnect from the PTY, ignoring exit errors
+    """
+
+    # Don't need to disconnect if it does not exist
+    if not handle:
+        return
+
+    # Ignore exceptions raised when disconnecting
+    # Most likely would be a network connection error
+    try:
+        await handle.disconnect()
+    except Exception:
+        pass
+
+
+async def _kill_pty_session(sandbox: AsyncSandbox, session_id: str | None) -> None:
+    """
+    Kill a PTY session, ignoring errors if raised or if session was never created
+    """
+    if not session_id:
+        return
+
+    try:
+        await sandbox.process.kill_pty_session(session_id)
+    except Exception:
+        logger.warning(f"Failed to kill PTY session {session_id}")
 
 
 async def stream_command_output(
@@ -324,48 +488,76 @@ async def stream_command_output(
     on_output: Callable[[str], None],
 ) -> bool:
     """
-    Execute a command inside of a sandbox using a session and stream the output to the given callbacks.
-    Command completion is authoritative; log streaming is best-effort only.
+    Execute a command inside a sandbox using a PTY session, reconnecting on errors
+
+    The exit code is written to a status file rather than relying on
+    the PTY WebSocket close frame, which doesn't reliably propagate it.
 
     Return:
         bool - True if the command timed out, False otherwise
     """
-    session_id = f"{sandbox.id}:{str(uuid.uuid4())}"
+    pty_id = uuid.uuid4().hex
+    session_id = f"{sandbox.id}:pty-{pty_id}"
+    status_dir = "/tmp/.valkyrie"
+    status_path = f"{status_dir}/{pty_id}.status"
+    handle: AsyncPtyHandle | None = None
+    last_output: deque[str] = deque(maxlen=50)
+
+    def on_data(data: bytes) -> None:
+        text = data.decode("utf-8", errors="replace")
+        on_output(text)
+        last_output.append(text)
+
     try:
-        await sandbox.process.create_session(session_id)
-        cmd_id = await start_session_command(
-            sandbox,
-            session_id,
-            command,
-        )
-        await stream_session_command_logs(
-            sandbox,
-            session_id=session_id,
-            command_id=cmd_id,
-            on_output=on_output,
-        )
-
+        # Create a PTY session, this is where our agent will be running
+        # Set term to DUMB and LANG to UTF-8 to account for terminal colors and unsupported unicode characters
         try:
-            cmd = await sandbox.process.get_session_command(session_id, cmd_id)
+            handle, session_id = await _create_pty_session(
+                sandbox, session_id, on_data, envs={"TERM": "dumb", "LANG": "C.UTF-8"}
+            )
+        except DaytonaError as e:
+            raise SandboxError(f"Failed to create PTY session after {_PTY_CREATE_MAX_ATTEMPTS} attempts: {e}") from e
 
-            # Exit code 124 = timeout(1) killed the process; treat as success so evaluation still runs
-            if cmd.exit_code == _TIMEOUT_EXIT_CODE:
-                return True
+        # Disable echo to suppress command line noise in the output
+        await handle.send_input("stty -echo\n")
 
-            if cmd.exit_code != _SUCCESS_EXIT_CODE:
-                raise SandboxError(f"Failed to run command {command}, exit code: {cmd.exit_code}")
-        except SandboxError:
-            raise
-        except Exception as error:
-            logger.warning(f"Failed to get session command for {session_id}: {error}")
+        # Capture exit code in a status file
+        await handle.send_input(f"mkdir -p {status_dir} && {command}; echo $? > {status_path}; exit\n")
+
+        # Wait for the PTY to finish running the agent, logging data returned
+        await _wait_for_pty(sandbox, session_id, handle, on_data, on_output, status_path)
+
+        # Verify sandbox is still alive before reading the status file
+        await _check_sandbox_health(sandbox)
+
+        # Read the exit code of the process running the agent
+        exit_code = await _read_exit_code(sandbox, status_path)
+
+        # Timeout error has a special handle since its caused by the benchmark service
+        # Remaining exit codes get handled by waterfall
+        if exit_code == _TIMEOUT_EXIT_CODE:
+            return True
+
+        # Failed error code handling (truncate error shown to the user)
+        # Final log is shown to the user, ignore traceback since it provides no insight as to what actually happened in the sandbox
+        if exit_code != _SUCCESS_EXIT_CODE:
+            tail = "".join(last_output).strip().splitlines()
+            recent = "\n".join(tail[-10:]) if tail else "(no output)"
+            raise SandboxError(f"Failed to run command {command}, exit code: {exit_code}\nLast output:\n{recent}")
 
         return False
 
     finally:
+        # Disconnect form PTY, ignoring exception if raised
+        await _disconnect_pty(handle)
+
+        # Kill the PTY session, ignoring exception if raised
+        await _kill_pty_session(sandbox, session_id)
+
+        # Remove the status file, ignoring exception if raised
         try:
-            await sandbox.process.delete_session(session_id)
+            await _exec(sandbox, f"rm -f {status_path}")
         except Exception:
-            logger.warning(f"Caught failure to delete session `{session_id}`")
             pass
 
 
@@ -375,23 +567,22 @@ async def archive_and_upload_output(
     """Compress a file in the sandbox into a tar.gz and upload it to S3"""
     archive_path = f"/tmp/{uuid.uuid4().hex}.tar.gz"
 
-    tar_result = await sandbox.process.exec(f"tar -czf {shlex.quote(archive_path)} {shlex.quote(output_path)}")
+    tar_result = await _exec(sandbox, f"tar -czf {shlex.quote(archive_path)} {shlex.quote(output_path)}")
     if tar_result.exit_code != 0:
         raise SandboxError(f"Failed to create archive from {output_path}")
 
     try:
-        b64_result = await sandbox.process.exec(f"base64 {shlex.quote(archive_path)}")
+        b64_result = await _exec(sandbox, f"base64 {shlex.quote(archive_path)}")
         if b64_result.exit_code != 0:
             raise SandboxError(f"Failed to read archive from {output_path}")
 
         upload_to_s3(base64.b64decode(b64_result.result), agent_output_s3_key, aws, s3_bucket)
     finally:
-        # Check if file exists and remove it if it does
-        result = await sandbox.process.exec(f"test -e {shlex.quote(archive_path)}")
-        if result.exit_code == 0:
-            await sandbox.process.exec(f"rm -f {shlex.quote(archive_path)}")
-        else:
-            logger.warning(f"File {archive_path} does not exist, skipping removal")
+        # Remove the file if it exists `-f` exits silently if the file does not exist
+        try:
+            await _exec(sandbox, f"rm -f {shlex.quote(archive_path)}")
+        except Exception:
+            pass
 
 
 async def run_agent(
@@ -435,10 +626,10 @@ async def run_agent(
         run_cmd = f"timeout {agent_timeout} {run_cmd}"
 
     # Create cwd if it does not already exist
-    await sandbox.process.exec(f"mkdir -p {shlex.quote(cwd)}")
+    await _exec(sandbox, f"mkdir -p {shlex.quote(cwd)}")
 
     # Run the agent without including task directory dependencies
-    timed_out = await stream_command_output(sandbox, f"cd {cwd} && PYTHONSAFEPATH=1 {run_cmd}", log_output)
+    timed_out = await stream_command_output(sandbox, f"cd {shlex.quote(cwd)} && PYTHONSAFEPATH=1 {run_cmd}", log_output)
 
     if timed_out:
         log_output(
@@ -447,7 +638,7 @@ async def run_agent(
 
     # Upload any output from the agent to S3
     if contract.final_output:
-        result = await sandbox.process.exec(f"test -e {shlex.quote(contract.final_output)}")
+        result = await _exec(sandbox, f"test -e {shlex.quote(contract.final_output)}")
         if result.exit_code == _SUCCESS_EXIT_CODE and agent_output_s3_key:
             await archive_and_upload_output(sandbox, contract.final_output, agent_output_s3_key, aws, s3_bucket)
 
