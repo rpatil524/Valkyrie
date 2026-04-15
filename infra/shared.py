@@ -71,7 +71,7 @@ class SharedStack(Stack):
         slack.add_notification_topic(notification_topic)  # type: ignore[arg-type]
 
         # Only notify for stacks deployed by this project
-        stack_names = ["SharedStack", "TrackerStack", "WorkerStack"]
+        stack_names = ["SharedStack", "TrackerStack", "WorkerStack", "MonitoringStack"]
 
         # EventBridge rule Slack notification for successful stack deployments
         success_rule = aws_events.Rule(
@@ -181,6 +181,7 @@ class SharedStack(Stack):
             "AgenticHarnessCluster",
             vpc=self.vpc,
             cluster_name=CLUSTER_NAME,
+            container_insights=True,
         )
 
         # service discovery namespace for internal communication
@@ -233,7 +234,7 @@ class SharedStack(Stack):
             subnet_ids=[s.subnet_id for s in self.vpc.public_subnets],
         )
 
-        redis_cluster = aws_elasticache.CfnCacheCluster(
+        self.redis_cluster = aws_elasticache.CfnCacheCluster(
             self,
             "RedisCluster",
             cache_node_type=ELASTICACHE_NODE_TYPE,
@@ -248,8 +249,8 @@ class SharedStack(Stack):
             "",
             [
                 "redis://",
-                redis_cluster.attr_redis_endpoint_address,
+                self.redis_cluster.attr_redis_endpoint_address,
                 ":",
-                redis_cluster.attr_redis_endpoint_port,
+                self.redis_cluster.attr_redis_endpoint_port,
             ],
         )
