@@ -402,7 +402,7 @@ async def process_task(
                     agent_output_s3_key = get_agent_result_s3_key(str(benchmark_id), task_id, "agent_output.tar.gz")
 
                 # Run the agent inside of the sandbox
-                agent_timed_out = await run_agent(
+                exit_reason = await run_agent(
                     sandbox,
                     start_benchmark_request.contract,
                     task_data.problem_path,
@@ -431,13 +431,13 @@ async def process_task(
                 buffer_logs(log_queue, stream_key, harness_config.aws, harness_config.log_group, force_flush=True)
 
                 # Save the evaluation result to the database with the task row
-                # Flag the agent timed out when trying to complete the task (expected)
+                # Record the termination reason if the agent did not exit cleanly (timeout / OS kill)
                 evaluation_result_row = EvaluationResult(
                     org_id=org.id,
                     task=task_row.id,
                     instance_id=sandbox.id,
                     result=evaluation_result,
-                    agent_timed_out=agent_timed_out,
+                    agent_caused_exit_reason=exit_reason,
                 )
 
                 with Session(bind=engine) as task_session:
@@ -824,7 +824,7 @@ def fetch_evaluation_results(benchmark_id: UUID, session: Session, org_id: UUID)
     for evaluation_result, task_id in results:
         result_data = evaluation_result.result
         # NOTE: We append this because its important for the user to know
-        result_data["agent_timed_out"] = evaluation_result.agent_timed_out
+        result_data["agent_caused_exit_reason"] = evaluation_result.agent_caused_exit_reason
         evaluation_results[task_id] = result_data
 
     return evaluation_results
