@@ -23,6 +23,7 @@ from tracker.logging import benchmark_id_var, configure_logging, get_logger, req
 from tracker.middleware import RequestContextMiddleware
 from tracker.s3 import (
     S3_BENCHMARKS_PREFIX,
+    copy_agent_to_benchmark,
     create_benchmark_url,
     create_console_url,
     create_presigned_url,
@@ -140,7 +141,7 @@ def init_org(
     tenant_name = resolve_descope_tenant(api_key)
 
     stmt = pg_insert(Org).values(name=tenant_name).on_conflict_do_nothing(index_elements=["name"])
-    result = session.execute(stmt)
+    result = session.exec(stmt)
     created = result.rowcount > 0
     session.commit()
 
@@ -189,6 +190,14 @@ async def start_benchmark(
     try:
         verify_response = await benchmark_service.verify_task_ids(
             task_ids=request.task_ids, slice_str=request.slice_str, dataset=request.dataset
+        )
+
+        # Copy agent so edits to agents/<name>.zip during the run doesn't affect it
+        await copy_agent_to_benchmark(
+            str(benchmark_row.id),
+            request.contract.name,
+            request.harness_config.aws,
+            request.harness_config.s3_bucket,
         )
     except Exception as e:
         error_message = f"{str(e)}\n{traceback.format_exc()}"

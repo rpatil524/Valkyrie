@@ -22,6 +22,7 @@ from valkyrie.cli.s3_client import (
     list_agents,
     push_agent,
     remove_agent,
+    update_benchmark_agent_version,
 )
 from valkyrie.cli.tracker_service import TrackerService
 from valkyrie.cli.utils import (
@@ -768,6 +769,13 @@ def stop(run_id: UUID, force: bool):
     default=None,
     help="Path to a text file with one task ID per line",
 )
+@click.option(
+    "--update-agent",
+    "-u",
+    is_flag=True,
+    default=False,
+    help="Refresh the frozen agent copy from the current agents/<name>.zip in S3 before resuming.",
+)
 @click.pass_context
 def resume(
     ctx: click.Context,
@@ -776,6 +784,7 @@ def resume(
     concurrency: int | None,
     task_ids: str | None,
     task_ids_file: Path | None,
+    update_agent: bool,
 ):
     """
     Resume a run by its run id.
@@ -806,6 +815,13 @@ def resume(
             if auth_credential:
                 service_headers["Authorization"] = str(auth_credential)
 
+            if update_agent:
+                metadata = tracker.fetch_benchmark_metadata(run_id)
+                agent_name = metadata.benchmark_arguments.contract.name
+                click.echo(f"\r\033[KUpdating agent '{agent_name}'...", nl=False)
+                asyncio.run(update_benchmark_agent_version(agent_name, str(run_id)))
+                click.echo(click.style("\r\033[K✓ Agent updated", fg="green"))
+
             retry_task_ids = task_ids.split(",") if task_ids else []
             _ = tracker.retry_or_resume_benchmark(
                 run_id,
@@ -821,7 +837,7 @@ def resume(
                     fg="cyan",
                 )
             )
-    except TrackerServiceError as e:
+    except (TrackerServiceError, S3Error) as e:
         raise click.ClickException(str(e))
 
 
