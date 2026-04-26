@@ -35,8 +35,8 @@ from tenacity import (
     wait_fixed,
 )
 
-from tracker.database.models import AgentContractRequest, AgentCausedExitReason
-from tracker.exceptions import InvalidSandboxConfigurationError, SandboxError
+from tracker.database.models import AgentCausedExitReason, AgentContractRequest
+from tracker.exceptions import InvalidSandboxConfigurationError, PtyCreationError, SandboxError
 from tracker.logging import get_logger
 from tracker.s3 import create_presigned_url, get_benchmark_contract_s3_key, upload_to_s3
 from tracker.types import AWSCredentials
@@ -64,7 +64,10 @@ async def delete_sandbox(sandbox: AsyncSandbox, daytona: AsyncDaytona) -> None:
     """Delete sandbox if it is not already destroyed or being destroyed"""
     try:
         await sandbox.refresh_data()
+
         if sandbox.state not in [SandboxState.DESTROYING, SandboxState.DESTROYED]:
+            # Set auto-stop interval in-case we fail to delete the sandbox
+            await sandbox.set_autostop_interval(interval=1)
             await daytona.delete(sandbox)
     except DaytonaNotFoundError:
         # If we error here that means the sandbox has just been deleted before we could refresh the state
@@ -115,7 +118,7 @@ async def _create_sandbox(
         return await daytona.create(
             CreateSandboxFromSnapshotParams(
                 auto_stop_interval=0,
-                auto_delete_interval=60,
+                auto_delete_interval=0,
                 name=sandbox_name,
                 labels=labels,
                 snapshot=snapshot_name,
@@ -130,7 +133,7 @@ async def _create_sandbox(
     return await daytona.create(
         CreateSandboxFromImageParams(
             auto_stop_interval=0,
-            auto_delete_interval=60,
+            auto_delete_interval=0,
             name=sandbox_name,
             labels=labels,
             image=image,
@@ -575,7 +578,9 @@ async def stream_command_output(
                 sandbox, session_id, on_data, envs={"TERM": "dumb", "LANG": "C.UTF-8"}
             )
         except DaytonaError as e:
-            raise SandboxError(f"Failed to create PTY session after {_PTY_CREATE_MAX_ATTEMPTS} attempts: {e}") from e
+            raise PtyCreationError(
+                f"Failed to create PTY session after {_PTY_CREATE_MAX_ATTEMPTS} attempts: {e}"
+            ) from e
 
         # Disable echo to suppress command line noise in the output
         await handle.send_input("stty -echo\n")
