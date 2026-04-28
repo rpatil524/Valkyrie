@@ -35,10 +35,10 @@ from tenacity import (
     wait_fixed,
 )
 
-from tracker.database.models import AgentContractRequest, AgentCausedExitReason
-from tracker.exceptions import InvalidSandboxConfigurationError, SandboxError
+from tracker.database.models import AgentCausedExitReason, AgentContractRequest
+from tracker.exceptions import InvalidSandboxConfigurationError, PtyCreationError, SandboxError
 from tracker.logging import get_logger
-from tracker.s3 import create_presigned_url, get_contract_s3_key, upload_to_s3
+from tracker.s3 import create_presigned_url, get_benchmark_contract_s3_key, upload_to_s3
 from tracker.types import AWSCredentials
 
 logger = get_logger(__name__)
@@ -64,7 +64,10 @@ async def delete_sandbox(sandbox: AsyncSandbox, daytona: AsyncDaytona) -> None:
     """Delete sandbox if it is not already destroyed or being destroyed"""
     try:
         await sandbox.refresh_data()
+
         if sandbox.state not in [SandboxState.DESTROYING, SandboxState.DESTROYED]:
+            # Set auto-stop interval in-case we fail to delete the sandbox
+            await sandbox.set_autostop_interval(interval=1)
             await daytona.delete(sandbox)
     except DaytonaNotFoundError:
         # If we error here that means the sandbox has just been deleted before we could refresh the state
@@ -115,7 +118,7 @@ async def _create_sandbox(
         return await daytona.create(
             CreateSandboxFromSnapshotParams(
                 auto_stop_interval=0,
-                auto_delete_interval=60,
+                auto_delete_interval=0,
                 name=sandbox_name,
                 labels=labels,
                 snapshot=snapshot_name,
@@ -130,7 +133,7 @@ async def _create_sandbox(
     return await daytona.create(
         CreateSandboxFromImageParams(
             auto_stop_interval=0,
-            auto_delete_interval=60,
+            auto_delete_interval=0,
             name=sandbox_name,
             labels=labels,
             image=image,
@@ -189,14 +192,21 @@ async def create_sandbox(
 
 @retry(retry=retry_if_exception_type(SandboxError), reraise=True, stop=stop_after_attempt(3))
 async def upload_agent_artifacts(
-    sandbox: AsyncSandbox, contract: AgentContractRequest, aws: AWSCredentials, s3_bucket: str
+    sandbox: AsyncSandbox,
+    contract: AgentContractRequest,
+    benchmark_id: str,
+    aws: AWSCredentials,
+    s3_bucket: str,
 ) -> None:
     """
     Download and extract the agent contract zip directly inside the sandbox. We generate a presigned S3 URL and have the sandbox curl + unzip it directly.
 
+    Reads from benchmarks/<benchmark_id>/<name>.zip so edits to the shared agent don't affect runs in flight.
+
     Args:
         sandbox: The sandbox to download and extract files in
         contract: The agent contract configuration
+        benchmark_id: The benchmark run id, used to locate the agent
         aws: AWS credentials for presigned URL generation
         s3_bucket: S3 bucket name
 
@@ -205,7 +215,7 @@ async def upload_agent_artifacts(
     """
     logger.info(f"Uploading contract {contract.name} to sandbox {sandbox.name}")
 
-    contract_s3_key = get_contract_s3_key(contract.name)
+    contract_s3_key = get_benchmark_contract_s3_key(benchmark_id, contract.name)
     presigned_url = create_presigned_url(contract_s3_key, aws, s3_bucket)
 
     zip_path = shlex.quote(f"/tmp/{contract.name}.zip")
@@ -568,7 +578,9 @@ async def stream_command_output(
                 sandbox, session_id, on_data, envs={"TERM": "dumb", "LANG": "C.UTF-8"}
             )
         except DaytonaError as e:
-            raise SandboxError(f"Failed to create PTY session after {_PTY_CREATE_MAX_ATTEMPTS} attempts: {e}") from e
+            raise PtyCreationError(
+                f"Failed to create PTY session after {_PTY_CREATE_MAX_ATTEMPTS} attempts: {e}"
+            ) from e
 
         # Disable echo to suppress command line noise in the output
         await handle.send_input("stty -echo\n")
