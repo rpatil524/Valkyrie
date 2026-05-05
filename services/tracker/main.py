@@ -4,10 +4,12 @@ import traceback
 from typing import Annotated
 from uuid import UUID
 
+import logfire
 import sentry_sdk
 from benchmark_service.client import BenchmarkServiceError
 from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
+from opentelemetry.propagate import inject
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import joinedload
 from sqlmodel import Session
@@ -20,7 +22,7 @@ from tracker.auth import (
     resolve_descope_tenant,
 )
 from tracker.cloudwatch import get_cloudwatch_url
-from tracker.config import AUTH_REQUIRED
+from tracker.config import AUTH_REQUIRED, ENVIRONMENT
 from tracker.database.models import Benchmark, BenchmarkStatus, Org
 from tracker.database.scoping import assert_org, get_scoped
 from tracker.database.session import check_database_connection, get_session
@@ -38,6 +40,7 @@ from tracker.s3 import (
     s3_object_exists,
 )
 from tracker.sentry import init_sentry
+from tracker.tracing import configure_tracing
 from tracker.types import (
     BenchmarkTableRow,
     FetchBenchmarkMetadataResponse,
@@ -70,12 +73,14 @@ from tracker.utils import (
 )
 
 configure_logging()
-init_sentry("valkyrie-tracker")
+init_sentry("valkyrie-tracker", environment=ENVIRONMENT)
+configure_tracing("valkyrie-tracker", environment=ENVIRONMENT)
 
 logger = get_logger(__name__)
 
 app = FastAPI()
 
+logfire.instrument_fastapi(app, excluded_urls="/health$")
 
 app.add_middleware(RequestContextMiddleware)
 
@@ -96,6 +101,13 @@ def bind_benchmark_id(benchmark_id: UUID) -> UUID:
 
 
 TrackedBenchmarkId = Annotated[UUID, Depends(bind_benchmark_id)]
+
+
+def _taskiq_labels() -> dict[str, str]:
+    """Labels attached to a kicked task: current request id + injected OTel trace context."""
+    trace_context: dict[str, str] = {}
+    inject(trace_context)
+    return {"request_id": request_id_var.get(), **trace_context}
 
 
 @app.exception_handler(TrackerServiceError)
@@ -226,9 +238,7 @@ async def start_benchmark(
 
     await (
         process_benchmark.kicker()
-        .with_labels(
-            request_id=request_id_var.get(),
-        )
+        .with_labels(**_taskiq_labels())
         .kiq(
             start_benchmark_request_json=request.model_dump(),
             benchmark_id_str=str(benchmark_row.id),
@@ -465,9 +475,7 @@ async def retry_or_resume_benchmark(
     # we will delegate inside what tasks we are running
     await (
         process_benchmark.kicker()
-        .with_labels(
-            request_id=request_id_var.get(),
-        )
+        .with_labels(**_taskiq_labels())
         .kiq(
             start_benchmark_request_json=resume_request_json,
             benchmark_id_str=str(benchmark_row.id),

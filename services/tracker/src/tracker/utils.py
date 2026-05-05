@@ -13,11 +13,13 @@ from typing import Any, NamedTuple, Sequence, cast
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
+import logfire
 import sentry_sdk
 from benchmark_service.client import BenchmarkServiceClient, BenchmarkServiceError
 from daytona import AsyncDaytona, AsyncPaginatedSandboxes, AsyncSandbox, SandboxState
 from daytona.common.errors import DaytonaNotFoundError
 from fastapi import Request
+from opentelemetry import trace
 from sqlalchemy import JSON, type_coerce
 from sqlmodel import Session, asc, case, col, delete, desc, func, or_, select, update
 from tenacity import before_sleep_log, retry_if_exception_type, stop_after_attempt, wait_fixed
@@ -25,7 +27,7 @@ from tenacity import retry as tenacity_retry
 
 from tracker._lambda import invoke_lambda
 from tracker.cloudwatch import cloudwatch_stream, create_benchmark_group
-from tracker.config import broker
+from tracker.config import ENVIRONMENT, broker
 from tracker.database.models import (
     Benchmark,
     BenchmarkArguments,
@@ -166,6 +168,7 @@ class TrackedTask:
         except Exception as e:
             error_message = f"Task error was not handled: {str(e)}\n{traceback.format_exc()}"
             logger.error(error_message)
+            logfire.exception("tracked_task_run failed")
             sentry_sdk.capture_exception(e)
             with Session(bind=engine) as session:
                 task = fetch_task_row(task_row.id, session, self._org)
@@ -305,6 +308,7 @@ def buffer_logs(
     loop.run_in_executor(None, cloudwatch_stream, stream_key, message, aws, log_group)
 
 
+@logfire.instrument("process_task")
 @tenacity_retry(
     retry=retry_if_exception_type(SandboxSetupError),
     stop=stop_after_attempt(_PTY_TASK_RETRY_LIMIT + 1),
@@ -331,6 +335,14 @@ async def process_task(
     task_id_var.set(task_id)
     sentry_sdk.set_tag("benchmark_name", start_benchmark_request.benchmark_name)
     sentry_sdk.set_tag("agent_name", start_benchmark_request.contract.name)
+    trace.get_current_span().set_attributes(
+        {
+            "task_id": task_id,
+            "benchmark_id": str(benchmark_id),
+            "benchmark_name": start_benchmark_request.benchmark_name,
+            "agent_name": start_benchmark_request.contract.name,
+        }
+    )
 
     with Session(bind=engine) as task_session:
         benchmark_row = fetch_benchmark_row(benchmark_id, task_session, org)
@@ -381,12 +393,22 @@ async def process_task(
             task.status = TaskStatus.BUILDING
             task_session.commit()
 
+        env_vars = {
+            **resolve_secrets(start_benchmark_request.contract.secrets, harness_config.aws),
+            # Tags sandbox-internal OTel telemetry with our IDs + environment so traces/logs/metrics
+            # are filterable per benchmark run and separable from other environments sharing the
+            # same Daytona account (sandbox OTLP export is account-level).
+            "DAYTONA_SANDBOX_OTEL_EXTRA_LABELS": (
+                f"benchmark_id={benchmark_id},task_id={task_row.task_id},environment={ENVIRONMENT}"
+            ),
+        }
+
         async with create_sandbox(
             daytona=benchmark_service.daytona_client,
             sandbox_name=task_row.alias,
             image=task_data.docker_image,
             labels=labels,
-            env_vars=resolve_secrets(start_benchmark_request.contract.secrets, harness_config.aws),
+            env_vars=env_vars,
             resources=task_data.resources,
             creation_semaphore=creation_semaphore,
         ) as sandbox:
@@ -417,7 +439,6 @@ async def process_task(
                 if start_benchmark_request.contract.final_output:
                     agent_output_s3_key = get_agent_result_s3_key(str(benchmark_id), task_id, "agent_output.tar.gz")
 
-                # Run the agent inside of the sandbox
                 exit_reason = await run_agent(
                     sandbox,
                     start_benchmark_request.contract,
@@ -474,6 +495,7 @@ async def process_task(
         log_output(f"\n[ERROR] {e}")
         raise
     except Exception as e:
+        logfire.exception("process_task failed")
         error_message = str(e)
         logger.error(error_message, exc_info=True)
 
@@ -583,6 +605,7 @@ async def fetch_missing_tasks(
 
 
 @broker.task
+@logfire.instrument("process_benchmark")
 async def process_benchmark(
     start_benchmark_request_json: dict[str, Any],
     benchmark_id_str: str,
@@ -595,6 +618,14 @@ async def process_benchmark(
     harness_config: HarnessConfig = start_benchmark_request.harness_config
     sentry_sdk.set_tag("benchmark_name", start_benchmark_request.benchmark_name)
     sentry_sdk.set_tag("agent_name", start_benchmark_request.contract.name)
+    trace.get_current_span().set_attributes(
+        {
+            "benchmark_id": benchmark_id_str,
+            "benchmark_name": start_benchmark_request.benchmark_name,
+            "agent_name": start_benchmark_request.contract.name,
+            "task_count": len(verified_task_ids),
+        }
+    )
 
     # Create notifier if webhook is configured
     notifier: SlackNotifier | None = None
@@ -731,8 +762,8 @@ async def process_benchmark(
                 invoke_lambda(arguments.lambda_function, lambda_payload, harness_config.aws)
 
     except Exception as e:
+        logfire.exception("process_benchmark failed")
         sentry_sdk.capture_exception(e)
-
         with Session(bind=engine) as session:
             benchmark_row = fetch_benchmark_row(benchmark_id, session, org)
             error_message = f"{str(e)}\n{traceback.format_exc()}"

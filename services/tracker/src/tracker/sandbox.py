@@ -12,6 +12,7 @@ from contextlib import asynccontextmanager
 from pathlib import PurePosixPath
 from typing import Any, AsyncGenerator
 
+import logfire
 from benchmark_service.schemas import Resources as TrackerResources
 from daytona import (
     AsyncDaytona,
@@ -25,6 +26,7 @@ from daytona import (
 )
 from daytona.common.errors import DaytonaError
 from daytona.handle.async_pty_handle import AsyncPtyHandle
+from opentelemetry import trace
 from tenacity import (
     before_sleep_log,
     retry,
@@ -529,34 +531,30 @@ async def _read_exit_code(sandbox: AsyncSandbox, status_path: str) -> int:
         raise SandboxError(f"Failed to read exit status from {status_path}: {e}") from e
 
 
-async def _disconnect_pty(handle: AsyncPtyHandle | None) -> None:
-    """
-    Disconnect from the PTY, ignoring exit errors
-    """
-
-    # Don't need to disconnect if it does not exist
+@logfire.instrument("pty_disconnect")
+async def _disconnect_pty(handle: AsyncPtyHandle | None, sandbox: AsyncSandbox) -> None:
+    """Disconnect from the PTY, ignoring exit errors (typically network errors)."""
     if not handle:
         return
 
-    # Ignore exceptions raised when disconnecting
-    # Most likely would be a network connection error
+    trace.get_current_span().set_attribute("sandbox_id", sandbox.id)
     try:
         await handle.disconnect()
     except Exception:
-        pass
+        logfire.exception(f"PTY disconnect failed on sandbox {sandbox.id}")
 
 
+@logfire.instrument("kill_pty_session", extract_args=("session_id",))
 async def _kill_pty_session(sandbox: AsyncSandbox, session_id: str | None) -> None:
-    """
-    Kill a PTY session, ignoring errors if raised or if session was never created
-    """
+    """Kill a PTY session, ignoring errors if raised or if session was never created."""
     if not session_id:
         return
 
+    trace.get_current_span().set_attribute("sandbox_id", sandbox.id)
     try:
         await sandbox.process.kill_pty_session(session_id)
     except Exception:
-        logger.warning(f"Failed to kill PTY session {session_id}")
+        logfire.exception(f"Failed to kill PTY session {session_id} on sandbox {sandbox.id}")
 
 
 async def stream_command_output(
@@ -633,7 +631,7 @@ async def stream_command_output(
 
     finally:
         # Disconnect form PTY, ignoring exception if raised
-        await _disconnect_pty(handle)
+        await _disconnect_pty(handle, sandbox)
 
         # Kill the PTY session, ignoring exception if raised
         await _kill_pty_session(sandbox, session_id)

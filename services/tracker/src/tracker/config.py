@@ -9,8 +9,9 @@ from taskiq_redis import RedisStreamBroker
 from taskiq_redis.redis_backend import RedisAsyncResultBackend
 
 from tracker.logging import configure_logging
-from tracker.middleware import LoggingContextMiddleware, TaskProtectionMiddleware
+from tracker.middleware import LoggingContextMiddleware, TaskProtectionMiddleware, TracingContextMiddleware
 from tracker.sentry import init_sentry
+from tracker.tracing import configure_tracing
 
 load_dotenv()
 configure_logging()
@@ -32,6 +33,7 @@ def create_benchmark_service_url(benchmark_name: str) -> str:
 
 AWS_S3_BUCKET = os.environ.get("AWS_S3_BUCKET", "agentic-harness")
 BROKER_ENVIRONMENT = os.environ.get("BROKER_ENVIRONMENT", "production")
+ENVIRONMENT = os.environ.get("ENVIRONMENT", "development")
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379")
 
 
@@ -54,21 +56,26 @@ result_backend: RedisAsyncResultBackend[Any] = RedisAsyncResultBackend(
     redis_url=REDIS_URL,
 )
 
+# Tracing precedes Logging so that anything emitted after (logs, child spans
+# from middlewares or the task body) is captured under the propagated parent trace.
+_BROKER_MIDDLEWARES = (TaskProtectionMiddleware(), TracingContextMiddleware(), LoggingContextMiddleware())
+
 broker = (
-    InMemoryBroker()
+    InMemoryBroker().with_middlewares(*_BROKER_MIDDLEWARES)
     if BROKER_ENVIRONMENT == "testing"
     else RedisStreamBroker(
         url=REDIS_URL,
         idle_timeout=86400000,  # 24 hours
     )
     .with_result_backend(result_backend)
-    .with_middlewares(TaskProtectionMiddleware(), LoggingContextMiddleware())
+    .with_middlewares(*_BROKER_MIDDLEWARES)
 )
 
 
 @broker.on_event(TaskiqEvents.WORKER_STARTUP)
-async def _init_worker_sentry(*_args: object, **_kwargs: object) -> None:  # pyright: ignore[reportUnusedFunction]
-    init_sentry("valkyrie-worker")
+async def _init_worker_observability(*_args: object, **_kwargs: object) -> None:  # pyright: ignore[reportUnusedFunction]
+    init_sentry("valkyrie-worker", environment=ENVIRONMENT)
+    configure_tracing("valkyrie-worker", environment=ENVIRONMENT)
 
 
 # Auth settings
