@@ -12,6 +12,7 @@ from contextlib import asynccontextmanager
 from pathlib import PurePosixPath
 from typing import Any, AsyncGenerator
 
+import logfire
 from benchmark_service.schemas import Resources as TrackerResources
 from daytona import (
     AsyncDaytona,
@@ -25,6 +26,7 @@ from daytona import (
 )
 from daytona.common.errors import DaytonaError
 from daytona.handle.async_pty_handle import AsyncPtyHandle
+from opentelemetry import trace
 from tenacity import (
     before_sleep_log,
     retry,
@@ -36,7 +38,13 @@ from tenacity import (
 )
 
 from tracker.database.models import AgentCausedExitReason, AgentContractRequest
-from tracker.exceptions import InvalidSandboxConfigurationError, PtyCreationError, SandboxError
+from tracker.exceptions import (
+    InvalidSandboxConfigurationError,
+    PtyCreationError,
+    SandboxError,
+    SandboxSetupError,
+    SSLConnectionError,
+)
 from tracker.logging import get_logger
 from tracker.s3 import create_presigned_url, get_benchmark_contract_s3_key, upload_to_s3
 from tracker.types import AWSCredentials
@@ -190,7 +198,11 @@ async def create_sandbox(
         await delete_sandbox(sandbox, daytona)
 
 
-@retry(retry=retry_if_exception_type(SandboxError), reraise=True, stop=stop_after_attempt(3))
+@retry(
+    retry=retry_if_exception_type(SandboxError) & retry_if_not_exception_type(SandboxSetupError),
+    reraise=True,
+    stop=stop_after_attempt(3),
+)
 async def upload_agent_artifacts(
     sandbox: AsyncSandbox,
     contract: AgentContractRequest,
@@ -253,12 +265,18 @@ async def upload_agent_artifacts(
 
     try:
         result = await _exec(sandbox, script)
-
-        if result.exit_code != 0:
-            raise RuntimeError(f"Command failed with exit code {result.exit_code}: {result.result}")
-
     except Exception as e:
         raise SandboxError(f"Failed to upload contract {contract.name} to sandbox {sandbox.name}: {e}") from e
+
+    error_message: str = (
+        f"Failed to upload contract {contract.name} to sandbox {sandbox.name}: "
+        f"Command failed with exit code {result.exit_code}: {result.result}"
+    )
+    if result.exit_code == 35:
+        raise SSLConnectionError(error_message)
+
+    if result.exit_code != 0:
+        raise SandboxError(error_message)
 
 
 @retry(retry=retry_if_exception_type(SandboxError), reraise=True, stop=stop_after_attempt(3))
@@ -513,34 +531,30 @@ async def _read_exit_code(sandbox: AsyncSandbox, status_path: str) -> int:
         raise SandboxError(f"Failed to read exit status from {status_path}: {e}") from e
 
 
-async def _disconnect_pty(handle: AsyncPtyHandle | None) -> None:
-    """
-    Disconnect from the PTY, ignoring exit errors
-    """
-
-    # Don't need to disconnect if it does not exist
+@logfire.instrument("pty_disconnect")
+async def _disconnect_pty(handle: AsyncPtyHandle | None, sandbox: AsyncSandbox) -> None:
+    """Disconnect from the PTY, ignoring exit errors (typically network errors)."""
     if not handle:
         return
 
-    # Ignore exceptions raised when disconnecting
-    # Most likely would be a network connection error
+    trace.get_current_span().set_attribute("sandbox_id", sandbox.id)
     try:
         await handle.disconnect()
     except Exception:
-        pass
+        logfire.exception(f"PTY disconnect failed on sandbox {sandbox.id}")
 
 
+@logfire.instrument("kill_pty_session", extract_args=("session_id",))
 async def _kill_pty_session(sandbox: AsyncSandbox, session_id: str | None) -> None:
-    """
-    Kill a PTY session, ignoring errors if raised or if session was never created
-    """
+    """Kill a PTY session, ignoring errors if raised or if session was never created."""
     if not session_id:
         return
 
+    trace.get_current_span().set_attribute("sandbox_id", sandbox.id)
     try:
         await sandbox.process.kill_pty_session(session_id)
     except Exception:
-        logger.warning(f"Failed to kill PTY session {session_id}")
+        logfire.exception(f"Failed to kill PTY session {session_id} on sandbox {sandbox.id}")
 
 
 async def stream_command_output(
@@ -617,7 +631,7 @@ async def stream_command_output(
 
     finally:
         # Disconnect form PTY, ignoring exception if raised
-        await _disconnect_pty(handle)
+        await _disconnect_pty(handle, sandbox)
 
         # Kill the PTY session, ignoring exception if raised
         await _kill_pty_session(sandbox, session_id)

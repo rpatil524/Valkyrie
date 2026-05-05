@@ -5,6 +5,7 @@ from functools import lru_cache, wraps
 from typing import TYPE_CHECKING, Any
 
 import boto3
+import logfire
 from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
 from botocore.response import StreamingBody
@@ -59,6 +60,7 @@ def handle_s3_error(message: str):
     return decorator
 
 
+@logfire.instrument("upload_to_s3", extract_args=("s3_key", "s3_bucket"))
 async def upload_to_s3(file_content: bytes, s3_key: str, aws: "AWSCredentials", s3_bucket: str) -> None:
     """
     Upload file content to S3 without blocking the event loop.
