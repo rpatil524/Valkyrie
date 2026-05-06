@@ -38,6 +38,7 @@ from tenacity import (
 
 from tracker.database.models import AgentCausedExitReason, AgentContractRequest
 from tracker.exceptions import (
+    AgentRunFailedError,
     InvalidSandboxConfigurationError,
     PtyCreationError,
     SandboxError,
@@ -741,7 +742,10 @@ async def stream_command_output(
         if exit_code != _SUCCESS_EXIT_CODE:
             tail = "".join(last_output).strip().splitlines()
             recent = "\n".join(tail[-10:]) if tail else "(no output)"
-            raise SandboxError(f"Failed to run command {command}, exit code: {exit_code}\nLast output:\n{recent}")
+            sentry_sdk.set_tag("agent_exit_code", str(exit_code))
+            raise AgentRunFailedError(
+                f"Failed to run command {command}, exit code: {exit_code}\nLast output:\n{recent}"
+            )
 
         return None
 
