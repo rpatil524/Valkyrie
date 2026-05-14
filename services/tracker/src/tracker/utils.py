@@ -16,7 +16,7 @@ import logfire
 import sentry_sdk
 from benchmark_service.client import BenchmarkServiceClient, BenchmarkServiceError
 from daytona import AsyncDaytona, AsyncPaginatedSandboxes, AsyncSandbox, SandboxState
-from daytona.common.errors import DaytonaNotFoundError
+from daytona.common.errors import DaytonaNotFoundError, DaytonaRateLimitError
 from fastapi import Request
 from opentelemetry import trace
 from sqlalchemy import JSON, type_coerce
@@ -48,6 +48,7 @@ from tracker.database.models import (
 )
 from tracker.database.scoping import scoped_select
 from tracker.database.session import engine
+from tracker.daytona_retry import daytona_retry_callback, wait_daytona_rate_limit
 from tracker.exceptions import SandboxSetupError, TrackerServiceError
 from tracker.logging import get_logger, task_id_var
 from tracker.notifications import NotificationContext, SlackNotifier
@@ -646,14 +647,16 @@ def set_benchmark_final_status(benchmark_row: Benchmark, session: Session, org: 
 
 
 def create_task_rows(
-    verified_task_ids: list[str], benchmark_row: Benchmark, session: Session, org: Org
+    verified_task_ids: list[str],
+    benchmark_row: Benchmark,
+    session: Session,
+    org: Org,
 ) -> Sequence[tuple[str, Task]]:
     """
     Create task_rows that do not already exist in the database for the benchmark row.
 
     NOTE: Only return runnable tasks to support resuming the benchmark.
     """
-
     # Find task ids that already exist so that we can filter them out
     existing_task_ids: Sequence[str] = session.exec(
         select(Task.task_id).where(Task.benchmark == benchmark_row.id).where(col(Task.task_id).in_(verified_task_ids))
@@ -1124,6 +1127,13 @@ async def stop_sandbox(sandbox: AsyncSandbox, daytona_client: AsyncDaytona) -> s
         return f"{str(e)}: {traceback.format_exc()}"
 
 
+@tenacity_retry(
+    retry=retry_if_exception_type(DaytonaRateLimitError),
+    stop=stop_after_attempt(5),
+    wait=wait_daytona_rate_limit(non_rate_limit_wait=wait_fixed(0)),
+    before_sleep=daytona_retry_callback("valkyrie.sandbox.list", op="sandbox.list"),
+    reraise=True,
+)
 async def fetch_sandboxes(benchmark_row: Benchmark, daytona_client: AsyncDaytona, page: int) -> AsyncPaginatedSandboxes:
     return await daytona_client.list(
         labels={"Benchmark": benchmark_row.name, "Id": str(benchmark_row.id)}, limit=10, page=page
@@ -1222,7 +1232,8 @@ async def reset_to_in_progress_status(
     Resets valid tasks to in progress and to allow for retrying or resuming the benchmark.
 
     Retry: we reset objects with an error status ontop of the stopped status
-    Rerun Task IDs: even if task has been finished we restart it
+    Rerun Task IDs: even if task has been finished we restart it. If the task has no
+        row yet, a fresh PENDING row is created when valid in the current dataset.
 
     Benchmark - In progress status
     Tasks - Pending status, or Evaluating status when retrying durable eval state
@@ -1243,24 +1254,19 @@ async def reset_to_in_progress_status(
             ),
         ]
 
-        task_rows = session.exec(select(Task).where(*filter_query)).all()
-        task_mapping: dict[UUID, str] = {task.id: task.task_id for task in task_rows}
-
-        # Ensure we are not missing any tasks that were requested (skips if force is empty)
-        missing_task_ids = [task_id for task_id in rerun_task_ids if task_id not in task_mapping.values()]
-        if missing_task_ids:
-            raise TrackerServiceError(
-                f"{', '.join(missing_task_ids)} was requested to be force resumed but does not exist in the dataset"
-            )
+        existing_rows = session.exec(select(Task).where(*filter_query)).all()
+        existing_by_task_id: dict[str, Task] = {task.task_id: task for task in existing_rows}
+        new_task_ids = [tid for tid in rerun_task_ids if tid not in existing_by_task_id]
 
         # Allow re-running the end of the benchmark without running any tasks
-        if not task_rows:
+        if not existing_rows and not new_task_ids:
             return []
 
         # Verify the task ids are still valid before priming to resume
         # Raises if any task ids are invalid
+        all_requested_task_ids = list(existing_by_task_id.keys()) + new_task_ids
         verify_response = await benchmark_service.verify_task_ids(
-            task_ids=list(task_mapping.values()), slice_str=None, dataset=benchmark_row.arguments.dataset
+            task_ids=all_requested_task_ids, slice_str=None, dataset=benchmark_row.arguments.dataset
         )
 
         # Set the benchmark status to in progress to flag resuming the benchmark
@@ -1268,7 +1274,7 @@ async def reset_to_in_progress_status(
         session.add(benchmark_row)
         session.commit()
 
-        for task in task_rows:
+        for task in existing_rows:
             task.status = (
                 TaskStatus.EVALUATING
                 if retry_mode == RetryMode.AUTO and task.eval_resume_state is not None
@@ -1281,12 +1287,16 @@ async def reset_to_in_progress_status(
                 task.eval_resume_state = None
             session.add(task)
 
+        for task_id in new_task_ids:
+            session.add(Task(org_id=org.id, task_id=task_id, benchmark=benchmark_row.id, status=TaskStatus.PENDING))
+
         # Delete all evaluation results for the tasks (unlikely they exist)
-        session.exec(
-            delete(EvaluationResult)
-            .where(col(EvaluationResult.task).in_(list(task_mapping.keys())))
-            .where(col(EvaluationResult.org_id) == org.id)
-        )
+        if existing_rows:
+            session.exec(
+                delete(EvaluationResult)
+                .where(col(EvaluationResult.task).in_([task.id for task in existing_rows]))
+                .where(col(EvaluationResult.org_id) == org.id)
+            )
 
         session.commit()
 
@@ -1424,6 +1434,7 @@ def fetch_harness_config(request: Request) -> HarnessConfig:
             aws_access_key_id=flat["aws_access_key_id"],
             aws_secret_access_key=flat["aws_secret_access_key"],
             aws_default_region=flat["aws_default_region"],
+            aws_session_token=flat.get("aws_session_token"),
         ),
         s3_bucket=flat["s3_bucket"],
         log_group=flat["log_group"],

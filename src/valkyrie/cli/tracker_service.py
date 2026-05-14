@@ -347,20 +347,24 @@ class TrackerService:
         except httpx.HTTPError as e:
             raise TrackerServiceError(f"Failed to stream run: {e}") from e
 
-    def retrieve_results(self, benchmark_id: UUID, s3: bool) -> RetrieveResultsResponse:
+    def retrieve_results(
+        self,
+        benchmark_id: UUID,
+        s3: bool,
+        task_ids: list[str] | None = None,
+    ) -> RetrieveResultsResponse:
         """
         Retrieve the results of a benchmark by its benchmark id.
 
-        Args:
-            benchmark_id: Benchmark id
-
-        Returns:
-            RetrieveResultsResponse with benchmark results
+        If task_ids is provided, results are filtered to that subset and the final score is
+        recomputed over those tasks (does not mutate the stored FinalEvaluation).
         """
         try:
-            response = self._client.get(
-                f"{self._base_url}/retrieve-results", params={"benchmark_id": str(benchmark_id), "s3": s3}
-            )
+            params: dict[str, Any] = {"benchmark_id": str(benchmark_id), "s3": s3}
+            if task_ids:
+                params["task_ids"] = task_ids
+
+            response = self._client.get(f"{self._base_url}/retrieve-results", params=params)
 
             if response.status_code != 200:
                 details = response.json().get("detail", response.text)
@@ -437,7 +441,8 @@ class TrackerService:
             benchmark_id: Benchmark id
             retry: Whether to retry tasks with the status error
             concurrency: Optional new concurrency level to override original value
-            task_ids: List of task ids to force retry
+            task_ids: List of task ids to force retry. Task ids without an existing row
+                are created as fresh PENDING if valid in the current dataset.
             service_headers: Optional headers for benchmark service authentication
 
         Returns:
