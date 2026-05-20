@@ -17,7 +17,7 @@ import sentry_sdk
 from benchmark_service.client import BenchmarkServiceClient, BenchmarkServiceError, BenchmarkServiceUnauthenticatedError
 from daytona import AsyncDaytona, AsyncPaginatedSandboxes, AsyncSandbox, SandboxState
 from daytona.common.errors import DaytonaNotFoundError, DaytonaRateLimitError
-from fastapi import Request
+from fastapi import HTTPException, Request
 from opentelemetry import trace
 from sqlalchemy import JSON, type_coerce
 from sqlmodel import Session, asc, case, col, delete, desc, func, or_, select, update
@@ -1545,15 +1545,26 @@ def fetch_harness_config(request: Request) -> HarnessConfig:
     flat = {
         key[len(prefix) :].replace("-", "_"): value for key, value in request.headers.items() if key.startswith(prefix)
     }
-    return HarnessConfig(
-        aws=AWSCredentials(
-            aws_access_key_id=flat["aws_access_key_id"],
-            aws_secret_access_key=flat["aws_secret_access_key"],
-            aws_default_region=flat["aws_default_region"],
-            aws_session_token=flat.get("aws_session_token"),
-        ),
-        s3_bucket=flat["s3_bucket"],
-        log_group=flat["log_group"],
-        log_retention_policy=int(flat["log_retention_policy"]),
-        daytona_secret_name=flat["daytona_secret_name"],
-    )
+
+    try:
+        return HarnessConfig(
+            aws=AWSCredentials(
+                aws_access_key_id=flat["aws_access_key_id"],
+                aws_secret_access_key=flat["aws_secret_access_key"],
+                aws_default_region=flat["aws_default_region"],
+                aws_session_token=flat.get("aws_session_token"),
+            ),
+            s3_bucket=flat["s3_bucket"],
+            log_group=flat["log_group"],
+            log_retention_policy=int(flat["log_retention_policy"]),
+            daytona_secret_name=flat["daytona_secret_name"],
+        )
+    except KeyError as e:
+        config_key = e.args[0].upper()
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Missing required config value: '{config_key}'. "
+                "Run `valk config init` to initialize or `valk config set` to update your Valkyrie config."
+            ),
+        ) from e
