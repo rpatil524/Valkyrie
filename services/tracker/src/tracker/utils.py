@@ -52,6 +52,8 @@ from tracker.database.models import (
 from tracker.database.scoping import scoped_select
 from tracker.database.session import engine
 from tracker.daytona_retry import daytona_retry_callback, wait_daytona_rate_limit
+from websockets.exceptions import ConnectionClosedError
+
 from tracker.exceptions import SandboxSetupError, TrackerServiceError
 from tracker.logging import get_logger, task_id_var
 from tracker.notifications import NotificationContext, SlackNotifier
@@ -433,6 +435,8 @@ async def process_task(
             try:
                 log_output("Resuming evaluation from durable benchmark state\n")
                 resume_eval_start_time = time.perf_counter()
+                # Reset timer to keep the last received message from the benchmarks service accurate
+                last_log_time = time.monotonic()
                 evaluation_result = await benchmark_service.resume_evaluation(
                     task_row.task_id,
                     eval_resume_state=task_row.eval_resume_state,
@@ -517,6 +521,8 @@ async def process_task(
                     harness_config.s3_bucket,
                 )
 
+                # Reset timer to keep the last received message from the benchmarks service accurate
+                last_log_time = time.monotonic()
                 _ = await benchmark_service.setup_task(
                     task_row.task_id, sandbox.id, on_message=log_output, dataset=start_benchmark_request.dataset
                 )
@@ -574,6 +580,8 @@ async def process_task(
                     },
                 )
                 logger.info(f"Evaluating agent {start_benchmark_request.contract.name} in sandbox {sandbox.name}")
+                # Reset timer to keep the last received message from the benchmarks service accurate
+                last_log_time = time.monotonic()
                 evaluation_result = await benchmark_service.evaluate_instance(
                     task_row.task_id,
                     sandbox.id,
@@ -619,6 +627,20 @@ async def process_task(
     except SandboxSetupError as e:
         log_output(f"\n[ERROR] {e}")
         raise
+    except ConnectionClosedError:
+        seconds = int(time.monotonic() - last_log_time)
+        error_message = (
+            f"Benchmark service has not sent a message, causing the connection to disconnect: "
+            f"last message received {seconds}s ago"
+        )
+        logger.warning(error_message)
+        log_output(f"\n[ERROR] {error_message}")
+
+        with Session(bind=engine) as task_session:
+            task = fetch_task_row(task_row.id, task_session, org)
+            commit_task_error(task, task_session, error_message)
+
+        return {task_id: None}
     except Exception as e:
         logfire.exception("process_task failed")
         error_message = str(e)
