@@ -52,7 +52,8 @@ from tracker.database.models import (
 from tracker.database.scoping import scoped_select
 from tracker.database.session import engine
 from tracker.daytona_retry import daytona_retry_callback, wait_daytona_rate_limit
-from websockets.exceptions import ConnectionClosedError
+from pydantic import ValidationError
+from websockets.exceptions import ConnectionClosedError, InvalidStatus
 
 from tracker.exceptions import SandboxSetupError, TrackerServiceError
 from tracker.logging import get_logger, task_id_var
@@ -641,6 +642,36 @@ async def process_task(
             commit_task_error(task, task_session, error_message)
 
         return {task_id: None}
+    except ValidationError as e:
+        field_names = ", ".join(".".join(str(loc) for loc in err["loc"]) for err in e.errors())
+        error_message = (
+            f"Benchmark service returned an incompatible task response. Missing or invalid fields: {field_names}"
+        )
+        log_output(f"\n[ERROR] {error_message}")
+
+        with Session(bind=engine) as task_session:
+            task = fetch_task_row(task_row.id, task_session, org)
+            commit_task_error(task, task_session, error_message)
+
+        return {task_id: None}
+    except InvalidStatus as e:
+        error_message = f"Benchmark service rejected the WebSocket connection (HTTP {e.response.status_code})"
+        log_output(f"\n[ERROR] {error_message}")
+
+        with Session(bind=engine) as task_session:
+            task = fetch_task_row(task_row.id, task_session, org)
+            commit_task_error(task, task_session, error_message)
+
+        return {task_id: None}
+    except BenchmarkServiceError as e:
+        error_message = str(e)
+        log_output(f"\n[ERROR] {error_message}")
+
+        with Session(bind=engine) as task_session:
+            task = fetch_task_row(task_row.id, task_session, org)
+            commit_task_error(task, task_session, error_message)
+
+        return {task_id: None}
     except Exception as e:
         logfire.exception("process_task failed")
         error_message = str(e)
@@ -924,6 +955,11 @@ async def process_benchmark(
             benchmark_row = fetch_benchmark_row(benchmark_id, session, org)
             error_message = f"{str(e)}\n{traceback.format_exc()}"
             logger.warning(error_message)
+            commit_benchmark_error(benchmark_row, session, error_message)
+    except BenchmarkServiceError as e:
+        with Session(bind=engine) as session:
+            benchmark_row = fetch_benchmark_row(benchmark_id, session, org)
+            error_message = str(e)
             commit_benchmark_error(benchmark_row, session, error_message)
     except Exception as e:
         logfire.exception("process_benchmark failed")
