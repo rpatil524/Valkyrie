@@ -17,7 +17,7 @@ import sentry_sdk
 from benchmark_service.client import BenchmarkServiceClient, BenchmarkServiceError, BenchmarkServiceUnauthenticatedError
 from daytona import AsyncDaytona, AsyncPaginatedSandboxes, AsyncSandbox, SandboxState
 from daytona.common.errors import DaytonaNotFoundError, DaytonaRateLimitError
-from fastapi import Request
+from fastapi import HTTPException, Request
 from opentelemetry import trace
 from sqlalchemy import JSON, type_coerce
 from sqlmodel import Session, asc, case, col, delete, desc, func, or_, select, update
@@ -52,6 +52,9 @@ from tracker.database.models import (
 from tracker.database.scoping import scoped_select
 from tracker.database.session import engine
 from tracker.daytona_retry import daytona_retry_callback, wait_daytona_rate_limit
+from pydantic import ValidationError
+from websockets.exceptions import ConnectionClosedError, InvalidStatus
+
 from tracker.exceptions import SandboxSetupError, TrackerServiceError
 from tracker.logging import get_logger, task_id_var
 from tracker.notifications import NotificationContext, SlackNotifier
@@ -433,6 +436,8 @@ async def process_task(
             try:
                 log_output("Resuming evaluation from durable benchmark state\n")
                 resume_eval_start_time = time.perf_counter()
+                # Reset timer to keep the last received message from the benchmarks service accurate
+                last_log_time = time.monotonic()
                 evaluation_result = await benchmark_service.resume_evaluation(
                     task_row.task_id,
                     eval_resume_state=task_row.eval_resume_state,
@@ -517,6 +522,8 @@ async def process_task(
                     harness_config.s3_bucket,
                 )
 
+                # Reset timer to keep the last received message from the benchmarks service accurate
+                last_log_time = time.monotonic()
                 _ = await benchmark_service.setup_task(
                     task_row.task_id, sandbox.id, on_message=log_output, dataset=start_benchmark_request.dataset
                 )
@@ -574,6 +581,8 @@ async def process_task(
                     },
                 )
                 logger.info(f"Evaluating agent {start_benchmark_request.contract.name} in sandbox {sandbox.name}")
+                # Reset timer to keep the last received message from the benchmarks service accurate
+                last_log_time = time.monotonic()
                 evaluation_result = await benchmark_service.evaluate_instance(
                     task_row.task_id,
                     sandbox.id,
@@ -619,6 +628,50 @@ async def process_task(
     except SandboxSetupError as e:
         log_output(f"\n[ERROR] {e}")
         raise
+    except ConnectionClosedError:
+        seconds = int(time.monotonic() - last_log_time)
+        error_message = (
+            f"Benchmark service has not sent a message, causing the connection to disconnect: "
+            f"last message received {seconds}s ago"
+        )
+        logger.warning(error_message)
+        log_output(f"\n[ERROR] {error_message}")
+
+        with Session(bind=engine) as task_session:
+            task = fetch_task_row(task_row.id, task_session, org)
+            commit_task_error(task, task_session, error_message)
+
+        return {task_id: None}
+    except ValidationError as e:
+        field_names = ", ".join(".".join(str(loc) for loc in err["loc"]) for err in e.errors())
+        error_message = (
+            f"Benchmark service returned an incompatible task response. Missing or invalid fields: {field_names}"
+        )
+        log_output(f"\n[ERROR] {error_message}")
+
+        with Session(bind=engine) as task_session:
+            task = fetch_task_row(task_row.id, task_session, org)
+            commit_task_error(task, task_session, error_message)
+
+        return {task_id: None}
+    except InvalidStatus as e:
+        error_message = f"Benchmark service rejected the WebSocket connection (HTTP {e.response.status_code})"
+        log_output(f"\n[ERROR] {error_message}")
+
+        with Session(bind=engine) as task_session:
+            task = fetch_task_row(task_row.id, task_session, org)
+            commit_task_error(task, task_session, error_message)
+
+        return {task_id: None}
+    except BenchmarkServiceError as e:
+        error_message = str(e)
+        log_output(f"\n[ERROR] {error_message}")
+
+        with Session(bind=engine) as task_session:
+            task = fetch_task_row(task_row.id, task_session, org)
+            commit_task_error(task, task_session, error_message)
+
+        return {task_id: None}
     except Exception as e:
         logfire.exception("process_task failed")
         error_message = str(e)
@@ -902,6 +955,11 @@ async def process_benchmark(
             benchmark_row = fetch_benchmark_row(benchmark_id, session, org)
             error_message = f"{str(e)}\n{traceback.format_exc()}"
             logger.warning(error_message)
+            commit_benchmark_error(benchmark_row, session, error_message)
+    except BenchmarkServiceError as e:
+        with Session(bind=engine) as session:
+            benchmark_row = fetch_benchmark_row(benchmark_id, session, org)
+            error_message = str(e)
             commit_benchmark_error(benchmark_row, session, error_message)
     except Exception as e:
         logfire.exception("process_benchmark failed")
@@ -1265,44 +1323,47 @@ async def force_stop_sandboxes(
     """
     daytona_client: AsyncDaytona = benchmark_row.benchmark_service(daytona_secret_name, aws).daytona_client
 
-    # Update all tasks being processed to stopped
-    session.exec(
-        update(Task)
-        .where(col(Task.benchmark) == benchmark_row.id)
-        .where(col(Task.org_id) == org.id)
-        .where(col(Task.status).in_([TaskStatus.BUILDING, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING]))
-        .values(status=TaskStatus.STOPPED)
-    )
+    try:
+        # Update all tasks being processed to stopped
+        session.exec(
+            update(Task)
+            .where(col(Task.benchmark) == benchmark_row.id)
+            .where(col(Task.org_id) == org.id)
+            .where(col(Task.status).in_([TaskStatus.BUILDING, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING]))
+            .values(status=TaskStatus.STOPPED)
+        )
 
-    session.commit()
-
-    # Iterate through each running sandbox and stop it, collecting error messages
-    results: dict[str, str | None] = {}
-    async for sandbox in sandbox_generator(benchmark_row, daytona_client):
-        result = await stop_sandbox(sandbox, daytona_client)
-
-        results[sandbox.name] = result
-
-    error_message: str = "\n".join(
-        f"{task_alias}: {error_message}" for task_alias, error_message in results.items() if error_message
-    )
-
-    # If all tasks are already in a stopped state, we need to update the final status here since the worker has exited
-    finished_statuses: list[TaskStatus] = [TaskStatus.FINISHED, TaskStatus.ERROR, TaskStatus.STOPPED]
-    tasks_still_running: int = session.exec(
-        select(func.count(col(Task.id)))
-        .where(col(Task.benchmark) == benchmark_row.id)
-        .where(col(Task.org_id) == org.id)
-        .where(col(Task.status).notin_(finished_statuses))
-    ).one()
-
-    if not tasks_still_running:
-        benchmark_row.status = BenchmarkStatus.STOPPED
-        session.add(benchmark_row)
         session.commit()
 
-    if error_message:
-        raise TrackerServiceError(f"Unexpected errors stopping sandboxes:\n{error_message}")
+        # Iterate through each running sandbox and stop it, collecting error messages
+        results: dict[str, str | None] = {}
+        async for sandbox in sandbox_generator(benchmark_row, daytona_client):
+            result = await stop_sandbox(sandbox, daytona_client)
+
+            results[sandbox.name] = result
+
+        error_message: str = "\n".join(
+            f"{task_alias}: {error_message}" for task_alias, error_message in results.items() if error_message
+        )
+
+        # If all tasks are already in a stopped state, we need to update the final status here since the worker has exited
+        finished_statuses: list[TaskStatus] = [TaskStatus.FINISHED, TaskStatus.ERROR, TaskStatus.STOPPED]
+        tasks_still_running: int = session.exec(
+            select(func.count(col(Task.id)))
+            .where(col(Task.benchmark) == benchmark_row.id)
+            .where(col(Task.org_id) == org.id)
+            .where(col(Task.status).notin_(finished_statuses))
+        ).one()
+
+        if not tasks_still_running:
+            benchmark_row.status = BenchmarkStatus.STOPPED
+            session.add(benchmark_row)
+            session.commit()
+
+        if error_message:
+            raise TrackerServiceError(f"Unexpected errors stopping sandboxes:\n{error_message}")
+    finally:
+        await daytona_client.close()
 
 
 async def reset_to_in_progress_status(
@@ -1545,15 +1606,26 @@ def fetch_harness_config(request: Request) -> HarnessConfig:
     flat = {
         key[len(prefix) :].replace("-", "_"): value for key, value in request.headers.items() if key.startswith(prefix)
     }
-    return HarnessConfig(
-        aws=AWSCredentials(
-            aws_access_key_id=flat["aws_access_key_id"],
-            aws_secret_access_key=flat["aws_secret_access_key"],
-            aws_default_region=flat["aws_default_region"],
-            aws_session_token=flat.get("aws_session_token"),
-        ),
-        s3_bucket=flat["s3_bucket"],
-        log_group=flat["log_group"],
-        log_retention_policy=int(flat["log_retention_policy"]),
-        daytona_secret_name=flat["daytona_secret_name"],
-    )
+
+    try:
+        return HarnessConfig(
+            aws=AWSCredentials(
+                aws_access_key_id=flat["aws_access_key_id"],
+                aws_secret_access_key=flat["aws_secret_access_key"],
+                aws_default_region=flat["aws_default_region"],
+                aws_session_token=flat.get("aws_session_token"),
+            ),
+            s3_bucket=flat["s3_bucket"],
+            log_group=flat["log_group"],
+            log_retention_policy=int(flat["log_retention_policy"]),
+            daytona_secret_name=flat["daytona_secret_name"],
+        )
+    except KeyError as e:
+        config_key = e.args[0].upper()
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Missing required config value: '{config_key}'. "
+                "Run `valk config init` to initialize or `valk config set` to update your Valkyrie config."
+            ),
+        ) from e
