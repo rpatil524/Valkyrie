@@ -15,7 +15,7 @@ from zoneinfo import ZoneInfo
 import logfire
 import sentry_sdk
 from benchmark_service.client import BenchmarkServiceClient, BenchmarkServiceError, BenchmarkServiceUnauthenticatedError
-from daytona import AsyncDaytona, AsyncPaginatedSandboxes, AsyncSandbox, SandboxState
+from daytona import AsyncDaytona, AsyncSandbox, ListSandboxesQuery, SandboxState
 from daytona.common.errors import DaytonaNotFoundError, DaytonaRateLimitError
 from fastapi import HTTPException, Request
 from opentelemetry import trace
@@ -77,6 +77,8 @@ logger = get_logger(__name__)
 _SANDBOX_CREATION_CAP: int = 10
 _PTY_TASK_RETRY_LIMIT: int = 1
 _RUNNABLE_TASK_STATUSES = [TaskStatus.PENDING, TaskStatus.BUILDING, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING]
+_DELETED_DAYTONA_SANDBOX_STATES = (SandboxState.DESTROYING, SandboxState.DESTROYED)
+_DAYTONA_LIST_PAGE_SIZE = 100
 
 
 def fetch_daytona_headers(daytona_secret_name: str, aws: AWSCredentials) -> dict[str, str]:
@@ -1271,6 +1273,22 @@ async def stop_sandbox(sandbox: AsyncSandbox, daytona_client: AsyncDaytona) -> s
         return f"{str(e)}: {traceback.format_exc()}"
 
 
+async def fetch_sandboxes(benchmark_row: Benchmark, daytona_client: AsyncDaytona) -> AsyncGenerator[AsyncSandbox, None]:
+    """Stream the benchmark's still-active sandboxes.
+
+    Not retry-decorated: @retry is a no-op on an async generator (it wraps only construction,
+    not iteration). Rate-limit retries belong on a consuming coroutine; see _stop_active_sandboxes.
+    """
+    async for sandbox in daytona_client.list(
+        ListSandboxesQuery(
+            labels={"Benchmark": benchmark_row.name, "Id": str(benchmark_row.id)},
+            limit=_DAYTONA_LIST_PAGE_SIZE,
+        )
+    ):
+        if sandbox.state not in _DELETED_DAYTONA_SANDBOX_STATES:
+            yield sandbox
+
+
 @tenacity_retry(
     retry=retry_if_exception_type(DaytonaRateLimitError),
     stop=stop_after_attempt(5),
@@ -1278,37 +1296,22 @@ async def stop_sandbox(sandbox: AsyncSandbox, daytona_client: AsyncDaytona) -> s
     before_sleep=daytona_retry_callback("valkyrie.sandbox.list", op="sandbox.list"),
     reraise=True,
 )
-async def fetch_sandboxes(benchmark_row: Benchmark, daytona_client: AsyncDaytona, page: int) -> AsyncPaginatedSandboxes:
-    return await daytona_client.list(
-        labels={"Benchmark": benchmark_row.name, "Id": str(benchmark_row.id)}, limit=10, page=page
-    )
+async def _stop_active_sandboxes(
+    benchmark_row: Benchmark,
+    daytona_client: AsyncDaytona,
+    results: dict[str, str | None],
+    attempted: set[str],
+) -> None:
+    """Stop each active sandbox as the cursor yields it, recording per-sandbox outcomes.
 
-
-async def sandbox_generator(
-    benchmark_row: Benchmark, daytona_client: AsyncDaytona
-) -> AsyncGenerator[AsyncSandbox, None]:
+    `attempted` (kept across retries) skips already-handled sandboxes, so a rate-limit retry
+    restarts the pass without re-stopping anything or looping forever on an undeletable sandbox.
     """
-    Generator that yields all sandboxes for a given benchmark in paginated chunks of 10.
-
-    NOTE: At the time of this implementation there are several things weird with the dayyona api
-        1. If you delete the sandboxes in the list, the next page should be the first page (repopulated)
-        2. Final state is not DESTROYED, but rather DESTROYING
-        3. The total_pages count is not updated as you delete sandboxes
-    """
-
-    paginated_sandboxes: AsyncPaginatedSandboxes = await fetch_sandboxes(benchmark_row, daytona_client, 1)
-
-    total_pages = paginated_sandboxes.total_pages
-    while (paginated_sandboxes.page <= total_pages) and paginated_sandboxes.items:
-        sandboxes = paginated_sandboxes.items
-        for sandbox in sandboxes:
-            if sandbox.state in [SandboxState.DESTROYING, SandboxState.DESTROYED]:
-                continue
-
-            yield sandbox
-
-        # NOTE: Since we deleted the first 10 the first page will be populated with the next 10 sandboxes
-        paginated_sandboxes = await fetch_sandboxes(benchmark_row, daytona_client, int(paginated_sandboxes.page))
+    async for sandbox in fetch_sandboxes(benchmark_row, daytona_client):
+        if sandbox.id in attempted:
+            continue
+        attempted.add(sandbox.id)
+        results[sandbox.name] = await stop_sandbox(sandbox, daytona_client)
 
 
 async def force_stop_sandboxes(
@@ -1335,12 +1338,11 @@ async def force_stop_sandboxes(
 
         session.commit()
 
-        # Iterate through each running sandbox and stop it, collecting error messages
+        # Stream the running sandboxes and stop each as it is yielded, collecting error messages.
+        # The retried coroutine streams + deletes in one pass; `attempted` dedupes across retries.
         results: dict[str, str | None] = {}
-        async for sandbox in sandbox_generator(benchmark_row, daytona_client):
-            result = await stop_sandbox(sandbox, daytona_client)
-
-            results[sandbox.name] = result
+        attempted: set[str] = set()
+        await _stop_active_sandboxes(benchmark_row, daytona_client, results, attempted)
 
         error_message: str = "\n".join(
             f"{task_alias}: {error_message}" for task_alias, error_message in results.items() if error_message
@@ -1501,6 +1503,13 @@ def fetch_filtered_benchmark_rows(
 
     if request.model:
         query = query.where(arguments_json["contract"]["model"].as_string() == request.model)
+
+    if request.dataset:
+        dataset_value = arguments_json["dataset"].as_string()
+        if request.dataset == "default":
+            query = query.where(or_(dataset_value == "default", dataset_value.is_(None)))
+        else:
+            query = query.where(dataset_value == request.dataset)
 
     if request.benchmark_name:
         query = query.where(Benchmark.name == request.benchmark_name)
