@@ -14,9 +14,21 @@ import tracker.daytona_retry as daytona_retry_module
 import tracker.observability.retry as retry_module
 import tracker.utils as utils_module
 from tracker import sandbox as sandbox_module
-from tracker.database.models import AgentContractRequest
-from tracker.exceptions import AgentRunFailedError, SSLConnectionError, SandboxError, SandboxSetupError
-from tracker.sandbox import create_sandbox, run_agent, stream_command_output, upload_agent_artifacts
+from tracker.database.models import AgentContractRequest, OutputArtifact
+from tracker.exceptions import (
+    AgentRunFailedError,
+    OutputArtifactError,
+    SSLConnectionError,
+    SandboxError,
+    SandboxSetupError,
+)
+from tracker.sandbox import (
+    create_sandbox,
+    run_agent,
+    stream_command_output,
+    upload_agent_artifacts,
+    upload_output_artifacts,
+)
 from tracker.types import AWSCredentials
 
 _create_sandbox = getattr(sandbox_module, "_create_sandbox")
@@ -229,7 +241,226 @@ class TestPtyHandshakeSemaphore:
         }
 
 
+class TestOutputArtifacts:
+    async def test_upload_output_artifacts_uploads_declared_file_to_task_prefix(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        harness_config: Any,
+    ) -> None:
+        artifact = "artifacts/turns.jsonl"
+        uploaded: list[tuple[bytes, str]] = []
+
+        async def fake_exec(_sandbox: Any, command: str) -> ExecuteResponse:
+            if command == "test -f /tmp/valkyrie/artifacts/turns.jsonl":
+                return ExecuteResponse(exit_code=0, result="")
+            if command == "stat -c%s /tmp/valkyrie/artifacts/turns.jsonl":
+                return ExecuteResponse(exit_code=0, result="12")
+            if command == "base64 /tmp/valkyrie/artifacts/turns.jsonl":
+                return ExecuteResponse(exit_code=0, result="eyJ0dXJuIjoxfQo=")
+            raise AssertionError(f"unexpected command: {command}")
+
+        async def fake_upload_to_s3(file_content: bytes, s3_key: str, _aws: Any, _s3_bucket: str) -> None:
+            uploaded.append((file_content, s3_key))
+
+        monkeypatch.setattr(sandbox_module, "_exec", fake_exec)
+        monkeypatch.setattr(sandbox_module, "upload_to_s3", fake_upload_to_s3)
+
+        mock_sandbox = Mock()
+        mock_sandbox.id = "sandbox-123"
+        mock_sandbox.name = "task-alias"
+
+        await upload_output_artifacts(
+            mock_sandbox,
+            [artifact],
+            "benchmark-123",
+            "task_0",
+            harness_config.aws,
+            harness_config.s3_bucket,
+        )
+
+        assert uploaded == [(b'{"turn":1}\n', "benchmarks/benchmark-123/task_0/artifacts/turns.jsonl")]
+
+    async def test_upload_output_artifacts_can_upload_explicit_glob_sources(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        harness_config: Any,
+    ) -> None:
+        uploaded: list[tuple[bytes, str]] = []
+
+        async def fake_exec(_sandbox: Any, command: str) -> ExecuteResponse:
+            if command == "find /logs -type f -path '/logs/*/turns/init/config.json' | sort | head -n 1":
+                return ExecuteResponse(exit_code=0, result="/logs/task/turns/init/config.json\n")
+            if command == "stat -c%s /logs/task/turns/init/config.json":
+                return ExecuteResponse(exit_code=0, result="11")
+            if command == "base64 /logs/task/turns/init/config.json":
+                return ExecuteResponse(exit_code=0, result="eyJsbG0iOnt9fQo=")
+            if command == "find /logs -type f -path '/logs/*/result.json' | sort | head -n 1":
+                return ExecuteResponse(exit_code=0, result="/logs/task/result.json\n")
+            if command == "stat -c%s /logs/task/result.json":
+                return ExecuteResponse(exit_code=0, result="13")
+            if command == "base64 /logs/task/result.json":
+                return ExecuteResponse(exit_code=0, result="eyJ0dXJucyI6W119Cg==")
+            raise AssertionError(f"unexpected command: {command}")
+
+        async def fake_upload_to_s3(file_content: bytes, s3_key: str, _aws: Any, _s3_bucket: str) -> None:
+            uploaded.append((file_content, s3_key))
+
+        monkeypatch.setattr(sandbox_module, "_exec", fake_exec)
+        monkeypatch.setattr(sandbox_module, "upload_to_s3", fake_upload_to_s3)
+
+        mock_sandbox = Mock()
+        mock_sandbox.id = "sandbox-123"
+        mock_sandbox.name = "task-alias"
+
+        await upload_output_artifacts(
+            mock_sandbox,
+            [
+                OutputArtifact(path="artifacts/config.json", source="/logs/*/turns/init/config.json"),
+                OutputArtifact(path="artifacts/result.json", source="/logs/*/result.json"),
+            ],
+            "benchmark-123",
+            "task_0",
+            harness_config.aws,
+            harness_config.s3_bucket,
+        )
+
+        assert uploaded == [
+            (b'{"llm":{}}\n', "benchmarks/benchmark-123/task_0/artifacts/config.json"),
+            (b'{"turns":[]}\n', "benchmarks/benchmark-123/task_0/artifacts/result.json"),
+        ]
+
+    async def test_upload_output_artifacts_uses_result_paired_with_model_library_config(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        harness_config: Any,
+    ) -> None:
+        uploaded: list[tuple[bytes, str]] = []
+
+        async def fake_exec(_sandbox: Any, command: str) -> ExecuteResponse:
+            if command == "test -f /logs/model-library-run/result.json":
+                return ExecuteResponse(exit_code=0, result="")
+            if command == "stat -c%s /logs/model-library-run/result.json":
+                return ExecuteResponse(exit_code=0, result="13")
+            if command == "base64 /logs/model-library-run/result.json":
+                return ExecuteResponse(exit_code=0, result="eyJ0dXJucyI6W119Cg==")
+            raise AssertionError(f"unexpected command: {command}")
+
+        async def fake_upload_to_s3(file_content: bytes, s3_key: str, _aws: Any, _s3_bucket: str) -> None:
+            uploaded.append((file_content, s3_key))
+
+        monkeypatch.setattr(sandbox_module, "_exec", fake_exec)
+        monkeypatch.setattr(sandbox_module, "upload_to_s3", fake_upload_to_s3)
+
+        mock_sandbox = Mock()
+        mock_sandbox.id = "sandbox-123"
+        mock_sandbox.name = "task-alias"
+
+        await upload_output_artifacts(
+            mock_sandbox,
+            [OutputArtifact(path="artifacts/result.json", source="/logs/model-library-run/result.json")],
+            "benchmark-123",
+            "task_0",
+            harness_config.aws,
+            harness_config.s3_bucket,
+        )
+
+        assert uploaded == [(b'{"turns":[]}\n', "benchmarks/benchmark-123/task_0/artifacts/result.json")]
+
+    async def test_upload_output_artifacts_fails_when_declared_file_is_missing(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        harness_config: Any,
+    ) -> None:
+        artifact = "artifacts/missing.json"
+
+        async def fake_exec(_sandbox: Any, command: str) -> ExecuteResponse:
+            assert command == "test -f /tmp/valkyrie/artifacts/missing.json"
+            return ExecuteResponse(exit_code=1, result="")
+
+        monkeypatch.setattr(sandbox_module, "_exec", fake_exec)
+
+        with pytest.raises(OutputArtifactError, match="Required output artifact missing"):
+            await upload_output_artifacts(Mock(), [artifact], "benchmark-123", "task_0", harness_config.aws, "bucket")
+
+    async def test_upload_output_artifacts_fails_when_file_exceeds_tracker_limit(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        harness_config: Any,
+    ) -> None:
+        artifact = "artifacts/large.json"
+
+        async def fake_exec(_sandbox: Any, command: str) -> ExecuteResponse:
+            if command == "test -f /tmp/valkyrie/artifacts/large.json":
+                return ExecuteResponse(exit_code=0, result="")
+            if command == "stat -c%s /tmp/valkyrie/artifacts/large.json":
+                return ExecuteResponse(exit_code=0, result=str(sandbox_module.MAX_OUTPUT_ARTIFACT_BYTES + 1))
+            raise AssertionError(f"unexpected command: {command}")
+
+        upload_mock = AsyncMock()
+        monkeypatch.setattr(sandbox_module, "_exec", fake_exec)
+        monkeypatch.setattr(sandbox_module, "upload_to_s3", upload_mock)
+
+        with pytest.raises(OutputArtifactError, match="too large"):
+            await upload_output_artifacts(Mock(), [artifact], "benchmark-123", "task_0", harness_config.aws, "bucket")
+
+        upload_mock.assert_not_awaited()
+
+
 class TestAgentOutputTelemetry:
+    async def test_run_agent_uploads_declared_output_artifacts(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        harness_config: Any,
+    ) -> None:
+        contract = AgentContractRequest(
+            name="test-agent",
+            install_cmd="",
+            run_cmd="echo done",
+            final_output="/logs",
+            output_artifacts=["artifacts/result.json"],
+        )
+        artifact_calls: list[str] = []
+
+        async def fake_exec(_sandbox: Any, command: str) -> ExecuteResponse:
+            if command.startswith("mkdir -p") or command == "test -e /logs":
+                return ExecuteResponse(exit_code=0, result="")
+            raise AssertionError(f"unexpected command: {command}")
+
+        async def fake_stream_command_output(*_args: Any, **_kwargs: Any) -> tuple[None, float]:
+            return None, 0.0
+
+        async def fake_upload_output_artifacts(
+            _sandbox: Any,
+            artifacts: list[str],
+            benchmark_id: str,
+            task_id: str,
+            _aws: Any,
+            _s3_bucket: str,
+        ) -> None:
+            artifact_calls.append(f"{benchmark_id}:{task_id}:{artifacts[0]}")
+
+        monkeypatch.setattr(sandbox_module, "_exec", fake_exec)
+        monkeypatch.setattr(sandbox_module, "stream_command_output", fake_stream_command_output)
+        monkeypatch.setattr(sandbox_module, "upload_output_artifacts", fake_upload_output_artifacts)
+
+        mock_sandbox = Mock()
+        mock_sandbox.id = "sandbox-123"
+        mock_sandbox.name = "task-alias"
+
+        await run_agent(
+            mock_sandbox,
+            contract,
+            "/tmp/problem.txt",
+            "task_0",
+            lambda _msg: None,
+            "/testbed",
+            aws=harness_config.aws,
+            s3_bucket=harness_config.s3_bucket,
+            benchmark_id="benchmark-123",
+        )
+
+        assert artifact_calls == ["benchmark-123:task_0:artifacts/result.json"]
+
     async def test_run_agent_threads_benchmark_id_to_archive_and_upload(
         self,
         monkeypatch: pytest.MonkeyPatch,
