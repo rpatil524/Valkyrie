@@ -5,6 +5,7 @@ import time
 import traceback
 from asyncio import Semaphore, gather
 from collections.abc import AsyncGenerator, Buffer, Coroutine
+from contextlib import suppress
 from datetime import datetime
 from enum import Enum
 from functools import cached_property
@@ -14,11 +15,11 @@ from zoneinfo import ZoneInfo
 
 import logfire
 import sentry_sdk
+from benchmark_service import Sandbox, SandboxNotFoundError, SandboxProvider, SandboxQuery
 from benchmark_service.client import BenchmarkServiceClient, BenchmarkServiceError, BenchmarkServiceUnauthenticatedError
-from daytona import AsyncDaytona, AsyncSandbox, ListSandboxesQuery, SandboxState
-from daytona.common.errors import DaytonaNotFoundError, DaytonaRateLimitError
 from fastapi import HTTPException, Request
 from opentelemetry import trace
+from pydantic import ValidationError
 from sqlalchemy import JSON, type_coerce
 from sqlmodel import Session, asc, case, col, delete, desc, func, or_, select, update
 from tenacity import retry as tenacity_retry
@@ -51,8 +52,6 @@ from tracker.database.models import (
 )
 from tracker.database.scoping import scoped_select
 from tracker.database.session import engine
-from tracker.daytona_retry import daytona_retry_callback, wait_daytona_rate_limit
-from pydantic import ValidationError
 from websockets.exceptions import ConnectionClosedError, InvalidStatus
 
 from tracker.exceptions import OutputArtifactError, SandboxSetupError, TrackerServiceError
@@ -77,8 +76,6 @@ logger = get_logger(__name__)
 _SANDBOX_CREATION_CAP: int = 10
 _PTY_TASK_RETRY_LIMIT: int = 1
 _RUNNABLE_TASK_STATUSES = [TaskStatus.PENDING, TaskStatus.BUILDING, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING]
-_DELETED_DAYTONA_SANDBOX_STATES = (SandboxState.DESTROYING, SandboxState.DESTROYED)
-_DAYTONA_LIST_PAGE_SIZE = 100
 
 
 def fetch_daytona_headers(daytona_secret_name: str, aws: AWSCredentials) -> dict[str, str]:
@@ -99,6 +96,7 @@ def fetch_daytona_headers(daytona_secret_name: str, aws: AWSCredentials) -> dict
         raise TrackerServiceError(f"Missing values for the following keys {', '.join(missing_values)}")
 
     return {
+        "x-sandbox-provider": "daytona",
         "x-api-key": secret["DAYTONA_API_KEY"],
         "x-api-url": secret["DAYTONA_API_URL"],
         "x-target": secret["DAYTONA_TARGET"],
@@ -346,7 +344,7 @@ def _commit_task_status(
     if error_message is not None:
         span_attributes["has_error_message"] = True
 
-    with logfire.span("task.status_transition", **span_attributes):
+    with logfire.span("task.status_transition", **span_attributes):  # pyright: ignore[reportArgumentType]
         task.status = to_status
         if error_message is not None:
             task.error_message = error_message
@@ -461,6 +459,7 @@ async def process_task(
                     task_in_session = fetch_task_row(task_row.id, task_session, org)
                     if task_in_session.task_breakdown:
                         existing_breakdown = task_session.get(TaskBreakdown, task_in_session.task_breakdown)
+                        assert existing_breakdown is not None
                         existing_breakdown.evaluation_run_duration = resume_eval_duration
                     commit_task_status_transition(task_row.id, task_session, org, TaskStatus.FINISHED)
 
@@ -474,6 +473,7 @@ async def process_task(
                 raise e from e
 
         task_data = await benchmark_service.retrieve_task(task_id=task_id, dataset=start_benchmark_request.dataset)
+        sandbox_provider = benchmark_service.get_sandbox_provider()
 
         # Labels that show up in the UI we can use to filter sandboxes
         labels = {
@@ -500,9 +500,9 @@ async def process_task(
 
         start_sandbox_build_time = time.perf_counter()
         async with create_sandbox(
-            daytona=benchmark_service.daytona_client,
+            provider=sandbox_provider,
             sandbox_name=task_row.alias,
-            image=task_data.docker_image,
+            source=task_data.source,
             labels=labels,
             env_vars=env_vars,
             resources=task_data.resources,
@@ -614,6 +614,8 @@ async def process_task(
                     task_session.add(evaluation_result_row)
                     task_in_session = fetch_task_row(task_row.id, task_session, org)
                     existing_breakdown = task_session.get(TaskBreakdown, task_in_session.task_breakdown)
+                    if existing_breakdown is None:
+                        raise TrackerServiceError(f"Missing task breakdown for task {task_row.id}")
                     existing_breakdown.evaluation_run_duration = task_breakdown.evaluation_run_duration
                     existing_breakdown.sandbox_run_duration = task_breakdown.sandbox_run_duration
                     commit_task_status_transition(task_row.id, task_session, org, TaskStatus.FINISHED)
@@ -701,6 +703,8 @@ async def process_task(
         return {task_id: None}
     finally:
         flush_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await flush_task
         buffer_logs(log_queue, stream_key, harness_config.aws, harness_config.log_group, force_flush=True)
 
 
@@ -1267,61 +1271,24 @@ async def initiate_stop_benchmark(benchmark_row: Benchmark, session: Session, fo
         raise TrackerServiceError(f"Unexpected error stopping run {benchmark_row.id}: {str(e)}") from e
 
 
-async def stop_sandbox(sandbox: AsyncSandbox, daytona_client: AsyncDaytona) -> str | None:
+async def stop_sandbox(sandbox: Sandbox, provider: SandboxProvider) -> str | None:
     try:
-        # Wait for the sandbox to be in a valid deletion state
-        await sandbox.wait_for_sandbox_start(timeout=0)
-
-        # Delete the sandbox
-        await delete_sandbox(sandbox, daytona_client)
-
+        await delete_sandbox(sandbox, provider)
         return None
-    except DaytonaNotFoundError:
+    except SandboxNotFoundError:
         logger.warning(f"Sandbox `{sandbox.name}` has already been terminated")
         return None
     except Exception as e:
         return f"{str(e)}: {traceback.format_exc()}"
 
 
-async def fetch_sandboxes(benchmark_row: Benchmark, daytona_client: AsyncDaytona) -> AsyncGenerator[AsyncSandbox, None]:
-    """Stream the benchmark's still-active sandboxes.
-
-    Not retry-decorated: @retry is a no-op on an async generator (it wraps only construction,
-    not iteration). Rate-limit retries belong on a consuming coroutine; see _stop_active_sandboxes.
+async def sandbox_generator(benchmark_row: Benchmark, provider: SandboxProvider) -> AsyncGenerator[Sandbox, None]:
     """
-    async for sandbox in daytona_client.list(
-        ListSandboxesQuery(
-            labels={"Benchmark": benchmark_row.name, "Id": str(benchmark_row.id)},
-            limit=_DAYTONA_LIST_PAGE_SIZE,
-        )
-    ):
-        if sandbox.state not in _DELETED_DAYTONA_SANDBOX_STATES:
-            yield sandbox
-
-
-@tenacity_retry(
-    retry=retry_if_exception_type(DaytonaRateLimitError),
-    stop=stop_after_attempt(5),
-    wait=wait_daytona_rate_limit(non_rate_limit_wait=wait_fixed(0)),
-    before_sleep=daytona_retry_callback("valkyrie.sandbox.list", op="sandbox.list"),
-    reraise=True,
-)
-async def _stop_active_sandboxes(
-    benchmark_row: Benchmark,
-    daytona_client: AsyncDaytona,
-    results: dict[str, str | None],
-    attempted: set[str],
-) -> None:
-    """Stop each active sandbox as the cursor yields it, recording per-sandbox outcomes.
-
-    `attempted` (kept across retries) skips already-handled sandboxes, so a rate-limit retry
-    restarts the pass without re-stopping anything or looping forever on an undeletable sandbox.
+    Generator that yields all sandboxes for a given benchmark.
     """
-    async for sandbox in fetch_sandboxes(benchmark_row, daytona_client):
-        if sandbox.id in attempted:
-            continue
-        attempted.add(sandbox.id)
-        results[sandbox.name] = await stop_sandbox(sandbox, daytona_client)
+    query = SandboxQuery(labels={"Benchmark": benchmark_row.name, "Id": str(benchmark_row.id)})
+    async for sandbox in provider.list_sandboxes(query):
+        yield sandbox
 
 
 async def force_stop_sandboxes(
@@ -1334,48 +1301,49 @@ async def force_stop_sandboxes(
     Raises:
         TrackerServiceError: If there are any errors stopping the sandboxes
     """
-    daytona_client: AsyncDaytona = benchmark_row.benchmark_service(daytona_secret_name, aws).daytona_client
+    benchmark_service = benchmark_row.benchmark_service(daytona_secret_name, aws)
+    provider = benchmark_service.get_sandbox_provider()
 
+    # Update all tasks being processed to stopped
+    session.exec(
+        update(Task)
+        .where(col(Task.benchmark) == benchmark_row.id)
+        .where(col(Task.org_id) == org.id)
+        .where(col(Task.status).in_([TaskStatus.BUILDING, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING]))
+        .values(status=TaskStatus.STOPPED)
+    )
+
+    session.commit()
+
+    # Iterate through each running sandbox and stop it, collecting error messages
+    results: dict[str, str | None] = {}
     try:
-        # Update all tasks being processed to stopped
-        session.exec(
-            update(Task)
-            .where(col(Task.benchmark) == benchmark_row.id)
-            .where(col(Task.org_id) == org.id)
-            .where(col(Task.status).in_([TaskStatus.BUILDING, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING]))
-            .values(status=TaskStatus.STOPPED)
-        )
+        async for sandbox in sandbox_generator(benchmark_row, provider):
+            result = await stop_sandbox(sandbox, provider)
+            results[sandbox.name] = result
+    finally:
+        await benchmark_service.close()
 
+    error_message: str = "\n".join(
+        f"{task_alias}: {error_message}" for task_alias, error_message in results.items() if error_message
+    )
+
+    # If all tasks are already in a stopped state, we need to update the final status here since the worker has exited
+    finished_statuses: list[TaskStatus] = [TaskStatus.FINISHED, TaskStatus.ERROR, TaskStatus.STOPPED]
+    tasks_still_running: int = session.exec(
+        select(func.count(col(Task.id)))
+        .where(col(Task.benchmark) == benchmark_row.id)
+        .where(col(Task.org_id) == org.id)
+        .where(col(Task.status).notin_(finished_statuses))
+    ).one()
+
+    if not tasks_still_running:
+        benchmark_row.status = BenchmarkStatus.STOPPED
+        session.add(benchmark_row)
         session.commit()
 
-        # Stream the running sandboxes and stop each as it is yielded, collecting error messages.
-        # The retried coroutine streams + deletes in one pass; `attempted` dedupes across retries.
-        results: dict[str, str | None] = {}
-        attempted: set[str] = set()
-        await _stop_active_sandboxes(benchmark_row, daytona_client, results, attempted)
-
-        error_message: str = "\n".join(
-            f"{task_alias}: {error_message}" for task_alias, error_message in results.items() if error_message
-        )
-
-        # If all tasks are already in a stopped state, we need to update the final status here since the worker has exited
-        finished_statuses: list[TaskStatus] = [TaskStatus.FINISHED, TaskStatus.ERROR, TaskStatus.STOPPED]
-        tasks_still_running: int = session.exec(
-            select(func.count(col(Task.id)))
-            .where(col(Task.benchmark) == benchmark_row.id)
-            .where(col(Task.org_id) == org.id)
-            .where(col(Task.status).notin_(finished_statuses))
-        ).one()
-
-        if not tasks_still_running:
-            benchmark_row.status = BenchmarkStatus.STOPPED
-            session.add(benchmark_row)
-            session.commit()
-
-        if error_message:
-            raise TrackerServiceError(f"Unexpected errors stopping sandboxes:\n{error_message}")
-    finally:
-        await daytona_client.close()
+    if error_message:
+        raise TrackerServiceError(f"Unexpected errors stopping sandboxes:\n{error_message}")
 
 
 async def reset_to_in_progress_status(

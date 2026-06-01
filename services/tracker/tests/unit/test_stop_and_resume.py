@@ -41,11 +41,6 @@ from tracker.utils import (
 client = TestClient(app)
 
 
-async def _empty_async_iter():
-    if False:
-        yield None
-
-
 class TestStopAndResume:
     _test_org = Org(id=TEST_ORG_ID, name="default")
     _test_starter = RequestIdentity(org=_test_org, access_key_id=None, email=None, name=None)
@@ -430,19 +425,24 @@ class TestStopAndResume:
             return {"score": 1.0}
 
         monkeypatch.setattr("tracker.utils.engine", database_session.bind)
+        monkeypatch.setattr("tracker.utils.buffer_logs", Mock())
         monkeypatch.setattr("tracker.utils.create_sandbox", _unexpected_create_sandbox)
         monkeypatch.setattr(BenchmarkServiceClient, "resume_evaluation", _mock_resume_evaluation, raising=False)
 
-        result = await process_task(
-            task_row,
-            request,
-            request.benchmark_service,
-            benchmark_row.id,
-            task_row.task_id,
-            harness_config,
-            self._test_org,
-            creation_semaphore=asyncio.Semaphore(1),
-        )
+        benchmark_service = request.benchmark_service
+        try:
+            result = await process_task(
+                task_row,
+                request,
+                benchmark_service,
+                benchmark_row.id,
+                task_row.task_id,
+                harness_config,
+                self._test_org,
+                creation_semaphore=asyncio.Semaphore(1),
+            )
+        finally:
+            await benchmark_service.close()
 
         database_session.refresh(task_row)
         evaluation = database_session.exec(select(EvaluationResult).where(EvaluationResult.task == task_row.id)).one()
@@ -496,18 +496,23 @@ class TestStopAndResume:
             raise RuntimeError("evaluation interrupted")
 
         monkeypatch.setattr("tracker.utils.engine", database_session.bind)
+        monkeypatch.setattr("tracker.utils.buffer_logs", Mock())
         monkeypatch.setattr(BenchmarkServiceClient, "resume_evaluation", _mock_resume_evaluation, raising=False)
 
-        result = await process_task(
-            task_row,
-            request,
-            request.benchmark_service,
-            benchmark_row.id,
-            task_row.task_id,
-            harness_config,
-            self._test_org,
-            creation_semaphore=asyncio.Semaphore(1),
-        )
+        benchmark_service = request.benchmark_service
+        try:
+            result = await process_task(
+                task_row,
+                request,
+                benchmark_service,
+                benchmark_row.id,
+                task_row.task_id,
+                harness_config,
+                self._test_org,
+                creation_semaphore=asyncio.Semaphore(1),
+            )
+        finally:
+            await benchmark_service.close()
 
         database_session.refresh(task_row)
         evaluations = database_session.exec(select(EvaluationResult).where(EvaluationResult.task == task_row.id)).all()
@@ -830,13 +835,19 @@ class TestStopAndResume:
         await initiate_stop_benchmark(benchmark_row, database_session, force=True, org=self._test_org)
         assert benchmark_row.status == BenchmarkStatus.STOPPING
 
-        # Mock daytona client since its not required
-        mock_daytona = AsyncMock()
-        mock_daytona.list = Mock(return_value=_empty_async_iter())
+        async def _empty_list_sandboxes(*_args: Any, **_kwargs: Any):
+            if False:
+                yield None
+
+        mock_provider = Mock()
+        mock_provider.list_sandboxes = _empty_list_sandboxes
+        mock_service = Mock()
+        mock_service.get_sandbox_provider.return_value = mock_provider
+        mock_service.close = AsyncMock()
         monkeypatch.setattr(
             Benchmark,
             "benchmark_service",
-            lambda *_args, **_kwargs: Mock(daytona_client=mock_daytona),  # type: ignore
+            lambda *_args, **_kwargs: mock_service,  # type: ignore
         )
 
         # Force stopping the sandboxes results in the benchmark row being stopped
