@@ -17,10 +17,12 @@ from tracker.utils import force_stop_sandboxes, process_benchmark
 
 logger = get_logger(__name__)
 
+_DEAD_STATES = {"destroying", "destroyed", "stopped", "error"}
+
 
 async def _sandboxes_for_benchmark(benchmark: Benchmark, provider: SandboxProvider):
     query = SandboxQuery(labels={"Benchmark": benchmark.name, "Id": str(benchmark.id)})
-    return [sandbox async for sandbox in provider.list_sandboxes(query)]
+    return [sandbox async for sandbox in provider.list_sandboxes(query) if sandbox.state not in _DEAD_STATES]
 
 
 class TestForceStop:
@@ -73,16 +75,18 @@ class TestForceStop:
                 Org(id=TEST_ORG_ID, name="default"),
             )
 
+        created_sandbox_name: list[str] = []
+
         async def _generator_to_courtine():
             async with create_sandbox(
                 provider,
-                task.alias,
+                task.task_id,
                 ImageSource(image=test_image),
                 resources=test_resources,
                 creation_semaphore=creation_semaphore,
                 labels=labels,
-            ) as _:
-                pass
+            ) as sandbox:
+                created_sandbox_name.append(sandbox.name)
 
         # Start sandbox and immediately try to stop it, expected to wait until its started to delete
         await asyncio.gather(
@@ -96,7 +100,7 @@ class TestForceStop:
 
         # Ensure that the sandbox does not exist anymore
         with pytest.raises(Exception):
-            await provider.get_sandbox(task.alias)
+            await provider.get_sandbox(created_sandbox_name[0])
 
     async def test_force_stop_sandboxes(
         self,
@@ -151,7 +155,8 @@ class TestForceStop:
         # Test force_stop_sandboxes util by running all 12 sandboxes in parallel and
         # See if we can close them all
         created_sandboxes = asyncio.gather(
-            *[asyncio.create_task(create_sandbox_with_delay(task.alias)) for task in tasks]
+            *[asyncio.create_task(create_sandbox_with_delay(task.task_id)) for task in tasks],
+            return_exceptions=True,
         )
 
         # Pause for 2 seconds to ensure that the sandboxes are being created
