@@ -24,6 +24,7 @@ from sqlalchemy import JSON, type_coerce
 from sqlmodel import Session, asc, case, col, delete, desc, func, or_, select, update
 from tenacity import retry as tenacity_retry
 from tenacity import retry_if_exception_type, stop_after_attempt, wait_fixed
+from websockets.exceptions import ConnectionClosedError, InvalidStatus
 
 from tracker._lambda import invoke_lambda, lambda_client
 from tracker.auth import RequestIdentity
@@ -52,8 +53,6 @@ from tracker.database.models import (
 )
 from tracker.database.scoping import scoped_select
 from tracker.database.session import engine
-from websockets.exceptions import ConnectionClosedError, InvalidStatus
-
 from tracker.exceptions import OutputArtifactError, SandboxSetupError, TrackerServiceError
 from tracker.logging import get_logger, task_id_var
 from tracker.notifications import NotificationContext, SlackNotifier
@@ -433,6 +432,11 @@ async def process_task(
     def on_eval_resume_state(state: dict[str, Any]) -> None:
         save_eval_resume_state(task_row.id, org, state)
 
+    def task_is_stopped() -> bool:
+        with Session(bind=engine) as task_session:
+            task = fetch_task_row(task_row.id, task_session, org)
+            return task.status == TaskStatus.STOPPED
+
     try:
         if task_row.status == TaskStatus.EVALUATING and task_row.eval_resume_state is not None:
             try:
@@ -632,9 +636,13 @@ async def process_task(
                 raise
 
     except SandboxSetupError as e:
+        if task_is_stopped():
+            return {task_id: None}
         log_output(f"\n[ERROR] {e}")
         raise
     except OutputArtifactError as e:
+        if task_is_stopped():
+            return {task_id: None}
         error_message = str(e)
         logger.warning(error_message)
         log_output(f"\n[ERROR] {error_message}")
@@ -645,6 +653,8 @@ async def process_task(
 
         return {task_id: None}
     except ConnectionClosedError:
+        if task_is_stopped():
+            return {task_id: None}
         seconds = int(time.monotonic() - last_log_time)
         error_message = (
             f"Benchmark service has not sent a message, causing the connection to disconnect: "
@@ -659,6 +669,8 @@ async def process_task(
 
         return {task_id: None}
     except ValidationError as e:
+        if task_is_stopped():
+            return {task_id: None}
         field_names = ", ".join(".".join(str(loc) for loc in err["loc"]) for err in e.errors())
         error_message = (
             f"Benchmark service returned an incompatible task response. Missing or invalid fields: {field_names}"
@@ -671,6 +683,8 @@ async def process_task(
 
         return {task_id: None}
     except InvalidStatus as e:
+        if task_is_stopped():
+            return {task_id: None}
         error_message = f"Benchmark service rejected the WebSocket connection (HTTP {e.response.status_code})"
         log_output(f"\n[ERROR] {error_message}")
 
@@ -680,6 +694,8 @@ async def process_task(
 
         return {task_id: None}
     except BenchmarkServiceError as e:
+        if task_is_stopped():
+            return {task_id: None}
         error_message = str(e)
         log_output(f"\n[ERROR] {error_message}")
 
@@ -689,6 +705,8 @@ async def process_task(
 
         return {task_id: None}
     except Exception as e:
+        if task_is_stopped():
+            return {task_id: None}
         logfire.exception("process_task failed")
         error_message = str(e)
         logger.error(error_message, exc_info=True)
@@ -793,6 +811,18 @@ def has_runnable_tasks(session: Session, benchmark_row: Benchmark, org: Org) -> 
             .where(Task.benchmark == benchmark_row.id)
             .where(Task.org_id == org.id)
             .where(col(Task.status).in_(_RUNNABLE_TASK_STATUSES))
+        ).first()
+        is not None
+    )
+
+
+def has_stopped_tasks(session: Session, benchmark_row: Benchmark, org: Org) -> bool:
+    return (
+        session.exec(
+            select(Task.id)
+            .where(Task.benchmark == benchmark_row.id)
+            .where(Task.org_id == org.id)
+            .where(Task.status == TaskStatus.STOPPED)
         ).first()
         is not None
     )
@@ -917,7 +947,12 @@ async def process_benchmark(
                 return
             evaluation_results = fetch_final_score_inputs(session, benchmark_row, org)
 
-        if not evaluation_results:
+        if not any(result is not None for result in evaluation_results.values()):
+            with Session(bind=engine) as session:
+                benchmark_row = fetch_benchmark_row(benchmark_id, session, org)
+                if has_stopped_tasks(session, benchmark_row, org):
+                    set_benchmark_final_status(benchmark_row, session, org)
+                    return
             raise TrackerServiceError("No tasks were completed successfully")
 
         # Calculate the final score based off the tasks that were ran
