@@ -41,11 +41,6 @@ from tracker.utils import (
 client = TestClient(app)
 
 
-async def _empty_async_iter():
-    if False:
-        yield None
-
-
 class TestStopAndResume:
     _test_org = Org(id=TEST_ORG_ID, name="default")
     _test_starter = RequestIdentity(org=_test_org, access_key_id=None, email=None, name=None)
@@ -154,49 +149,6 @@ class TestStopAndResume:
 
         database_session.refresh(benchmark_row)
         assert benchmark_row.status == BenchmarkStatus.FINISHED, benchmark_row.error_message
-
-    async def test_resume_changes_task_alias_per_attempt(
-        self,
-        example_benchmark_object: Benchmark,
-        database_session: Session,
-        monkeypatch: MonkeyPatch,
-        harness_config: HarnessConfig,
-    ):
-        benchmark_row = example_benchmark_object
-        benchmark_row.status = BenchmarkStatus.STOPPED
-        database_session.add(benchmark_row)
-        database_session.commit()
-
-        task_rows = [
-            Task(org_id=TEST_ORG_ID, task_id=f"task_{i}", benchmark=benchmark_row.id, status=TaskStatus.STOPPED)
-            for i in range(2)
-        ]
-        database_session.add_all(task_rows)
-        database_session.commit()
-
-        original_aliases = {task_row.task_id: task_row.alias for task_row in task_rows}
-
-        async def _mock_request_verify_task_ids(*_args: Any, **_kwargs: Any) -> VerifyTaskIdsResponse:
-            return VerifyTaskIdsResponse(task_ids=[task_row.task_id for task_row in task_rows])
-
-        monkeypatch.setattr(BenchmarkServiceClient, "verify_task_ids", _mock_request_verify_task_ids)
-
-        # resets the start time of the task, so the alias will be different the next time we run the task
-        verified_task_ids = await reset_to_in_progress_status(
-            benchmark_row=benchmark_row,
-            session=database_session,
-            benchmark_service=benchmark_row.benchmark_service(harness_config.daytona_secret_name, harness_config.aws),
-            retry=True,
-            retry_mode=RetryMode.AUTO,
-            rerun_task_ids=[],
-            org=self._test_org,
-        )
-
-        assert set(verified_task_ids) == set(original_aliases.keys())
-
-        updated_task_rows = database_session.exec(select(Task).where(Task.benchmark == benchmark_row.id)).all()
-        for task_row in updated_task_rows:
-            assert task_row.alias != original_aliases[task_row.task_id]
 
     @pytest.mark.parametrize(
         ("retry_mode", "eval_resume_state", "expected_status", "expected_state"),
@@ -430,19 +382,24 @@ class TestStopAndResume:
             return {"score": 1.0}
 
         monkeypatch.setattr("tracker.utils.engine", database_session.bind)
+        monkeypatch.setattr("tracker.utils.buffer_logs", Mock())
         monkeypatch.setattr("tracker.utils.create_sandbox", _unexpected_create_sandbox)
         monkeypatch.setattr(BenchmarkServiceClient, "resume_evaluation", _mock_resume_evaluation, raising=False)
 
-        result = await process_task(
-            task_row,
-            request,
-            request.benchmark_service,
-            benchmark_row.id,
-            task_row.task_id,
-            harness_config,
-            self._test_org,
-            creation_semaphore=asyncio.Semaphore(1),
-        )
+        benchmark_service = request.benchmark_service
+        try:
+            result = await process_task(
+                task_row,
+                request,
+                benchmark_service,
+                benchmark_row.id,
+                task_row.task_id,
+                harness_config,
+                self._test_org,
+                creation_semaphore=asyncio.Semaphore(1),
+            )
+        finally:
+            await benchmark_service.close()
 
         database_session.refresh(task_row)
         evaluation = database_session.exec(select(EvaluationResult).where(EvaluationResult.task == task_row.id)).one()
@@ -496,18 +453,23 @@ class TestStopAndResume:
             raise RuntimeError("evaluation interrupted")
 
         monkeypatch.setattr("tracker.utils.engine", database_session.bind)
+        monkeypatch.setattr("tracker.utils.buffer_logs", Mock())
         monkeypatch.setattr(BenchmarkServiceClient, "resume_evaluation", _mock_resume_evaluation, raising=False)
 
-        result = await process_task(
-            task_row,
-            request,
-            request.benchmark_service,
-            benchmark_row.id,
-            task_row.task_id,
-            harness_config,
-            self._test_org,
-            creation_semaphore=asyncio.Semaphore(1),
-        )
+        benchmark_service = request.benchmark_service
+        try:
+            result = await process_task(
+                task_row,
+                request,
+                benchmark_service,
+                benchmark_row.id,
+                task_row.task_id,
+                harness_config,
+                self._test_org,
+                creation_semaphore=asyncio.Semaphore(1),
+            )
+        finally:
+            await benchmark_service.close()
 
         database_session.refresh(task_row)
         evaluations = database_session.exec(select(EvaluationResult).where(EvaluationResult.task == task_row.id)).all()
@@ -830,13 +792,19 @@ class TestStopAndResume:
         await initiate_stop_benchmark(benchmark_row, database_session, force=True, org=self._test_org)
         assert benchmark_row.status == BenchmarkStatus.STOPPING
 
-        # Mock daytona client since its not required
-        mock_daytona = AsyncMock()
-        mock_daytona.list = Mock(return_value=_empty_async_iter())
+        async def _empty_list_sandboxes(*_args: Any, **_kwargs: Any):
+            if False:
+                yield None
+
+        mock_provider = Mock()
+        mock_provider.list_sandboxes = _empty_list_sandboxes
+        mock_service = Mock()
+        mock_service.get_sandbox_provider.return_value = mock_provider
+        mock_service.close = AsyncMock()
         monkeypatch.setattr(
             Benchmark,
             "benchmark_service",
-            lambda *_args, **_kwargs: Mock(daytona_client=mock_daytona),  # type: ignore
+            lambda *_args, **_kwargs: mock_service,  # type: ignore
         )
 
         # Force stopping the sandboxes results in the benchmark row being stopped

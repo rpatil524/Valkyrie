@@ -1,5 +1,7 @@
 """Constants for infrastructure configuration."""
 
+import os
+
 # VPC
 VPC_CIDR = "10.0.0.0/16"
 VPC_MAX_AZS = 2
@@ -67,5 +69,23 @@ ALB_IDLE_TIMEOUT_SECONDS = 60
 S3_BUCKET_NAME = "agentic-harness"
 
 # Slack notifications
-SLACK_WORKSPACE_ID = "T05929786PK"
-SLACK_CHANNEL_ID = "C0AF4987EF6"
+SLACK_WORKSPACE_ID_ENV = "SLACK_WORKSPACE_ID"
+VALKYRIE_ALERTS_SLACK_CHANNEL_ID_ENV = "VALKYRIE_ALERTS_SLACK_CHANNEL_ID"
+DEPLOYMENT_NOTIFICATIONS_SLACK_CHANNEL_ID_ENV = "DEPLOYMENT_NOTIFICATIONS_SLACK_CHANNEL_ID"
+
+
+def get_slack_notification_config(channel_id_env_var: str) -> tuple[str, str] | None:
+    workspace_id = os.environ.get(SLACK_WORKSPACE_ID_ENV)
+    channel_id = os.environ.get(channel_id_env_var)
+
+    if channel_id and workspace_id:
+        return workspace_id, channel_id
+
+    if not channel_id:
+        return None
+
+    raise RuntimeError(
+        "Incomplete Slack notification environment configuration. "
+        f"Set {SLACK_WORKSPACE_ID_ENV} when setting {channel_id_env_var}. "
+        f"Missing: {SLACK_WORKSPACE_ID_ENV}"
+    )
