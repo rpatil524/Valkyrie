@@ -29,7 +29,6 @@ if TYPE_CHECKING:
     from benchmark_service.client import BenchmarkServiceClient
 
     from tracker.types import (
-        AWSCredentials,
         BenchmarkTableRow,
         FetchBenchmarkMetadataResponse,
         HarnessConfig,
@@ -162,6 +161,8 @@ class BenchmarkArguments(BaseModel):
     slice_str: str | None = None
     lambda_function: str | None = None
     dataset: str | None = None
+    sandbox_provider: str = "daytona"
+    sandbox_provider_secret_name: str | None = None
 
 
 class FinalEvaluation(SQLModel, table=True):
@@ -278,22 +279,20 @@ class Benchmark(SQLModel, table=True):
             lambda_function=self.arguments.lambda_function,
             dataset=self.arguments.dataset,
             harness_config=harness_config,
+            sandbox_provider=self.arguments.sandbox_provider,
+            sandbox_provider_secret_name=self.arguments.sandbox_provider_secret_name,
             custom_benchmark_service=self.custom_benchmark_service,
             webhook_secret_name=self.webhook_secret_name,
             webhook_intervals=self.webhook_intervals,
             service_headers=service_headers or {},
         )
 
-    def benchmark_service(
-        self, daytona_secret_name: str, aws: "AWSCredentials", service_headers: dict[str, str] | None = None
-    ) -> "BenchmarkServiceClient":
+    def benchmark_service(self, service_headers: dict[str, str] | None = None) -> "BenchmarkServiceClient":
         from tracker.config import create_benchmark_service_url
         from tracker.utils import create_benchmark_service_client
 
         url = self.custom_benchmark_service or create_benchmark_service_url(self.name)
-        return create_benchmark_service_client(
-            url=url, daytona_secret_name=daytona_secret_name, aws=aws, service_headers=service_headers
-        )
+        return create_benchmark_service_client(url=url, service_headers=service_headers)
 
     @property
     def benchmark_metadata(self) -> "FetchBenchmarkMetadataResponse":

@@ -17,7 +17,13 @@ from tracker.auth import RequestIdentity
 from tracker.database.models import AgentContractRequest, BenchmarkStatus, Org, Task, TaskStatus
 from tracker.exceptions import OutputArtifactError
 from tracker.types import HarnessConfig, StartBenchmarkRequest
-from tracker.utils import fetch_benchmark_row, process_benchmark, process_task, start_benchmark_request_to_benchmark
+from tracker.utils import (
+    fetch_benchmark_row,
+    fetch_sandbox_provider_config,
+    process_benchmark,
+    process_task,
+    start_benchmark_request_to_benchmark,
+)
 
 
 class TestBenchmarkServiceDisconnect:
@@ -66,6 +72,11 @@ class TestBenchmarkServiceDisconnect:
             task_id="task_0",
             harness_config=harness_config,
             org=self._test_org,
+            sandbox_provider_config=fetch_sandbox_provider_config(
+                harness_config.sandbox_provider_secret_name,
+                harness_config.aws,
+                start_benchmark_request.sandbox_provider,
+            ),
             creation_semaphore=Semaphore(1),
         )
 

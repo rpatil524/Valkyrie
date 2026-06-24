@@ -25,16 +25,16 @@ from tracker.database.models import (
     TaskStatus,
 )
 from tracker.exceptions import TrackerServiceError
-from tracker.types import FetchBenchmarksRequest, HarnessConfig, StartBenchmarkRequest
+from tracker.types import AWSCredentials, FetchBenchmarksRequest, HarnessConfig, StartBenchmarkRequest
 from tracker.utils import (
     _parse_log_retention_policy,
     commit_task_error,
     create_task_rows,
-    fetch_daytona_headers,
     fetch_benchmark_row,
     fetch_harness_config,
-    fetch_final_score_inputs,
     fetch_filtered_benchmark_rows,
+    fetch_final_score_inputs,
+    fetch_sandbox_provider_config,
     has_runnable_tasks,
     set_benchmark_final_status,
     start_benchmark_request_to_benchmark,
@@ -45,23 +45,33 @@ class TestBenchmarkUtils:
     _test_org = Org(id=TEST_ORG_ID, name="default")
     _test_starter = RequestIdentity(org=_test_org, access_key_id=None, email=None, name=None)
 
-    def test_fetch_daytona_headers_sets_provider(
+    def test_fetch_sandbox_provider_config_combines_provider_type_with_secret(
         self, harness_config: HarnessConfig, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr(
-            "tracker.utils.fetch_aws_secret",
-            lambda *_args, **_kwargs: {
+        """Sandbox provider config should combine client-selected type with the production secret shape.
+
+        Test cases:
+        - A selected provider type is added to DAYTONA_* secret values.
+        """
+        secrets = {
+            "provider-secret": {
                 "DAYTONA_API_KEY": "key",
                 "DAYTONA_API_URL": "url",
                 "DAYTONA_TARGET": "target",
             },
-        )
+        }
 
-        assert fetch_daytona_headers(harness_config.daytona_secret_name, harness_config.aws) == {
-            "x-sandbox-provider": "daytona",
-            "x-api-key": "key",
-            "x-api-url": "url",
-            "x-target": "target",
+        def fetch_secret(name: str, _aws: AWSCredentials) -> dict[str, str]:
+            return secrets[name]
+
+        monkeypatch.setattr("tracker.utils.fetch_aws_secret", fetch_secret)
+
+        provider_config = fetch_sandbox_provider_config("provider-secret", harness_config.aws, "daytona")
+        assert provider_config.model_dump(mode="json") == {
+            "type": "daytona",
+            "DAYTONA_API_KEY": "key",
+            "DAYTONA_API_URL": "url",
+            "DAYTONA_TARGET": "target",
         }
 
     async def _mock_request_final_score(
@@ -291,12 +301,16 @@ class TestBenchmarkUtils:
             task_ids=["task_0", "task_1", "task_2", "task_3", "task_4"],
             slice_str=":10",
             harness_config=harness_config,
+            sandbox_provider_secret_name="ignored-request-secret",
         )
 
         benchmark_row = start_benchmark_request_to_benchmark(original_start_benchmark_request, self._test_starter)
+        assert benchmark_row.arguments.sandbox_provider_secret_name == harness_config.sandbox_provider_secret_name
 
         recreated_start_benchmark_request = benchmark_row.start_benchmark_request(harness_config)
-        assert recreated_start_benchmark_request == original_start_benchmark_request
+        assert recreated_start_benchmark_request == original_start_benchmark_request.model_copy(
+            update={"sandbox_provider_secret_name": harness_config.sandbox_provider_secret_name}
+        )
 
         # Assert we have 5 tasks in the database
         task_rows = database_session.exec(select(Task).where(col(Task.benchmark) == example_benchmark_object.id)).all()
@@ -596,7 +610,10 @@ def test_fetch_filtered_started_by_multiple(database_session: Session, contract:
         org,
     )
     assert total == 2
-    assert sorted(r.started_by_email for r in rows) == ["alice@vals.ai", "bob@vals.ai"]
+    assert sorted(email for r in rows if (email := r.started_by_email) is not None) == [
+        "alice@vals.ai",
+        "bob@vals.ai",
+    ]
 
 
 def test_fetch_filtered_started_by_case_insensitive(database_session: Session, contract: AgentContractRequest):

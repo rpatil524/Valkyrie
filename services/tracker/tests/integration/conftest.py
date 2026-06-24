@@ -22,7 +22,7 @@ from tracker.database.models import *  # noqa: F403 # type: ignore[attr-defined]
 from tracker.database.models import DEFAULT_ORG_NAME, Org
 from tracker.database.session import get_session
 from tracker.types import AWSCredentials, HarnessConfig
-from tracker.utils import create_benchmark_service_client, fetch_harness_config
+from tracker.utils import create_benchmark_service_client, fetch_harness_config, fetch_sandbox_provider_config
 
 _ = load_dotenv()
 
@@ -37,7 +37,7 @@ FAKE_HARNESS_CONFIG = HarnessConfig(
     s3_bucket="test-bucket",
     log_group="test-log-group",
     log_retention_policy=30,
-    daytona_secret_name="test-daytona-secret",
+    sandbox_provider_secret_name="test-daytona-secret",
 )
 
 
@@ -172,7 +172,7 @@ def harness_config(daytona_secret_name: str, aws_credentials: AWSCredentials) ->
     log_retention_policy = int(os.getenv("TEST_LOG_RETENTION") or 1)
 
     return HarnessConfig(
-        daytona_secret_name=daytona_secret_name,
+        sandbox_provider_secret_name=daytona_secret_name,
         aws=aws_credentials,
         log_group=log_group,
         log_retention_policy=log_retention_policy,
@@ -192,13 +192,9 @@ def creation_semaphore() -> Semaphore:
 
 
 @pytest.fixture(scope="function")
-async def benchmark_service(
-    daytona_secret_name: str, aws_credentials: AWSCredentials, service_headers: dict[str, str]
-) -> AsyncGenerator[BenchmarkServiceClient, None]:
+async def benchmark_service(service_headers: dict[str, str]) -> AsyncGenerator[BenchmarkServiceClient, None]:
     service = create_benchmark_service_client(
         url=create_benchmark_service_url("swebench"),
-        daytona_secret_name=daytona_secret_name,
-        aws=aws_credentials,
         service_headers=service_headers,
     )
 
@@ -209,8 +205,13 @@ async def benchmark_service(
 
 
 @pytest.fixture
-async def sandbox_provider(benchmark_service: BenchmarkServiceClient) -> AsyncGenerator[SandboxProvider, None]:
-    yield benchmark_service.get_sandbox_provider()
+async def sandbox_provider(
+    benchmark_service: BenchmarkServiceClient,
+    daytona_secret_name: str,
+    aws_credentials: AWSCredentials,
+) -> AsyncGenerator[SandboxProvider, None]:
+    provider_config = fetch_sandbox_provider_config(daytona_secret_name, aws_credentials, "daytona")
+    yield benchmark_service.get_sandbox_provider(provider_config)
 
 
 @pytest.fixture

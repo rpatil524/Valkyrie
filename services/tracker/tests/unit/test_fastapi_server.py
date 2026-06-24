@@ -137,6 +137,7 @@ class TestFastapiServer:
             concurrency=request.concurrency,
             task_ids=None,
             slice_str=None,
+            sandbox_provider_secret_name=harness_config.sandbox_provider_secret_name,
         )
 
         # Test case 3. Start timestamp is in UTC timezone and matches the benchmark row
@@ -1042,5 +1043,5 @@ class TestFastapiServer:
                 s3_bucket="test-bucket",
                 log_group="test-log-group",
                 log_retention_policy=30,
-                daytona_secret_name="test-daytona-secret",
+                sandbox_provider_secret_name="test-daytona-secret",
             )

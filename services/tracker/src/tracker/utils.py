@@ -16,7 +16,14 @@ from zoneinfo import ZoneInfo
 
 import logfire
 import sentry_sdk
-from benchmark_service import Sandbox, SandboxNotFoundError, SandboxProvider, SandboxQuery
+from benchmark_service import (
+    Sandbox,
+    SandboxNotFoundError,
+    SandboxProvider,
+    SandboxProviderConfig,
+    SandboxQuery,
+    sandbox_provider_config_from_mapping,
+)
 from benchmark_service.client import BenchmarkServiceClient, BenchmarkServiceError, BenchmarkServiceUnauthenticatedError
 from fastapi import HTTPException, Request
 from opentelemetry import trace
@@ -39,7 +46,7 @@ from tracker.aws.s3 import (
     upload_to_s3,
 )
 from tracker.aws.secrets import fetch_aws_secret, resolve_secrets
-from tracker.config import ENVIRONMENT, broker
+from tracker.config import ENVIRONMENT, broker, create_benchmark_service_url
 from tracker.database.models import (
     Benchmark,
     BenchmarkArguments,
@@ -80,41 +87,30 @@ _PTY_TASK_RETRY_LIMIT: int = 1
 _RUNNABLE_TASK_STATUSES = [TaskStatus.PENDING, TaskStatus.BUILDING, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING]
 
 
-def fetch_daytona_headers(daytona_secret_name: str, aws: AWSCredentials) -> dict[str, str]:
-    """Fetch Daytona credentials from AWS Secrets Manager and return as headers for BenchmarkServiceClient."""
-    daytona_keys: list[str] = ["DAYTONA_API_KEY", "DAYTONA_API_URL", "DAYTONA_TARGET"]
-
-    secret = fetch_aws_secret(daytona_secret_name, aws)
-
+def fetch_sandbox_provider_config(secret_name: str, aws: AWSCredentials, provider_type: str) -> SandboxProviderConfig:
+    """Resolve sandbox provider config from the selected provider type and secret."""
+    secret = fetch_aws_secret(secret_name, aws)
     if not isinstance(secret, dict):
-        raise TrackerServiceError(
-            f"Expected Daytona secret to be a JSON object with keys {', '.join(daytona_keys)}, received a string"
-        )
+        raise TrackerServiceError("Expected sandbox provider secret to be a JSON object")
 
-    missing_keys = set(daytona_keys) - set(secret.keys())
-    if missing_keys:
-        raise TrackerServiceError(f"Missing following keys to use daytona {', '.join(missing_keys)}")
-
-    missing_values = [key for key, value in secret.items() if not value]
-    if missing_values:
-        raise TrackerServiceError(f"Missing values for the following keys {', '.join(missing_values)}")
-
-    return {
-        "x-sandbox-provider": "daytona",
-        "x-api-key": secret["DAYTONA_API_KEY"],
-        "x-api-url": secret["DAYTONA_API_URL"],
-        "x-target": secret["DAYTONA_TARGET"],
-    }
+    return sandbox_provider_config_from_mapping({**secret, "type": provider_type})
 
 
 def create_benchmark_service_client(
-    url: str, daytona_secret_name: str, aws: AWSCredentials, service_headers: dict[str, str] | None = None
+    url: str,
+    service_headers: dict[str, str] | None = None,
 ) -> BenchmarkServiceClient:
-    """Create a BenchmarkServiceClient using Daytona credentials from AWS Secrets Manager."""
-    headers = fetch_daytona_headers(daytona_secret_name, aws)
+    """Create a BenchmarkServiceClient with benchmark-service headers."""
+    headers: dict[str, str] = {}
     if service_headers:
         headers.update(service_headers)
     return BenchmarkServiceClient(url=url, headers=headers)
+
+
+def create_benchmark_service_client_from_request(request: StartBenchmarkRequest) -> BenchmarkServiceClient:
+    """Create a BenchmarkServiceClient for a start request."""
+    url = request.custom_benchmark_service or create_benchmark_service_url(request.benchmark_name)
+    return create_benchmark_service_client(url, service_headers=request.service_headers)
 
 
 def start_benchmark_request_to_benchmark(request: StartBenchmarkRequest, run_starter: RequestIdentity) -> Benchmark:
@@ -132,6 +128,8 @@ def start_benchmark_request_to_benchmark(request: StartBenchmarkRequest, run_sta
             slice_str=request.slice_str,
             lambda_function=request.lambda_function,
             dataset=request.dataset,
+            sandbox_provider=request.sandbox_provider,
+            sandbox_provider_secret_name=request.harness_config.sandbox_provider_secret_name,
         ),
         started_by_id=run_starter.access_key_id,
         started_by_email=run_starter.email,
@@ -378,6 +376,7 @@ async def process_task(
     task_id: str,
     harness_config: HarnessConfig,
     org: Org,
+    sandbox_provider_config: SandboxProviderConfig,
     creation_semaphore: Semaphore,
 ) -> dict[str, dict[str, Any] | None]:
     """
@@ -485,7 +484,7 @@ async def process_task(
                 raise e from e
 
         task_data = await benchmark_service.retrieve_task(task_id=task_id, dataset=start_benchmark_request.dataset)
-        sandbox_provider = benchmark_service.get_sandbox_provider()
+        sandbox_provider = benchmark_service.get_sandbox_provider(sandbox_provider_config)
 
         # Labels that show up in the UI we can use to filter sandboxes
         labels = {
@@ -549,7 +548,11 @@ async def process_task(
                 # Reset timer to keep the last received message from the benchmarks service accurate
                 last_log_time = time.monotonic()
                 _ = await benchmark_service.setup_task(
-                    task_row.task_id, sandbox.id, on_message=log_output, dataset=start_benchmark_request.dataset
+                    task_row.task_id,
+                    sandbox.id,
+                    on_message=log_output,
+                    dataset=start_benchmark_request.dataset,
+                    sandbox_provider=sandbox_provider_config,
                 )
 
                 # Force flush the logs if anything has been buffered
@@ -585,7 +588,6 @@ async def process_task(
                 )
 
                 task_breakdown.agent_run_duration = agent_run_time
-
                 with Session(bind=engine) as task_session:
                     task_session.add(task_breakdown)
                     task_in_session = fetch_task_row(task_row.id, task_session, org)
@@ -613,8 +615,8 @@ async def process_task(
                     on_message=log_output,
                     on_eval_resume_state=on_eval_resume_state,
                     dataset=start_benchmark_request.dataset,
+                    sandbox_provider=sandbox_provider_config,
                 )
-
                 task_breakdown.evaluation_run_duration = time.perf_counter() - evaluation_start_time
 
                 task_breakdown.sandbox_run_duration = time.perf_counter() - start_sandbox_run_time
@@ -868,8 +870,13 @@ async def process_benchmark(
     # Was serialized to make it compatible with the broker
     start_benchmark_request: StartBenchmarkRequest = StartBenchmarkRequest(**start_benchmark_request_json)
     benchmark_id: UUID = UUID(benchmark_id_str)
-    benchmark_service = start_benchmark_request.benchmark_service
     harness_config: HarnessConfig = start_benchmark_request.harness_config
+    sandbox_provider_config = fetch_sandbox_provider_config(
+        harness_config.sandbox_provider_secret_name,
+        harness_config.aws,
+        start_benchmark_request.sandbox_provider,
+    )
+    benchmark_service = create_benchmark_service_client_from_request(start_benchmark_request)
 
     sentry_sdk.set_tag("benchmark_name", start_benchmark_request.benchmark_name)
     sentry_sdk.set_tag("agent_name", start_benchmark_request.contract.name)
@@ -939,6 +946,7 @@ async def process_benchmark(
                     task_id,
                     harness_config,
                     org,
+                    sandbox_provider_config=sandbox_provider_config,
                     creation_semaphore=creation_semaphore,
                 ),
                 org,
@@ -1345,7 +1353,12 @@ async def sandbox_generator(benchmark_row: Benchmark, provider: SandboxProvider)
 
 
 async def force_stop_sandboxes(
-    benchmark_row: Benchmark, session: Session, daytona_secret_name: str, aws: AWSCredentials, org: Org
+    benchmark_row: Benchmark,
+    session: Session,
+    sandbox_provider_secret_name: str,
+    aws: AWSCredentials,
+    org: Org,
+    sandbox_provider: str = "daytona",
 ) -> None:
     """
     Stops and deletes all sandboxes which are in progress or evaluating.
@@ -1354,8 +1367,10 @@ async def force_stop_sandboxes(
     Raises:
         TrackerServiceError: If there are any errors stopping the sandboxes
     """
-    benchmark_service = benchmark_row.benchmark_service(daytona_secret_name, aws)
-    provider = benchmark_service.get_sandbox_provider()
+    benchmark_service = benchmark_row.benchmark_service()
+    provider = benchmark_service.get_sandbox_provider(
+        fetch_sandbox_provider_config(sandbox_provider_secret_name, aws, sandbox_provider)
+    )
 
     # Update all tasks being processed to stopped
     session.exec(
@@ -1794,7 +1809,7 @@ def _build_harness_config(flat: dict[str, str]) -> HarnessConfig:
             flat.get("log_retention_policy"),
             source="request headers",
         ),
-        daytona_secret_name=flat.get("daytona_secret_name") or "",
+        sandbox_provider_secret_name=flat.get("sandbox_provider_secret_name") or flat.get("daytona_secret_name") or "",
     )
 
 

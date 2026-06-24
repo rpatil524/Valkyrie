@@ -52,7 +52,7 @@ class HarnessConfig(BaseModel):
     s3_bucket: str
     log_group: str
     log_retention_policy: int
-    daytona_secret_name: str
+    sandbox_provider_secret_name: str
 
 
 class StartBenchmarkRequest(BaseModel):
@@ -66,6 +66,8 @@ class StartBenchmarkRequest(BaseModel):
     harness_config: HarnessConfig
     custom_benchmark_service: str | None = None
     service_headers: dict[str, str] = Field(default_factory=dict, repr=False)
+    sandbox_provider: str = "daytona"
+    sandbox_provider_secret_name: str | None = None
     service_auth_header_name: str | None = None
     service_auth_secret_name: str | None = None
     webhook_secret_name: str | None = None
@@ -79,8 +81,6 @@ class StartBenchmarkRequest(BaseModel):
         benchmark_service_url = self.custom_benchmark_service or create_benchmark_service_url(self.benchmark_name)
         return create_benchmark_service_client(
             url=benchmark_service_url,
-            daytona_secret_name=self.harness_config.daytona_secret_name,
-            aws=self.harness_config.aws,
             service_headers=self.service_headers,
         )
 

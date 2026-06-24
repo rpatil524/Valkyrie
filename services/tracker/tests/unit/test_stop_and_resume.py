@@ -7,6 +7,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 from benchmark_service.client import BenchmarkServiceClient
+from benchmark_service.sandbox import DaytonaProviderConfig
 from benchmark_service.schemas import FinalScoreResponse, VerifyTaskIdsResponse
 from fastapi.testclient import TestClient
 from pytest import MonkeyPatch
@@ -195,7 +196,7 @@ class TestStopAndResume:
         verified_task_ids = await reset_to_in_progress_status(
             benchmark_row=benchmark_row,
             session=database_session,
-            benchmark_service=benchmark_row.benchmark_service(harness_config.daytona_secret_name, harness_config.aws),
+            benchmark_service=benchmark_row.benchmark_service(),
             retry=False,
             retry_mode=retry_mode,
             rerun_task_ids=[],
@@ -226,7 +227,7 @@ class TestStopAndResume:
         verified_task_ids = await reset_to_in_progress_status(
             benchmark_row=benchmark_row,
             session=database_session,
-            benchmark_service=benchmark_row.benchmark_service(harness_config.daytona_secret_name, harness_config.aws),
+            benchmark_service=benchmark_row.benchmark_service(),
             retry=False,
             retry_mode=RetryMode.AUTO,
             rerun_task_ids=["task_1", "task_2"],
@@ -396,6 +397,11 @@ class TestStopAndResume:
                 task_row.task_id,
                 harness_config,
                 self._test_org,
+                sandbox_provider_config=DaytonaProviderConfig(
+                    DAYTONA_API_KEY="key",
+                    DAYTONA_API_URL="url",
+                    DAYTONA_TARGET="target",
+                ),
                 creation_semaphore=asyncio.Semaphore(1),
             )
         finally:
@@ -466,6 +472,11 @@ class TestStopAndResume:
                 task_row.task_id,
                 harness_config,
                 self._test_org,
+                sandbox_provider_config=DaytonaProviderConfig(
+                    DAYTONA_API_KEY="key",
+                    DAYTONA_API_URL="url",
+                    DAYTONA_TARGET="target",
+                ),
                 creation_semaphore=asyncio.Semaphore(1),
             )
         finally:
@@ -509,14 +520,17 @@ class TestStopAndResume:
         monkeypatch.setattr("main.process_benchmark.kicker", lambda: _MockKicker())
 
         response = client.post(
-            f"/retry-or-resume-benchmark/{benchmark_row.id}",
+            f"/retry-or-resume-benchmark/{benchmark_row.id}?concurrency=20",
             json={"task_ids": [], "service_headers": {}},
             headers={"X-Api-Key": "tracker-api-key"},
         )
 
         assert response.status_code == 200
         assert observed_headers["X-Descope-Api-Key"] == "tracker-api-key"
+        assert captured_request_json["concurrency"] == 20
         assert captured_request_json["service_headers"]["X-Descope-Api-Key"] == "tracker-api-key"
+        database_session.refresh(benchmark_row)
+        assert benchmark_row.arguments.concurrency == 20
 
     async def test_retry_or_resume_applies_secrets_to_stored_contract(
         self,
@@ -855,18 +869,30 @@ class TestStopAndResume:
 
         mock_provider = Mock()
         mock_provider.list_sandboxes = _empty_list_sandboxes
-        mock_service = Mock()
-        mock_service.get_sandbox_provider.return_value = mock_provider
-        mock_service.close = AsyncMock()
+
+        def _provider_config(*_args: Any, **_kwargs: Any) -> DaytonaProviderConfig:
+            return DaytonaProviderConfig(
+                DAYTONA_API_KEY="key",
+                DAYTONA_API_URL="url",
+                DAYTONA_TARGET="target",
+            )
+
+        def _sandbox_provider(*_args: Any, **_kwargs: Any) -> Mock:
+            return mock_provider
+
         monkeypatch.setattr(
-            Benchmark,
-            "benchmark_service",
-            lambda *_args, **_kwargs: mock_service,  # type: ignore
+            "tracker.utils.fetch_sandbox_provider_config",
+            _provider_config,
         )
+        monkeypatch.setattr(BenchmarkServiceClient, "get_sandbox_provider", _sandbox_provider)
 
         # Force stopping the sandboxes results in the benchmark row being stopped
         await force_stop_sandboxes(
-            benchmark_row, database_session, harness_config.daytona_secret_name, harness_config.aws, self._test_org
+            benchmark_row,
+            database_session,
+            harness_config.sandbox_provider_secret_name,
+            harness_config.aws,
+            self._test_org,
         )
 
         database_session.refresh(benchmark_row)
