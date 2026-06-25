@@ -33,7 +33,7 @@ from valkyrie.cli.utils import (
     CONFIG_LOCATION,
     ConfigValue,
     check_tracker_service_health,
-    download_agent_outputs,
+    download_run_outputs,
     download_final_view,
     format_agent_start_details,
     format_benchmark_status,
@@ -1190,16 +1190,16 @@ def list_benchmarks(
         raise click.ClickException(str(e))
 
 
-@agent.command(
+@run.command(
     name="outputs",
-    help="Fetch agent outputs by run id. \n\nExample:\nvalkyrie agent outputs 123e4567-e89b-12d3-a456-426614174000 --output-dir ./agent_outputs",
+    help="Fetch run outputs by run id. \n\nExample:\nvalkyrie run outputs 123e4567-e89b-12d3-a456-426614174000 --output-dir ./run_outputs",
 )
 @click.argument("run_id", type=UUID)
 @click.option(
     "--output-dir",
     type=click.Path(path_type=Path),
     default=None,
-    help="Directory to save agent outputs (defaults to ./agent_outputs/<run-id>)",
+    help="Directory to save run outputs (defaults to ./<benchmark>_<agent>_<run-id>)",
 )
 @click.option(
     "--task-ids",
@@ -1210,13 +1210,12 @@ def list_benchmarks(
 )
 def outputs(run_id: UUID, output_dir: Path | None, task_ids: str | None):
     """
-    Fetch agent outputs for a benchmark by its run id.
+    Fetch run outputs for a benchmark by its run id.
 
     Example:
-        valkyrie agent outputs 123e4567-e89b-12d3-a456-426614174000
-        valkyrie agent outputs 123e4567-e89b-12d3-a456-426614174000 --task-ids astropy__astropy-7606,django__django-10880
+        valkyrie run outputs 123e4567-e89b-12d3-a456-426614174000
+        valkyrie run outputs 123e4567-e89b-12d3-a456-426614174000 --task-ids astropy__astropy-7606,django__django-10880
     """
-
     try:
         with TrackerService() as tracker:
             if not check_tracker_service_health(tracker):
@@ -1229,23 +1228,23 @@ def outputs(run_id: UUID, output_dir: Path | None, task_ids: str | None):
                     f"{metadata.benchmark_name}_{metadata.benchmark_arguments.contract.name}_{metadata.benchmark_id}"
                 )
 
-            click.echo(f"\r\033[KFetching agent outputs for run {run_id}...", nl=False)
+            click.echo(f"\r\033[KFetching run outputs for run {run_id}...", nl=False)
 
-            response = tracker.fetch_agent_outputs(
+            response = tracker.fetch_run_outputs(
                 run_id,
                 task_ids=resolve_task_ids(task_ids),
             )
 
-            download_agent_outputs(response, output_dir)
+            download_run_outputs(response, output_dir)
 
-            click.echo(click.style(f"\r\033[K✓ Agent outputs extracted to: {output_dir}", fg="green"))
+            click.echo(click.style(f"\r\033[K✓ Run outputs extracted to: {output_dir}", fg="green"))
 
     except TrackerServiceError as e:
         click.echo(click.style(f"✗ Error: {e}", fg="red"), err=True)
         raise click.Abort()
 
 
-@agent.command(name="output", help="Download files from a benchmark run by its ID.")
+@run.command(name="output", help="Download files from a benchmark run by its ID.")
 @click.argument("benchmark_id", type=UUID)
 @click.argument("subpath", type=str, default="", required=False)
 @click.option(
@@ -1260,9 +1259,9 @@ def output_path(benchmark_id: UUID, subpath: str, output_dir: Path | None):
     Download all files under a benchmark's S3 directory.
 
     Example:
-        valkyrie agent output 6f176c17-7199-4ebc-b931-973e5600c1c9
-        valkyrie agent output 6f176c17-7199-4ebc-b931-973e5600c1c9 astropy__astropy-7606
-        valkyrie agent output 6f176c17-7199-4ebc-b931-973e5600c1c9 swebench.json -o .
+        valkyrie run output 6f176c17-7199-4ebc-b931-973e5600c1c9
+        valkyrie run output 6f176c17-7199-4ebc-b931-973e5600c1c9 astropy__astropy-7606
+        valkyrie run output 6f176c17-7199-4ebc-b931-973e5600c1c9 swebench.json -o .
     """
     try:
         path = f"{S3_BENCHMARKS_PREFIX}/{benchmark_id}"
