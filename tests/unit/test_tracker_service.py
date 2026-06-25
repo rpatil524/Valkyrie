@@ -1,12 +1,13 @@
 from datetime import datetime
 from pathlib import Path
+from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
-from uuid import uuid4
 
 import click
 import httpx
 import pytest
 import yaml
+from click.testing import CliRunner
 from tracker.database.models import AgentContractRequest, BenchmarkStatus, DocentReadingStatus, RetryMode, TaskStatus
 from tracker.types import (
     BenchmarkDetails,
@@ -17,6 +18,7 @@ from tracker.types import (
 )
 
 from valkyrie.cli import tracker_service as tracker_service_module
+from valkyrie.cli import main as cli_main
 from valkyrie.cli.main import list_benchmarks, start
 from valkyrie.cli.tracker_service import TrackerService
 from valkyrie.cli.utils import format_benchmark_status, format_fetch_benchmarks_response
@@ -153,6 +155,31 @@ def _command_option_flags(command: click.Command, param_name: str) -> set[str]:
     param = next(param for param in command.params if param.name == param_name)
     assert isinstance(param, click.Option)
     return {*param.opts}
+
+
+def test_run_commands_connect_after_success(connect_stream_testbed: tuple[UUID, list[str]]) -> None:
+    """Connect should stream the run once start, resume, or retry succeeds.
+
+    Test cases:
+    - Start streams the new run ID returned by the tracker.
+    - Resume and retry stream the run ID supplied by the user.
+    - Connected commands skip the redundant track-progress next step.
+    """
+    started_run_id, streamed_run_ids = connect_stream_testbed
+    resume_run_id = uuid4()
+    retry_run_id = uuid4()
+
+    runner = CliRunner()
+    for command in (
+        ["run", "start", "--agent", "agent", "--benchmark", "swebench", "--connect"],
+        ["run", "resume", str(resume_run_id), "--connect"],
+        ["run", "retry", str(retry_run_id), "--connect"],
+    ):
+        result = runner.invoke(cli_main.cli, command)
+        assert result.exit_code == 0, result.output
+        assert "Track progress:" not in result.output
+
+    assert streamed_run_ids == [str(started_run_id), str(resume_run_id), str(retry_run_id)]
 
 
 def test_run_label_cli_options_and_client_requests(monkeypatch: pytest.MonkeyPatch) -> None:
