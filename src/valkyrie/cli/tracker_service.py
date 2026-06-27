@@ -40,6 +40,9 @@ _REQUIRED_CONFIG_KEYS = {
     "AWS_SECRET_ACCESS_KEY",
     "AWS_DEFAULT_REGION",
     "S3_BUCKET",
+}
+_SANDBOX_PROVIDER_SECRET_CONFIG_KEYS = {
+    "SANDBOX_PROVIDER_SECRET_NAME",
     "DAYTONA_SECRET_NAME",
 }
 
@@ -180,6 +183,8 @@ class TrackerService:
             harness_config: dict[str, str] = yaml.safe_load(f) or {}
 
         missing = _REQUIRED_CONFIG_KEYS - harness_config.keys()
+        if not (_SANDBOX_PROVIDER_SECRET_CONFIG_KEYS & harness_config.keys()):
+            missing.add("SANDBOX_PROVIDER_SECRET_NAME")
         if missing:
             raise TrackerServiceError(
                 f"Missing required config keys: {', '.join(sorted(missing))}. "
@@ -214,7 +219,8 @@ class TrackerService:
             "s3_bucket": flat["s3_bucket"],
             "log_group": flat["log_group"],
             "log_retention_policy": int(flat["log_retention_policy"]),
-            "daytona_secret_name": flat["daytona_secret_name"],
+            "sandbox_provider_secret_name": flat.get("sandbox_provider_secret_name")
+            or flat.get("daytona_secret_name", ""),
         }
 
     def health_check(self) -> Response:
@@ -257,6 +263,7 @@ class TrackerService:
         ignore_custom_services: bool,
         task_ids: list[str] | None,
         slice_str: str | None,
+        label: str | None = None,
         lambda_function: str | None = None,
         dataset: str | None = None,
         service_headers: dict[str, str] | None = None,
@@ -272,6 +279,7 @@ class TrackerService:
             concurrency: Number of concurrent tasks
             task_ids: Optional list of specific task IDs to run
             slice_str: Optional slice string for task selection
+            label: Optional run label
             lambda_function: Optional lambda function to invoke after benchmark
 
         Returns:
@@ -285,6 +293,7 @@ class TrackerService:
                 contract=contract,
                 benchmark_name=benchmark_name,
                 concurrency=concurrency,
+                label=label,
                 task_ids=task_ids,
                 slice_str=slice_str,
                 lambda_function=lambda_function,
@@ -582,29 +591,29 @@ class TrackerService:
         except httpx.HTTPError as e:
             raise TrackerServiceError(f"Failed to fetch runs: {e}") from e
 
-    def fetch_agent_outputs(self, benchmark_id: UUID, task_ids: list[str] | None = None) -> Response:
+    def fetch_run_outputs(self, benchmark_id: UUID, task_ids: list[str] | None = None) -> Response:
         """
-        Fetch agent outputs for a benchmark by its benchmark id.
+        Fetch run outputs for a benchmark by its benchmark id.
 
         Args:
             benchmark_id: Benchmark id
             task_ids: Optional list of task ids to filter outputs
 
         Returns:
-            httpx Response with agent outputs
+            httpx Response with run outputs
         """
         try:
             params: dict[str, Any] = {}
             if task_ids:
                 params["task_ids"] = task_ids
-            response = self._client.get(f"{self._base_url}/fetch-agent-outputs/{benchmark_id}", params=params)
+            response = self._client.get(f"{self._base_url}/fetch-run-outputs/{benchmark_id}", params=params)
             if response.status_code != 200:
                 details = _response_error_detail(response)
-                raise TrackerServiceError(f"Failed to fetch agent outputs: {details}")
+                raise TrackerServiceError(f"Failed to fetch run outputs: {details}")
 
             return response
         except httpx.HTTPError as e:
-            raise TrackerServiceError(f"Failed to fetch agent outputs: {e}") from e
+            raise TrackerServiceError(f"Failed to fetch run outputs: {e}") from e
 
     def fetch_benchmark_metadata(self, benchmark_id: UUID) -> FetchBenchmarkMetadataResponse:
         """
