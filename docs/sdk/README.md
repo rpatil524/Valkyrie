@@ -1,18 +1,16 @@
 # Python SDK
 
-Use Valkyrie's async Python SDK to manage runs without invoking the CLI. The SDK currently requires Python 3.12.x.
+Use Valkyrie's async Python SDK to manage runs from Python. The SDK requires Python 3.12 or newer.
 
-## Installation from source
+## Installation
 
-The SDK is part of the Valkyrie Python package. A standalone PyPI package is not available yet; publishing one is tracked separately. Until then, install it from the repository:
+Install the standalone package from PyPI:
 
 ```bash
-git clone https://github.com/vals-ai/Valkyrie.git
-cd Valkyrie
-uv sync
+pip install valkyrie-sdk
 ```
 
-The source checkout lets `uv` install the bundled tracker dependency alongside the SDK.
+The package does not install the Valkyrie CLI or tracker service.
 
 ## Quickstart
 
@@ -25,34 +23,23 @@ async with ValkyrieClient.from_config() as client:
     runs = await client.runs.list()
 ```
 
-Services can validate the same YAML-shaped mapping in memory instead of reading a local file:
+Pass `base_url` to `ValkyrieClient` for a self-hosted tracker. Otherwise, the SDK uses
+`TRACKER_SERVICE_URL` or the hosted tracker URL.
 
-```python
-from valkyrie.sdk import ValkyrieClient, ValkyrieConfig
+The SDK sends AWS credentials in `X-Harness-*` headers. Only connect to trusted trackers, and use
+HTTPS outside local development.
 
-config = ValkyrieConfig.model_validate(config_values)
+## Examples
 
-async with ValkyrieClient(config=config) as client:
-    runs = await client.runs.list()
-```
-
-Pass `base_url` to `ValkyrieClient` for a self-hosted tracker. Otherwise, the SDK uses `TRACKER_SERVICE_URL` or the hosted tracker URL.
-
-The SDK sends AWS credentials in `X-Harness-*` headers. Only connect to trusted trackers and use HTTPS outside local development.
-
-## Executable examples
-
-The examples use the default Valkyrie config and require explicit command-line arguments before they can start or modify a run:
-
-- [`run_lifecycle.py`](examples/run_lifecycle.py) starts a run, streams updates, fetches its final state, lists visible runs, and retrieves results when the run finishes.
-- [`manage_run.py`](examples/manage_run.py) stops, resumes, or retries an existing run through explicit subcommands.
-
-Run them from the repository root:
+- [`run_lifecycle.py`](examples/run_lifecycle.py): start, stream, and retrieve a run.
+- [`manage_run.py`](examples/manage_run.py): stop, resume, or retry a run.
 
 ```bash
-uv run python docs/sdk/examples/run_lifecycle.py --help
-uv run python docs/sdk/examples/manage_run.py --help
+python docs/sdk/examples/run_lifecycle.py --help
+python docs/sdk/examples/manage_run.py --help
 ```
+
+Maintainers can follow [RELEASING.md](RELEASING.md) to publish the package.
 
 ## Run lifecycle
 
@@ -78,7 +65,7 @@ async for update in client.runs.stream(run.benchmark_id):
     print(update.details.status)
 ```
 
-Manage the remaining run lifecycle:
+Use the other run methods:
 
 ```python
 page = await client.runs.list()
@@ -88,7 +75,7 @@ await client.runs.resume(run.benchmark_id, concurrency=20)
 await client.runs.retry(run.benchmark_id, task_ids=["task-1"])
 ```
 
-## Error handling
+## Errors
 
 All SDK exceptions inherit from `ValkyrieSDKError`:
 
@@ -102,11 +89,3 @@ except ValkyrieAPIError as exc:
 except ValkyrieSDKError as exc:
     print(exc)
 ```
-
-| Exception | Description |
-| --- | --- |
-| `ValkyrieConfigError` | Invalid SDK configuration |
-| `ValkyrieRunError` | Invalid input for a run operation |
-| `ValkyrieAPIError` | Non-success API response |
-| `ValkyrieTransportError` | Connection or timeout failure |
-| `ValkyrieStreamError` | Invalid streaming event |

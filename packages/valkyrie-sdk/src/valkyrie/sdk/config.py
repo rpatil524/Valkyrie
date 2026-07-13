@@ -5,9 +5,9 @@ from typing import TypeVar, cast
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError, field_validator
-from tracker.types import AWSCredentials, HarnessConfig
 
 from valkyrie.sdk.errors import ValkyrieConfigError
+from valkyrie.sdk.models import AWSCredentials, HarnessConfig
 
 DEFAULT_CONFIG_PATH = Path("~/.config/valkyrie/valkyrie.yaml")
 ConfigT = TypeVar("ConfigT", bound="ValkyrieConfig")
@@ -16,7 +16,7 @@ ConfigT = TypeVar("ConfigT", bound="ValkyrieConfig")
 class ValkyrieConfig(BaseModel):
     """Validated SDK configuration using ``valkyrie.yaml`` field aliases."""
 
-    model_config = ConfigDict(populate_by_name=True, extra="allow")
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
 
     api_key: SecretStr | None = Field(default=None, repr=False)
     aws_access_key_id: SecretStr = Field(alias="AWS_ACCESS_KEY_ID", repr=False)
