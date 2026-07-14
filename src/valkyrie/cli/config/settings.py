@@ -4,8 +4,9 @@ from typing import Any
 import click
 
 from valkyrie.cli.exceptions import TrackerServiceError
+from valkyrie.cli.runtime_config import config_location
 from valkyrie.cli.tracker_client import TrackerService
-from valkyrie.cli.config.state import CONFIG_LOCATION, ConfigValue, load_config, read_config_if_exists, write_config
+from valkyrie.cli.config.state import ConfigValue, load_config, read_config_if_exists, write_config
 
 
 _REQUIRED_ENVIRONMENT_VARIABLES: dict[str, str | None | int] = {
@@ -26,7 +27,8 @@ def init() -> None:
     """
 
     current_config: dict[str, Any] = {}
-    if CONFIG_LOCATION.exists():
+    config_path = config_location()
+    if config_path.exists():
         try:
             current_config = read_config_if_exists()
         except Exception:
@@ -91,7 +93,7 @@ def init() -> None:
 
     write_config(current_config)
 
-    click.echo(click.style(f"\nConfig written to {CONFIG_LOCATION}", fg="green", bold=True))
+    click.echo(click.style(f"\nConfig written to {config_path}", fg="green", bold=True))
 
 
 @click.command()

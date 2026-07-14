@@ -5,15 +5,15 @@ import pytest
 import yaml
 from click.testing import CliRunner
 
+from valkyrie.cli.runtime_config import VALKYRIE_CONFIG_PATH_ENV_VAR
+
 settings = import_module("valkyrie.cli.config.settings")
-state = import_module("valkyrie.cli.config.state")
 
 
 @pytest.fixture
 def config_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     path = tmp_path / "valkyrie.yaml"
-    monkeypatch.setattr(state, "CONFIG_LOCATION", path)
-    monkeypatch.setattr(settings, "CONFIG_LOCATION", path)
+    monkeypatch.setenv(VALKYRIE_CONFIG_PATH_ENV_VAR, str(path))
     return path
 
 
