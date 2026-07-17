@@ -1,3 +1,8 @@
+"""Tests for run artifact downloads from S3.
+
+Run: uv run pytest tests/unit/cli/run/test_artifacts.py
+"""
+
 import asyncio
 from pathlib import Path
 from types import TracebackType
@@ -5,6 +10,7 @@ from typing import Any
 
 import click
 import pytest
+from tracker.exceptions import S3Error
 from tracker.types import AWSCredentials
 
 from valkyrie.cli.run.artifacts import download_s3_path
@@ -79,7 +85,6 @@ def patch_s3(monkeypatch: pytest.MonkeyPatch, payloads: dict[str, bytes], tracke
     monkeypatch.setattr("valkyrie.cli.s3_config.tracker_s3_client", tracker_s3_client)
 
 
-@pytest.mark.asyncio
 async def test_download_s3_path_downloads_files_in_parallel(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     tracker = ConcurrencyTracker()
     payloads = {
@@ -99,7 +104,6 @@ async def test_download_s3_path_downloads_files_in_parallel(monkeypatch: pytest.
     assert tracker.max_active > 1
 
 
-@pytest.mark.asyncio
 async def test_download_s3_path_handles_exact_file_path(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     tracker = ConcurrencyTracker()
     payloads = {"benchmarks/run-1/results.json": b"results"}
@@ -112,7 +116,27 @@ async def test_download_s3_path_handles_exact_file_path(monkeypatch: pytest.Monk
     assert (tmp_path / "results.json").read_bytes() == b"results"
 
 
-@pytest.mark.asyncio
+async def test_download_s3_path_rejects_keys_outside_output_directory(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """S3 object keys must not write outside the requested output directory.
+
+    Test cases:
+    - A key containing a parent-directory segment raises an S3 error.
+    - No file is written beside the output directory.
+    """
+    tracker = ConcurrencyTracker()
+    payloads = {"benchmarks/run-1/../escaped.txt": b"escaped"}
+    output_dir = tmp_path / "output"
+    patch_s3(monkeypatch, payloads, tracker)
+
+    with pytest.raises(S3Error, match="Requested path is not relative the output directory"):
+        await download_s3_path("benchmarks/run-1", output_dir)
+
+    assert not (tmp_path / "escaped.txt").exists()
+
+
 async def test_download_s3_path_requires_configured_bucket(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """S3 artifact downloads should fail with the CLI config error before making AWS calls.
 

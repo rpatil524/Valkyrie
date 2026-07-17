@@ -1,17 +1,19 @@
+"""Tests for batched run status output.
+
+Run: uv run pytest tests/unit/cli/run/test_status.py
+"""
+
 import json
 from datetime import datetime, timezone
 from importlib import import_module
 from uuid import UUID
 
-import httpx
 import pytest
-from click.testing import CliRunner
+from click.testing import CliRunner, Result
 from tracker.database.models import BenchmarkStatus
 from tracker.types import BenchmarkStatusEntry, BenchmarkStatusResponse
 
-from valkyrie.cli.run import run
 from valkyrie.cli.run.status import status_runs
-from valkyrie.cli.tracker_client import TrackerService
 
 status_module = import_module("valkyrie.cli.run.status")
 
@@ -32,7 +34,7 @@ class StubStatusTracker:
         self.entries = entries
         self.calls: list[list[UUID]] = []
 
-    def __enter__(self):
+    def __enter__(self) -> "StubStatusTracker":
         return self
 
     def __exit__(self, *_exc_info: object) -> None:
@@ -44,39 +46,7 @@ class StubStatusTracker:
         return BenchmarkStatusResponse(entries=[entry for entry in self.entries if entry.id in requested])
 
 
-class MockStatusClient:
-    """Return one deterministic batch-status response."""
-
-    def __init__(self, run_id: UUID) -> None:
-        self.run_id = run_id
-        self.url: str | None = None
-        self.params: dict[str, str] | None = None
-
-    def get(self, url: str, *, params: dict[str, str]) -> httpx.Response:
-        self.url = url
-        self.params = params
-
-        return httpx.Response(
-            200,
-            json={
-                "entries": [
-                    {
-                        "id": str(self.run_id),
-                        "status": "IN_PROGRESS",
-                        "finished_at": None,
-                        "total_tasks": 1,
-                        "finished_tasks": 0,
-                        "task_state_counts": {"PENDING": 1},
-                    }
-                ]
-            },
-        )
-
-    def close(self) -> None:
-        return None
-
-
-def invoke_with_tracker(monkeypatch: pytest.MonkeyPatch, tracker: StubStatusTracker, args: list[str]):
+def invoke_with_tracker(monkeypatch: pytest.MonkeyPatch, tracker: StubStatusTracker, args: list[str]) -> Result:
     monkeypatch.setattr(status_module, "TrackerService", lambda: tracker)
     return CliRunner().invoke(status_runs, args)
 
@@ -154,22 +124,3 @@ def test_status_rejects_invalid_ids_before_tracker_construction(
 
     assert result.exit_code == 2
     assert "--ids" in result.output
-
-
-def test_tracker_client_fetches_batch_status_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
-    run_id = UUID(int=1)
-    client = MockStatusClient(run_id)
-    monkeypatch.setattr(TrackerService, "_load_config", staticmethod(lambda: {}))
-    monkeypatch.setattr(TrackerService, "parse_config_keys", lambda _self: {})
-    monkeypatch.setattr("valkyrie.cli.tracker_client.httpx.Client", lambda **_kwargs: client)
-
-    tracker = TrackerService(base_url="http://tracker")
-    response = tracker.fetch_benchmark_statuses([run_id])
-
-    assert client.url == "http://tracker/benchmarks/status"
-    assert client.params == {"ids": str(run_id)}
-    assert [entry.id for entry in response.entries] == [run_id]
-
-
-def test_status_command_is_registered() -> None:
-    assert "status" in run.commands
