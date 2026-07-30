@@ -135,12 +135,67 @@ class DeployWorkflowTest(unittest.TestCase):
         )[0]
         prod_executor = workflow.split("  executor-production:", maxsplit=1)[1]
 
-        for executor_job in (dev_executor, prod_executor):
-            self.assertIn("aws ssm get-parameter", executor_job)
-            self.assertIn("ParameterNotFound", executor_job)
-            self.assertIn("physical WorkerStack bootstrap", executor_job)
-            self.assertNotIn("describe-stacks", executor_job)
-            self.assertNotIn("steps.executor-stack.outputs.exists", executor_job)
+        stages = (
+            (
+                dev_executor,
+                "dev",
+                "arn:aws:iam::${{ env.DEV_ACCOUNT_ID }}:role/ValkyrieExecutorRelease-dev",
+                "${{ env.AWS_DEPLOY_ROLE_ARN }}",
+            ),
+            (
+                prod_executor,
+                "production",
+                "arn:aws:iam::613431292675:role/ValkyrieExecutorRelease",
+                "arn:aws:iam::613431292675:role/github-actions-valkyrie-deploy",
+            ),
+        )
+        for executor_job, stage, release_role, deployment_role in stages:
+            with self.subTest(stage=stage):
+                self.assertIn("aws ssm get-parameter", executor_job)
+                self.assertIn("ParameterNotFound", executor_job)
+                self.assertIn("physical WorkerStack bootstrap", executor_job)
+                self.assertNotIn("describe-stacks", executor_job)
+                self.assertNotIn("steps.executor-stack.outputs.exists", executor_job)
+
+                preflight = f"Require deployed {stage} release control"
+                maintenance = f"Begin {stage} maintenance"
+                release_credentials = f"Configure {stage} release preflight credentials"
+                restore_credentials = f"Restore {stage} deployment credentials"
+                core_deploy = f"Deploy {stage} core stacks under maintenance"
+                executor_deploy = f"Deploy {stage} executor stack"
+                final_release_credentials = f"- name: Configure {stage} release credentials\n"
+                activation = f"Publish and activate {stage} executor release"
+                finish = f"Finish {stage} maintenance"
+
+                self.assertIn(release_credentials, executor_job)
+                self.assertLess(executor_job.index(release_credentials), executor_job.index(preflight))
+                preflight_index = executor_job.index(preflight)
+                preflight_credentials = executor_job[executor_job.index(release_credentials) : preflight_index]
+                self.assertEqual(preflight_credentials.count("uses: aws-actions/configure-aws-credentials"), 1)
+                self.assertIn(f"role-to-assume: {release_role}", preflight_credentials)
+                self.assertNotIn(f"role-to-assume: {deployment_role}", preflight_credentials)
+                preflight_step = executor_job[preflight_index : executor_job.index(maintenance)]
+                self.assertIn("aws ssm get-parameter", preflight_step)
+                self.assertLess(preflight_index, executor_job.index(maintenance))
+                self.assertNotIn(f"Configure {stage} release credentials for maintenance", executor_job)
+
+                restore_index = executor_job.index(restore_credentials)
+                self.assertLess(restore_index, executor_job.index(core_deploy))
+                self.assertLess(restore_index, executor_job.index(executor_deploy))
+                deployment_credentials = executor_job[restore_index : executor_job.index(core_deploy)]
+                self.assertIn(f"role-to-assume: {deployment_role}", deployment_credentials)
+
+                final_release_index = executor_job.index(final_release_credentials)
+                activation_index = executor_job.index(activation)
+                self.assertLess(final_release_index, activation_index)
+                self.assertLess(final_release_index, executor_job.index(finish))
+                final_release = executor_job[final_release_index:activation_index]
+                self.assertIn(f"role-to-assume: {release_role}", final_release)
+                activation_step = executor_job[activation_index : executor_job.index(finish)]
+                self.assertIn(
+                    "needs.classify-deployment.outputs.executor_release_required == 'true'",
+                    activation_step,
+                )
 
         self.assertIn(
             "EXECUTOR_RELEASE_LAUNCH_PARAMETER: /valkyrie/dev/executor-release/launch-config",
