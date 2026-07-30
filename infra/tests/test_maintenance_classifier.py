@@ -253,6 +253,17 @@ def upgrade() -> None:
         self.assertTrue(result.executor_stack_deploy_required)
         self.assertEqual(result.reasons, ["executor-core-change"])
 
+    def test_deploy_workflow_change_requires_stack_without_release(self) -> None:
+        head_sha = self._commit_file(".github/workflows/deploy.yaml", "changed\n")
+
+        result = self._classify(head_sha)
+
+        self.assertEqual(result.classification, "maintenance-required")
+        self.assertTrue(result.executor_stack_deploy_required)
+        self.assertFalse(result.executor_release_required)
+        self.assertFalse(result.core_maintenance_required)
+        self.assertFalse(result.database_maintenance_required)
+
     def test_shared_executor_input_requires_core_maintenance(self) -> None:
         head_sha = self._commit_file("infra/shared.py", "changed = True\n")
 

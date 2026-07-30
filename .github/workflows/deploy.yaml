@@ -329,14 +329,14 @@ jobs:
             --output-directory "$GITHUB_WORKSPACE/executor-release" \
             --source-revision "$GITHUB_SHA"
 
-      - name: Configure dev deployment credentials
+      - name: Configure dev release preflight credentials
         if: steps.freshness.outputs.current == 'true'
         uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
         with:
-          role-to-assume: ${{ env.AWS_DEPLOY_ROLE_ARN }}
+          role-to-assume: arn:aws:iam::${{ env.DEV_ACCOUNT_ID }}:role/ValkyrieExecutorRelease-dev
           aws-region: ${{ env.AWS_REGION }}
           allowed-account-ids: ${{ env.DEV_ACCOUNT_ID }}
-          role-session-name: valkyrie-dev-executor-deploy-${{ github.run_id }}
+          role-session-name: valkyrie-dev-release-preflight-${{ github.run_id }}
           unset-current-credentials: true
 
       - name: Require deployed dev release control
@@ -353,19 +353,6 @@ jobs:
             cat "$error_file" >&2
           fi
           exit 1
-
-      - name: Configure dev release credentials for maintenance
-        if: >-
-          steps.freshness.outputs.current == 'true' &&
-          (needs.classify-deployment.outputs.executor_stack_deploy_required == 'true' ||
-           needs.classify-deployment.outputs.database_maintenance_required == 'true')
-        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
-        with:
-          role-to-assume: arn:aws:iam::${{ env.DEV_ACCOUNT_ID }}:role/ValkyrieExecutorRelease-dev
-          aws-region: ${{ env.AWS_REGION }}
-          allowed-account-ids: ${{ env.DEV_ACCOUNT_ID }}
-          role-session-name: valkyrie-dev-maintenance-${{ github.run_id }}
-          unset-current-credentials: true
 
       - name: Begin dev maintenance
         if: >-
@@ -561,14 +548,14 @@ jobs:
             --output-directory "$GITHUB_WORKSPACE/executor-release" \
             --source-revision "$GITHUB_SHA"
 
-      - name: Configure production deployment credentials
+      - name: Configure production release preflight credentials
         if: steps.freshness.outputs.current == 'true'
         uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
         with:
-          role-to-assume: arn:aws:iam::613431292675:role/github-actions-valkyrie-deploy
+          role-to-assume: arn:aws:iam::613431292675:role/ValkyrieExecutorRelease
           aws-region: ${{ env.AWS_REGION }}
           allowed-account-ids: ${{ env.PRODUCTION_ACCOUNT_ID }}
-          role-session-name: valkyrie-prod-executor-deploy-${{ github.run_id }}
+          role-session-name: valkyrie-prod-release-preflight-${{ github.run_id }}
           unset-current-credentials: true
 
       - name: Require deployed production release control
@@ -585,19 +572,6 @@ jobs:
             cat "$error_file" >&2
           fi
           exit 1
-
-      - name: Configure production release credentials for maintenance
-        if: >-
-          steps.freshness.outputs.current == 'true' &&
-          (needs.classify-deployment.outputs.executor_stack_deploy_required == 'true' ||
-           needs.classify-deployment.outputs.database_maintenance_required == 'true')
-        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
-        with:
-          role-to-assume: arn:aws:iam::613431292675:role/ValkyrieExecutorRelease
-          aws-region: ${{ env.AWS_REGION }}
-          allowed-account-ids: ${{ env.PRODUCTION_ACCOUNT_ID }}
-          role-session-name: valkyrie-prod-maintenance-${{ github.run_id }}
-          unset-current-credentials: true
 
       - name: Begin production maintenance
         if: >-
