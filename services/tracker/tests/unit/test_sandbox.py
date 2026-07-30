@@ -6,7 +6,7 @@ Run: pytest services/tracker/tests/unit/test_sandbox.py
 import asyncio
 import shlex
 from collections import deque
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
 from typing import Any, Never, cast
 from unittest.mock import AsyncMock, Mock, call
 
@@ -111,6 +111,43 @@ class TestOutputArtifacts:
         )
 
         assert uploaded == [(artifact_content, "benchmarks/benchmark-123/task_0/artifacts/turns.jsonl")]
+
+    async def test_upload_output_artifacts_rechecks_authority_after_download(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        harness_config: Any,
+    ) -> None:
+        artifact = "artifacts/turns.jsonl"
+        authority_checks = iter([True, False])
+        uploaded: list[bytes] = []
+
+        async def fake_exec(_sandbox: Any, command: str) -> ExecResult:
+            if command == "test -f /tmp/valkyrie/artifacts/turns.jsonl":
+                return ExecResult(exit_code=0, output="")
+            if command == "stat -c%s /tmp/valkyrie/artifacts/turns.jsonl":
+                return ExecResult(exit_code=0, output="3")
+            raise AssertionError(f"unexpected command: {command}")
+
+        async def fake_upload_to_s3(file_content: bytes, *_args: Any, **_kwargs: Any) -> None:
+            uploaded.append(file_content)
+
+        monkeypatch.setattr(sandbox_module, "_exec", fake_exec)
+        monkeypatch.setattr(sandbox_module, "upload_to_s3", fake_upload_to_s3)
+        mock_sandbox = Mock()
+        mock_sandbox.download_file = AsyncMock(return_value=b"old")
+
+        await upload_output_artifacts(
+            mock_sandbox,
+            [artifact],
+            "benchmark-123",
+            "task_0",
+            harness_config.aws,
+            harness_config.s3_bucket,
+            execution_is_current=lambda: next(authority_checks),
+        )
+
+        mock_sandbox.download_file.assert_awaited_once()
+        assert uploaded == []
 
     async def test_upload_output_artifacts_can_upload_explicit_glob_sources(
         self,
@@ -470,7 +507,13 @@ class TestArchiveAndUploadOutput:
             exec_commands.append(command)
             return ExecResult(exit_code=0, output="")
 
-        async def fake_upload_stream_to_s3(chunks: Any, s3_key: str, _aws: Any, _s3_bucket: str) -> int:
+        async def fake_upload_stream_to_s3(
+            chunks: Any,
+            s3_key: str,
+            _aws: Any,
+            _s3_bucket: str,
+            should_continue: Any = None,
+        ) -> int:
             data = b"".join([chunk async for chunk in chunks])
             uploaded.append((data, s3_key))
             return len(data)
@@ -537,6 +580,7 @@ class TestRunAgent:
             task_id: str,
             _aws: Any,
             _s3_bucket: str,
+            _execution_is_current: Any,
         ) -> None:
             artifact_calls.append(f"{benchmark_id}:{task_id}:{artifacts[0]}")
 
@@ -592,6 +636,7 @@ class TestRunAgent:
             *,
             benchmark_id: str | None = None,
             task_id: str | None = None,
+            execution_is_current: Callable[[], bool] | None = None,
         ) -> None:
             archive_calls.append(f"{benchmark_id}:{task_id}:{output_path}")
 
@@ -617,6 +662,22 @@ class TestRunAgent:
         )
 
         assert archive_calls == ["benchmark-123:task_0:/tmp/agent_output"]
+
+        archive_calls.clear()
+        await run_agent(
+            mock_sandbox,
+            contract,
+            "/tmp/problem.txt",
+            "task_0",
+            lambda _msg: None,
+            "/testbed",
+            aws=harness_config.aws,
+            s3_bucket=harness_config.s3_bucket,
+            agent_output_s3_key="benchmarks/run/task/agent_output.tar.gz",
+            benchmark_id="benchmark-123",
+            execution_is_current=lambda: False,
+        )
+        assert archive_calls == []
 
     async def test_run_agent_wraps_compose_runtime_source(
         self,
