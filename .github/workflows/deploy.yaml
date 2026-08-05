@@ -688,6 +688,10 @@ jobs:
         if: >-
           steps.freshness.outputs.current == 'true' &&
           needs.classify-deployment.outputs.executor_stack_deploy_required == 'true'
+        env:
+          SANDBOX_CLEANUP_ENABLED: ${{ vars.SANDBOX_CLEANUP_ENABLED }}
+          SANDBOX_CLEANUP_PROVIDER: ${{ vars.SANDBOX_CLEANUP_PROVIDER }}
+          SANDBOX_CLEANUP_SECRET_NAME: ${{ vars.SANDBOX_CLEANUP_SECRET_NAME }}
         working-directory: infra
         run: make deploy STAGE=prod SCOPE=executor AWS_REGION="$AWS_REGION"
 
