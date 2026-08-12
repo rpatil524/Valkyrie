@@ -109,6 +109,8 @@ jobs:
               CDK_DEFAULT_REGION=us-east-1 \
               AWS_REGION=us-east-1 \
               STAGE="$stage" \
+              SENTRY_DSN_SECRET_NAME=offline-synth \
+              DESCOPE_MANAGEMENT_KEY_SECRET_NAME=offline-synth \
               DESCOPE_PROJECT_ID=offline-synth \
                 uv run --frozen cdk synth "$stack_id" -c stage="$stage" --output "$assembly"
             )
@@ -205,7 +207,9 @@ jobs:
           DEPLOYMENT_NOTIFICATIONS_SLACK_CHANNEL_ID: ${{ secrets.DEPLOYMENT_NOTIFICATIONS_SLACK_CHANNEL_ID }}
           AUTH_REQUIRED: ${{ secrets.AUTH_REQUIRED }}
           BENCHMARK_CATALOG_URL: ${{ secrets.BENCHMARK_CATALOG_URL }}
+          DESCOPE_MANAGEMENT_KEY_SECRET_NAME: ${{ secrets.DESCOPE_MANAGEMENT_KEY_SECRET_NAME }}
           DESCOPE_PROJECT_ID: ${{ secrets.DESCOPE_PROJECT_ID }}
+          SENTRY_DSN_SECRET_NAME: ${{ secrets.SENTRY_DSN_SECRET_NAME }}
         working-directory: infra
         run: >-
           make deploy
@@ -236,6 +240,7 @@ jobs:
       AWS_DEFAULT_REGION: ${{ vars.AWS_REGION }}
       CDK_DEFAULT_ACCOUNT: ${{ vars.DEV_ACCOUNT_ID }}
       CDK_DEFAULT_REGION: ${{ vars.AWS_REGION }}
+      DESCOPE_MANAGEMENT_KEY_SECRET_NAME: ${{ vars.DESCOPE_MANAGEMENT_KEY_SECRET_NAME }}
       DESCOPE_PROJECT_ID: ${{ vars.DESCOPE_PROJECT_ID }}
       DEV_ACCOUNT_ID: ${{ vars.DEV_ACCOUNT_ID }}
       OPERATION: ${{ github.event_name == 'push' && 'deploy' || inputs.operation }}
@@ -253,6 +258,10 @@ jobs:
           fi
           if [[ "$OPERATION" != "credentials-only" && -z "$DESCOPE_PROJECT_ID" ]]; then
             echo "::error::The dev Environment must define DESCOPE_PROJECT_ID before planning or deploying."
+            exit 1
+          fi
+          if [[ "$OPERATION" != "credentials-only" && -z "$DESCOPE_MANAGEMENT_KEY_SECRET_NAME" ]]; then
+            echo "::error::The dev Environment must define DESCOPE_MANAGEMENT_KEY_SECRET_NAME before planning or deploying."
             exit 1
           fi
           if [[ ! "$DEV_ACCOUNT_ID" =~ ^[0-9]{12}$ ]]; then
@@ -352,6 +361,7 @@ jobs:
       AWS_DEFAULT_REGION: ${{ vars.AWS_REGION }}
       CDK_DEFAULT_ACCOUNT: ${{ vars.DEV_ACCOUNT_ID }}
       CDK_DEFAULT_REGION: ${{ vars.AWS_REGION }}
+      DESCOPE_MANAGEMENT_KEY_SECRET_NAME: ${{ vars.DESCOPE_MANAGEMENT_KEY_SECRET_NAME }}
       DESCOPE_PROJECT_ID: ${{ vars.DESCOPE_PROJECT_ID }}
       DEV_ACCOUNT_ID: ${{ vars.DEV_ACCOUNT_ID }}
       EXECUTOR_RELEASE_LAUNCH_PARAMETER: /valkyrie/dev/executor-release/launch-config
@@ -680,7 +690,9 @@ jobs:
           DEPLOYMENT_NOTIFICATIONS_SLACK_CHANNEL_ID: ${{ secrets.DEPLOYMENT_NOTIFICATIONS_SLACK_CHANNEL_ID }}
           AUTH_REQUIRED: ${{ secrets.AUTH_REQUIRED }}
           BENCHMARK_CATALOG_URL: ${{ secrets.BENCHMARK_CATALOG_URL }}
+          DESCOPE_MANAGEMENT_KEY_SECRET_NAME: ${{ secrets.DESCOPE_MANAGEMENT_KEY_SECRET_NAME }}
           DESCOPE_PROJECT_ID: ${{ secrets.DESCOPE_PROJECT_ID }}
+          SENTRY_DSN_SECRET_NAME: ${{ secrets.SENTRY_DSN_SECRET_NAME }}
         working-directory: infra
         run: make deploy STAGE=prod SCOPE=core AWS_REGION="$AWS_REGION"
 
@@ -689,9 +701,13 @@ jobs:
           steps.freshness.outputs.current == 'true' &&
           needs.classify-deployment.outputs.executor_stack_deploy_required == 'true'
         env:
+          AUTH_REQUIRED: ${{ secrets.AUTH_REQUIRED }}
+          DESCOPE_MANAGEMENT_KEY_SECRET_NAME: ${{ secrets.DESCOPE_MANAGEMENT_KEY_SECRET_NAME }}
+          DESCOPE_PROJECT_ID: ${{ secrets.DESCOPE_PROJECT_ID }}
+          SENTRY_DSN_SECRET_NAME: ${{ secrets.SENTRY_DSN_SECRET_NAME }}
           SANDBOX_CLEANUP_ENABLED: ${{ vars.SANDBOX_CLEANUP_ENABLED }}
           SANDBOX_CLEANUP_PROVIDER: ${{ vars.SANDBOX_CLEANUP_PROVIDER }}
-          SANDBOX_CLEANUP_SECRET_NAME: ${{ vars.SANDBOX_CLEANUP_SECRET_NAME }}
+          SANDBOX_CLEANUP_SECRET_NAME: ${{ secrets.SANDBOX_CLEANUP_SECRET_NAME }}
         working-directory: infra
         run: make deploy STAGE=prod SCOPE=executor AWS_REGION="$AWS_REGION"
 
