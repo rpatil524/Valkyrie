@@ -54,7 +54,13 @@ from tracker.aws.s3 import (
     s3_object_exists,
 )
 from tracker.agent.schemas import AgentConfig
-from tracker.config import AUTH_REQUIRED, ENVIRONMENT, broker, create_benchmark_service_url
+from tracker.config import (
+    AUTH_REQUIRED,
+    ENVIRONMENT,
+    broker,
+    classify_benchmark_service_destination,
+    create_benchmark_service_url,
+)
 from tracker.database.models import (
     AgentContractRequest,
     Benchmark,
@@ -394,6 +400,10 @@ async def start_benchmark(
             "service_headers": forward_tracker_api_key(
                 service_headers,
                 http_request.headers.get("x-api-key"),
+                destination=classify_benchmark_service_destination(
+                    request.benchmark_name,
+                    request.custom_benchmark_service,
+                ),
             ),
         }
     )
@@ -408,23 +418,29 @@ async def start_benchmark(
     # Validate benchmark service is reachable + tasks resolve BEFORE creating the DB row,
     # so failed auth / unreachable services don't pollute the benchmark list.
     try:
-        _ = await benchmark_service.health_check()
-    except httpx.ConnectError as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Benchmark service '{request.benchmark_name}' is not reachable",
-        ) from exc
+        try:
+            _ = await benchmark_service.health_check()
+        except httpx.ConnectError as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Benchmark service '{request.benchmark_name}' is not reachable",
+            ) from exc
 
-    try:
-        verify_response = await benchmark_service.verify_task_ids(
-            task_ids=request.task_ids, slice_str=request.slice_str, dataset=request.dataset
-        )
-    except BenchmarkServiceUnauthenticatedError as exc:
-        logger.warning("Benchmark service authentication failed for %s: %s", request.benchmark_name, exc)
-        raise HTTPException(status_code=502, detail="Benchmark service authentication failed") from exc
-    except Exception as exc:
-        logger.error("Failed to verify task ids for %s", request.benchmark_name, exc_info=True)
-        raise HTTPException(status_code=502, detail="Failed to verify task ids") from exc
+        try:
+            verify_response = await benchmark_service.verify_task_ids(
+                task_ids=request.task_ids, slice_str=request.slice_str, dataset=request.dataset
+            )
+        except BenchmarkServiceUnauthenticatedError as exc:
+            logger.warning("Benchmark service authentication failed for %s: %s", request.benchmark_name, exc)
+            raise HTTPException(status_code=502, detail="Benchmark service authentication failed") from exc
+        except Exception as exc:
+            logger.error("Failed to verify task ids for %s", request.benchmark_name, exc_info=True)
+            raise HTTPException(status_code=502, detail="Failed to verify task ids") from exc
+    finally:
+        try:
+            await benchmark_service.close()
+        except Exception:
+            logger.exception("Failed to close benchmark service client for %s", request.benchmark_name)
 
     benchmark_row = start_benchmark_request_to_benchmark(request, run_starter)
     dispatch_id = uuid4()
@@ -511,7 +527,14 @@ async def fetch_benchmark_tasks(
     try:
         benchmark_service = create_benchmark_service_client(
             url=request.custom_benchmark_service or create_benchmark_service_url(request.benchmark_name),
-            service_headers=forward_tracker_api_key(request.service_headers, http_request.headers.get("x-api-key")),
+            service_headers=forward_tracker_api_key(
+                request.service_headers,
+                http_request.headers.get("x-api-key"),
+                destination=classify_benchmark_service_destination(
+                    request.benchmark_name,
+                    request.custom_benchmark_service,
+                ),
+            ),
         )
         try:
             return await benchmark_service.verify_task_ids(
@@ -695,7 +718,14 @@ async def retrieve_results(
             if task_id in task_ids_set
         }
 
-        effective_service_headers = forward_tracker_api_key(None, http_request.headers.get("x-api-key"))
+        effective_service_headers = forward_tracker_api_key(
+            None,
+            http_request.headers.get("x-api-key"),
+            destination=classify_benchmark_service_destination(
+                benchmark_row.name,
+                benchmark_row.custom_benchmark_service,
+            ),
+        )
         benchmark_service = benchmark_row.benchmark_service(service_headers=effective_service_headers)
         try:
             resp = await benchmark_service.final_score(
@@ -943,17 +973,21 @@ async def retry_or_resume_benchmark(
             session.commit()
         return RetryOrResumeBenchmarkResponse(status="success")
 
-    effective_service_headers = forward_tracker_api_key(
-        service_headers,
-        http_request.headers.get("x-api-key"),
-    )
-
     dispatch_id = uuid4()
     pre_action_status: BenchmarkStatus | None = None
     try:
         with session.no_autoflush:
             lock_executor_admission(session)
         benchmark_row = fetch_benchmark_row(benchmark_id, session, org, for_update=True)
+        effective_benchmark_url = benchmark_url if benchmark_url is not None else benchmark_row.custom_benchmark_service
+        effective_service_headers = forward_tracker_api_key(
+            service_headers,
+            http_request.headers.get("x-api-key"),
+            destination=classify_benchmark_service_destination(
+                benchmark_row.name,
+                effective_benchmark_url,
+            ),
+        )
         if benchmark_row.status == BenchmarkStatus.STOPPING:
             raise HTTPException(
                 status_code=400,
