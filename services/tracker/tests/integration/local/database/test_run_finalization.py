@@ -21,6 +21,7 @@ from sqlmodel import Session, select
 import tracker.utils.run_control as run_control_module
 import tracker.utils.run_orchestration as run_orchestration_module
 from tests.factories import make_benchmark, make_task
+from tracker.aws.runtime import AWSRuntime
 from tracker.database.models import (
     AgentContractRequest,
     Benchmark,
@@ -660,7 +661,7 @@ class TestRunFinalization:
                 benchmark,
                 postgres_session,
                 harness_config.sandbox_provider_secret_name,
-                harness_config.aws,
+                AWSRuntime.from_harness_config(harness_config),
                 org,
             )
         finally:

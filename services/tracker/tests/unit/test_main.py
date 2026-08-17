@@ -33,6 +33,7 @@ import services.executor_host.supervisor as executor_host  # pyright: ignore[rep
 from main import app, tracker_service_error_handler
 from tests.utils import TEST_ORG_ID, async_iterator
 from tracker.auth import RequestIdentity, get_current_org, get_current_starter
+from tracker.aws.runtime import AWSRuntime
 from tracker.database.models import (
     AgentContractRequest,
     Benchmark,
@@ -742,8 +743,7 @@ class TestTrackerAPI:
             copied_benchmark_id = copy_call.args[0]
             delete_agent_copy.assert_awaited_once_with(
                 f"benchmarks/{copied_benchmark_id}/{contract.name}.zip",
-                harness_config.aws,
-                harness_config.s3_bucket,
+                AWSRuntime.from_harness_config(harness_config),
             )
         else:
             delete_agent_copy.assert_not_awaited()
@@ -789,8 +789,7 @@ class TestTrackerAPI:
         copied_benchmark_id = copy_call.args[0]
         delete_agent_copy.assert_awaited_once_with(
             f"benchmarks/{copied_benchmark_id}/{contract.name}.zip",
-            harness_config.aws,
-            harness_config.s3_bucket,
+            AWSRuntime.from_harness_config(harness_config),
         )
 
     async def test_start_benchmark_returns_502_when_benchmark_service_is_unreachable(

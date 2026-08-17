@@ -18,6 +18,7 @@ from sqlmodel import Session, select
 import tracker.utils as tracker_utils
 from tests.utils import TEST_ORG_ID
 from tracker.auth import RequestIdentity
+from tracker.aws.runtime import AWSRuntime
 from tracker.aws.s3 import copy_agent_to_benchmark, delete_from_s3, get_benchmark_contract_s3_key
 from tracker.database.models import (
     AgentContractRequest,
@@ -48,7 +49,7 @@ async def frozen_contract_keys(harness_config: HarnessConfig) -> AsyncGenerator[
         yield keys
     finally:
         for key in sorted(keys):
-            await delete_from_s3(key, harness_config.aws, harness_config.s3_bucket)
+            await delete_from_s3(key, AWSRuntime.from_harness_config(harness_config))
 
 
 async def _create_benchmark(
@@ -76,8 +77,7 @@ async def _create_benchmark(
     copied = await copy_agent_to_benchmark(
         str(benchmark.id),
         contract.name,
-        harness_config.aws,
-        harness_config.s3_bucket,
+        AWSRuntime.from_harness_config(harness_config),
     )
     if copied:
         frozen_contract_keys.add(get_benchmark_contract_s3_key(str(benchmark.id), contract.name))

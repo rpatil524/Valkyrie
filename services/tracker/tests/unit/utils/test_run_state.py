@@ -22,6 +22,7 @@ from main import app
 from tests.factories import make_benchmark
 from tests.utils import TEST_ORG_ID
 from tracker.auth import RequestIdentity
+from tracker.aws.runtime import AWSRuntime
 from tracker.database.models import (
     AgentContractRequest,
     Benchmark,
@@ -35,7 +36,7 @@ from tracker.database.models import (
 )
 from tracker.exceptions import TrackerServiceError
 from tracker.executor.release_control import promote_release
-from tracker.types import AWSCredentials, FetchBenchmarksRequest, HarnessConfig, StartBenchmarkRequest
+from tracker.types import FetchBenchmarksRequest, HarnessConfig, StartBenchmarkRequest
 from tracker.utils import (
     commit_task_error,
     create_task_rows,
@@ -99,12 +100,16 @@ class TestRunState:
             },
         }
 
-        def fetch_secret(name: str, _aws: AWSCredentials) -> dict[str, str]:
+        def fetch_secret(name: str, _client_provider: object) -> dict[str, str]:
             return secrets[name]
 
         monkeypatch.setattr("tracker.utils.resources.fetch_aws_secret", fetch_secret)
 
-        provider_config = fetch_sandbox_provider_config("provider-secret", harness_config.aws, "daytona")
+        provider_config = fetch_sandbox_provider_config(
+            "provider-secret",
+            AWSRuntime.from_harness_config(harness_config).clients,
+            "daytona",
+        )
         assert provider_config.model_dump(mode="json") == {
             "type": "daytona",
             "DAYTONA_API_KEY": "key",
