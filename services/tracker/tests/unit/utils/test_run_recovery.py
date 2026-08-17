@@ -30,6 +30,7 @@ import tracker.utils as tracker_utils
 from tests.factories import make_benchmark, make_error_result, make_evaluation_result
 from tests.unit.utils.task_execution_support import MockKicker, make_retrieve_task_response
 from tests.utils import TEST_ORG_ID, async_iterator
+from tracker import config
 from tracker.auth import RequestIdentity
 from tracker.aws.runtime import AWSRuntime
 from tracker.database.models import (
@@ -229,6 +230,7 @@ class TestRunRecovery:
         example_benchmark_object: Benchmark,
         database_session: Session,
         monkeypatch: MonkeyPatch,
+        harness_headers: dict[str, str],
         executor_authority: Any,
     ) -> None:
         """Apply selected stops and reject invalid selections without affecting other work.
@@ -303,21 +305,25 @@ class TestRunRecovery:
         graceful_response = client.post(
             f"/stop-benchmark/{benchmark_row.id}?force=false",
             json={"task_ids": ["task_pending", "task_evaluating"]},
+            headers=harness_headers,
         )
 
         force_response = client.post(
             f"/stop-benchmark/{benchmark_row.id}?force=true",
             json={"task_ids": ["task_force_selected"]},
+            headers=harness_headers,
         )
 
         empty_response = client.post(
             f"/stop-benchmark/{benchmark_row.id}",
             json={"task_ids": []},
+            headers=harness_headers,
         )
 
         missing_response = client.post(
             f"/stop-benchmark/{benchmark_row.id}",
             json={"task_ids": ["task_not_in_run"]},
+            headers=harness_headers,
         )
 
         assert graceful_response.status_code == 200, graceful_response.text
@@ -354,6 +360,7 @@ class TestRunRecovery:
         database_session: Session,
         monkeypatch: MonkeyPatch,
         harness_config: HarnessConfig,
+        harness_headers: dict[str, str],
         executor_authority: Any,
     ) -> None:
         """Keep an old worker from continuing after force stop and immediate resume.
@@ -454,10 +461,12 @@ class TestRunRecovery:
         stop_response = client.post(
             f"/stop-benchmark/{benchmark_row.id}?force=true",
             json={"task_ids": [selected_task.task_id]},
+            headers=harness_headers,
         )
         resume_response = client.post(
             f"/retry-or-resume-benchmark/{benchmark_row.id}",
             json={"task_ids": [selected_task.task_id]},
+            headers=harness_headers,
         )
         continue_retrieval.set()
 
@@ -682,6 +691,7 @@ class TestRunRecovery:
         example_benchmark_object: Benchmark,
         database_session: Session,
         monkeypatch: MonkeyPatch,
+        harness_headers: dict[str, str],
     ) -> None:
         """Retried tasks should keep prior attempts visible in exported results.
 
@@ -742,7 +752,11 @@ class TestRunRecovery:
             )
         database_session.commit()
 
-        response = client.get("/retrieve-results", params={"benchmark_id": str(benchmark_row.id)})
+        response = client.get(
+            "/retrieve-results",
+            params={"benchmark_id": str(benchmark_row.id)},
+            headers=harness_headers,
+        )
 
         assert response.status_code == 200
         evaluation_results = response.json()["evaluation_results"]
@@ -1126,7 +1140,8 @@ class TestRunRecovery:
         example_benchmark_object: Benchmark,
         database_session: Session,
         monkeypatch: MonkeyPatch,
-        mock_kicker: Any,
+        harness_headers: dict[str, str],
+        mock_kicker: MockKicker,
     ) -> None:
         benchmark_row = example_benchmark_object
         benchmark_row.status = BenchmarkStatus.STOPPED
@@ -1149,7 +1164,7 @@ class TestRunRecovery:
         response = client.post(
             f"/retry-or-resume-benchmark/{benchmark_row.id}?concurrency=20",
             json={"task_ids": [], "service_headers": {}},
-            headers={"X-Api-Key": "tracker-api-key"},
+            headers={**harness_headers, "X-Api-Key": "tracker-api-key"},
         )
 
         assert response.status_code == 200
@@ -1204,6 +1219,7 @@ class TestRunRecovery:
         example_benchmark_object: Benchmark,
         database_session: Session,
         monkeypatch: MonkeyPatch,
+        harness_headers: dict[str, str],
     ) -> None:
         """Force stop should use the provider secret stored with the run.
 
@@ -1237,7 +1253,10 @@ class TestRunRecovery:
 
         monkeypatch.setattr("main.force_stop_sandboxes", _mock_force_stop_sandboxes)
 
-        response = client.post(f"/stop-benchmark/{benchmark_row.id}?force=true")
+        response = client.post(
+            f"/stop-benchmark/{benchmark_row.id}?force=true",
+            headers=harness_headers,
+        )
 
         assert response.status_code == 200
         assert captured == {
@@ -1245,6 +1264,49 @@ class TestRunRecovery:
             "sandbox_provider": "modal",
             "task_ids": None,
         }
+
+    async def test_force_stop_missing_provider_secret_does_not_mutate_run(
+        self,
+        example_benchmark_object: Benchmark,
+        database_session: Session,
+        monkeypatch: MonkeyPatch,
+    ) -> None:
+        """Reject an invalid managed force stop without changing run state."""
+        benchmark_row = example_benchmark_object
+        benchmark_row.status = BenchmarkStatus.IN_PROGRESS
+        benchmark_row.aws_managed = True
+        benchmark_row.arguments = benchmark_row.arguments.model_copy(update={"sandbox_provider_secret_name": ""})
+        pending_task = Task(
+            org_id=TEST_ORG_ID,
+            task_id="task_0",
+            benchmark=benchmark_row.id,
+            status=TaskStatus.PENDING,
+        )
+        database_session.add_all([benchmark_row, pending_task])
+        database_session.commit()
+
+        monkeypatch.setattr(config, "AWS_DEPLOYMENT_ROLE_ORG_IDS", str(TEST_ORG_ID))
+        monkeypatch.setattr(config, "AWS_DEPLOYMENT_REGION", "deployment-region")
+        monkeypatch.setattr(config, "AWS_DEPLOYMENT_S3_BUCKET", "deployment-bucket")
+        monkeypatch.setattr(config, "AWS_DEPLOYMENT_LOG_GROUP", "deployment-log-group")
+        monkeypatch.setattr(config, "AWS_DEPLOYMENT_LOG_RETENTION_DAYS", "30")
+        force_stop = AsyncMock()
+        monkeypatch.setattr("main.force_stop_sandboxes", force_stop)
+
+        response = client.post(f"/stop-benchmark/{benchmark_row.id}?force=true")
+
+        assert response.status_code == 400
+        detail = response.json()["detail"]
+        assert "sandbox provider secret name" in detail
+        assert "x-harness-sandbox-provider-secret-name" not in detail
+        database_session.expire_all()
+        stored_benchmark = database_session.get(Benchmark, benchmark_row.id)
+        stored_task = database_session.get(Task, pending_task.id)
+        assert stored_benchmark is not None
+        assert stored_benchmark.status == BenchmarkStatus.IN_PROGRESS
+        assert stored_task is not None
+        assert stored_task.status == TaskStatus.PENDING
+        force_stop.assert_not_awaited()
 
     async def test_retry_or_resume_applies_secrets_to_stored_contract(
         self,

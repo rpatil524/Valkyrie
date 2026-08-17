@@ -121,6 +121,7 @@ class TestRunState:
         self,
         example_benchmark_object: Benchmark,
         database_session: Session,
+        harness_headers: dict[str, str],
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """Tests the flow of updating the benchmark related objects to the proper states when stopping a benchmark
@@ -168,7 +169,10 @@ class TestRunState:
         monkeypatch.setattr("main.fetch_benchmark_row", capture_locked_fetch)
 
         # Test request to stop the benchmark
-        response: Response = client.post(f"/stop-benchmark/{benchmark_row.id}?force=false")
+        response: Response = client.post(
+            f"/stop-benchmark/{benchmark_row.id}?force=false",
+            headers=harness_headers,
+        )
         assert response.status_code == 200
         assert response.json() == {"status": "success"}
         assert locked_fetches == [True]

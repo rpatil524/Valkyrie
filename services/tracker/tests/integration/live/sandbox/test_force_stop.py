@@ -392,6 +392,7 @@ class TestForceStop:
         database_session: Session,
         daytona_secret_name: str,
         harness_config: HarnessConfig,
+        harness_headers: dict[str, str],
         service_headers: dict[str, str],
         live_api_client: TestClient,
         executor_authority_kwargs: Any,
@@ -435,8 +436,10 @@ class TestForceStop:
             provider = benchmark_service.get_sandbox_provider(provider_config)
             await _wait_for_running_benchmark(example_benchmark_object, database_session, provider)
 
-            response = live_api_client.post(f"/stop-benchmark/{example_benchmark_object.id}?force=true")
-
+            response = live_api_client.post(
+                f"/stop-benchmark/{example_benchmark_object.id}?force=true",
+                headers=harness_headers,
+            )
             assert response.status_code == 200
             assert response.json() == {"status": "success"}
 

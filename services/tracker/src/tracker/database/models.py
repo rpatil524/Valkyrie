@@ -308,6 +308,7 @@ class Benchmark(SQLModel, table=True):
     finished_at: datetime | None = None
     status: BenchmarkStatus = Field(default=BenchmarkStatus.IN_PROGRESS)
     label: str | None = Field(default=None, index=True)
+    aws_managed: bool = Field(default=False, nullable=False)
     executor_release_id: str | None = Field(default=None, foreign_key="executorrelease.id", index=True)
     current_execution_release_id: str | None = Field(default=None, foreign_key="executorrelease.id", index=True)
     executor_artifact_uri: str | None = None

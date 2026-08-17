@@ -62,7 +62,7 @@ from tracker.types import (
     HarnessConfig,
     StartBenchmarkRequest,
 )
-from tracker.utils import fetch_harness_config, update_benchmark_concurrency
+from tracker.utils import update_benchmark_concurrency
 
 client = TestClient(app)
 
@@ -304,6 +304,7 @@ class TestTrackerAPI:
         self,
         database_session: Session,
         example_benchmark_object: Benchmark,
+        harness_headers: dict[str, str],
     ) -> None:
         """Docent analysis must reject invalid runs and return a completed cached result.
 
@@ -318,6 +319,7 @@ class TestTrackerAPI:
         active_response = client.post(
             f"/analyze-benchmark/{example_benchmark_object.id}",
             json={"lambda_function": "docent-analyzer"},
+            headers=harness_headers,
         )
         assert active_response.status_code == 400
         assert "must be FINISHED" in active_response.json()["detail"]
@@ -325,7 +327,11 @@ class TestTrackerAPI:
         example_benchmark_object.status = BenchmarkStatus.FINISHED
         database_session.add(example_benchmark_object)
         database_session.commit()
-        missing_lambda_response = client.post(f"/analyze-benchmark/{example_benchmark_object.id}", json={})
+        missing_lambda_response = client.post(
+            f"/analyze-benchmark/{example_benchmark_object.id}",
+            json={},
+            headers=harness_headers,
+        )
         assert missing_lambda_response.status_code == 400
         assert "No ingest_lambda provided" in missing_lambda_response.json()["detail"]
 
@@ -333,7 +339,11 @@ class TestTrackerAPI:
         example_benchmark_object.docent_reading_url = "https://results.example/reading-plan"
         database_session.add(example_benchmark_object)
         database_session.commit()
-        cached_response = client.post(f"/analyze-benchmark/{example_benchmark_object.id}", json={})
+        cached_response = client.post(
+            f"/analyze-benchmark/{example_benchmark_object.id}",
+            json={},
+            headers=harness_headers,
+        )
         assert cached_response.status_code == 200
         assert cached_response.json() == {
             "status": "done",
@@ -999,7 +1009,12 @@ class TestTrackerAPI:
         assert queued_request["sandbox_provider"] == "modal"
         assert queued_request["harness_config"]["sandbox_provider_secret_name"] == "ModalSecrets"
 
-    async def test_fetch_benchmark(self, database_session: Session, example_benchmark_object: Benchmark) -> None:
+    async def test_fetch_benchmark(
+        self,
+        database_session: Session,
+        example_benchmark_object: Benchmark,
+        harness_headers: dict[str, str],
+    ) -> None:
         """Test fetch benchmark of the fastapi server.
 
         Test Cases:
@@ -1013,7 +1028,7 @@ class TestTrackerAPI:
 
         # Test case 1. Return 404 Not Found if benchmark does not exist
         query_params = {"benchmark_id": str(uuid4())}
-        response = client.get("/fetch-benchmark", params=query_params)
+        response = client.get("/fetch-benchmark", params=query_params, headers=harness_headers)
         assert response.status_code == 404
 
         # Add benchmark row to the database to fetch
@@ -1029,7 +1044,7 @@ class TestTrackerAPI:
 
         # Fetch during the interval between benchmark creation and task discovery.
         query_params = {"benchmark_id": str(benchmark_row.id)}
-        response = client.get("/fetch-benchmark", params=query_params)
+        response = client.get("/fetch-benchmark", params=query_params, headers=harness_headers)
 
         assert response.status_code == 200
 
@@ -1045,7 +1060,7 @@ class TestTrackerAPI:
 
         # Send request to fetch the benchmark and ensure that the fetch response is returned
         query_params = {"benchmark_id": str(benchmark_row.id)}
-        response = client.get("/fetch-benchmark", params=query_params)
+        response = client.get("/fetch-benchmark", params=query_params, headers=harness_headers)
 
         # Test case 2. Returns 200 OK
         assert response.status_code == 200
@@ -1097,7 +1112,7 @@ class TestTrackerAPI:
 
         # Send request to fetch the benchmark and ensure that the fetch response is returned
         query_params = {"benchmark_id": str(benchmark_row.id)}
-        response = client.get("/fetch-benchmark", params=query_params)
+        response = client.get("/fetch-benchmark", params=query_params, headers=harness_headers)
         details = response.json().get("details")
         assert details
 
@@ -1115,7 +1130,7 @@ class TestTrackerAPI:
         database_session.commit()
         database_session.expire_all()
 
-        response = client.get("/fetch-benchmark", params=query_params)
+        response = client.get("/fetch-benchmark", params=query_params, headers=harness_headers)
 
         # Test case 6. Final score is returned when the benchmark has a final evaluation
         assert response.status_code == 200
@@ -1126,14 +1141,18 @@ class TestTrackerAPI:
         database_session.add(benchmark_row)
         database_session.commit()
 
-        response = client.get("/fetch-benchmark", params=query_params)
+        response = client.get("/fetch-benchmark", params=query_params, headers=harness_headers)
 
         # Test case 7. Terminal errors return the stored run-level message
         assert response.status_code == 200
         assert response.json().get("error_message") == "Dominant task error affecting 10/10 tasks"
 
     async def test_retrieve_results(
-        self, monkeypatch: MonkeyPatch, database_session: Session, example_benchmark_object: Benchmark
+        self,
+        monkeypatch: MonkeyPatch,
+        database_session: Session,
+        example_benchmark_object: Benchmark,
+        harness_headers: dict[str, str],
     ) -> None:
         """Test the retrieve results endpoint of the fastapi server.
 
@@ -1149,7 +1168,7 @@ class TestTrackerAPI:
 
         # Test case 1. 404 on invalid benchmark id
         query_params = {"benchmark_id": str(uuid4())}
-        response = client.get("/retrieve-results", params=query_params)
+        response = client.get("/retrieve-results", params=query_params, headers=harness_headers)
         assert response.status_code == 404
 
         # Add benchmark row
@@ -1158,7 +1177,7 @@ class TestTrackerAPI:
         database_session.commit()
 
         query_params = {"benchmark_id": str(benchmark_row.id)}
-        response = client.get("/retrieve-results", params=query_params)
+        response = client.get("/retrieve-results", params=query_params, headers=harness_headers)
         assert response.status_code == 200
         response_json = response.json()
 
@@ -1185,7 +1204,7 @@ class TestTrackerAPI:
         database_session.add_all(evaluation_result_rows)
         database_session.commit()
 
-        response = client.get("/retrieve-results", params=query_params)
+        response = client.get("/retrieve-results", params=query_params, headers=harness_headers)
         assert response.status_code == 200
 
         # NOTE: We have defaults so we need to exclude none to get the same response as the user
@@ -1215,7 +1234,7 @@ class TestTrackerAPI:
         database_session.add(final_evaluation_row)
         database_session.commit()
 
-        response = client.get("/retrieve-results", params=query_params)
+        response = client.get("/retrieve-results", params=query_params, headers=harness_headers)
         assert response.status_code == 200
         response_json = response.json()
 
@@ -1237,7 +1256,7 @@ class TestTrackerAPI:
         database_session.add_all(task_rows)
         database_session.commit()
 
-        response = client.get("/retrieve-results", params=query_params)
+        response = client.get("/retrieve-results", params=query_params, headers=harness_headers)
         assert response.status_code == 200
         response_json = response.json()
 
@@ -1268,7 +1287,7 @@ class TestTrackerAPI:
         )
         database_session.commit()
 
-        response = client.get("/retrieve-results", params=query_params)
+        response = client.get("/retrieve-results", params=query_params, headers=harness_headers)
         assert response.status_code == 200
         response_json = response.json()
 
@@ -1302,7 +1321,7 @@ class TestTrackerAPI:
         response = client.get(
             "/retrieve-results",
             params=[("benchmark_id", str(benchmark_row.id)), ("task_ids", "task_1"), ("task_ids", "task_3")],
-            headers={"X-Api-Key": "tracker-api-key"},
+            headers={**harness_headers, "X-Api-Key": "tracker-api-key"},
         )
         assert response.status_code == 200
         body = response.json()
@@ -1316,7 +1335,7 @@ class TestTrackerAPI:
         response = client.get(
             "/retrieve-results",
             params=[("benchmark_id", str(benchmark_row.id)), ("task_ids", "task_1"), ("task_ids", "task_11")],
-            headers={"X-Api-Key": "tracker-api-key"},
+            headers={**harness_headers, "X-Api-Key": "tracker-api-key"},
         )
         assert response.status_code == 200
         assert observed_results.keys() == {"task_1", "task_11"}
@@ -1328,6 +1347,7 @@ class TestTrackerAPI:
         example_benchmark_object: Benchmark,
         database_session: Session,
         monkeypatch: MonkeyPatch,
+        harness_headers: dict[str, str],
     ) -> None:
         example_benchmark_object.custom_benchmark_service = "http://service.internal:8001"
         database_session.add(example_benchmark_object)
@@ -1340,6 +1360,7 @@ class TestTrackerAPI:
                 ("benchmark_id", str(example_benchmark_object.id)),
                 ("task_ids", "task_0"),
             ],
+            headers=harness_headers,
         )
 
         assert response.status_code == 403
@@ -1350,6 +1371,7 @@ class TestTrackerAPI:
         monkeypatch: MonkeyPatch,
         database_session: Session,
         example_benchmark_object: Benchmark,
+        harness_headers: dict[str, str],
     ) -> None:
         benchmark_row = example_benchmark_object
         benchmark_row.name = "terminal_bench"
@@ -1385,7 +1407,7 @@ class TestTrackerAPI:
         response = client.get(
             "/retrieve-results",
             params=[("benchmark_id", str(benchmark_row.id)), ("task_ids", "task_1")],
-            headers={"X-Api-Key": "tracker-api-key"},
+            headers={**harness_headers, "X-Api-Key": "tracker-api-key"},
         )
 
         assert response.status_code == 200
@@ -1891,6 +1913,7 @@ class TestTrackerAPI:
         monkeypatch: MonkeyPatch,
         database_session: Session,
         harness_config: HarnessConfig,
+        harness_headers: dict[str, str],
     ) -> None:
         """Run labels should persist on start and be visible through fetch and list.
 
@@ -1917,7 +1940,11 @@ class TestTrackerAPI:
         assert benchmark_row is not None
         assert benchmark_row.label == "nightly"
 
-        fetch_response = client.get("/fetch-benchmark", params={"benchmark_id": str(benchmark_id)})
+        fetch_response = client.get(
+            "/fetch-benchmark",
+            params={"benchmark_id": str(benchmark_id)},
+            headers=harness_headers,
+        )
         assert fetch_response.status_code == 200
         assert fetch_response.json()["label"] == "nightly"
 
@@ -1952,6 +1979,7 @@ class TestTrackerAPI:
         monkeypatch: MonkeyPatch,
         database_session: Session,
         example_benchmark_object: Benchmark,
+        harness_headers: dict[str, str],
     ) -> None:
         database_session.add(example_benchmark_object)
         database_session.commit()
@@ -1974,6 +2002,7 @@ class TestTrackerAPI:
         response = client.get(
             f"/fetch-run-outputs/{example_benchmark_object.id}",
             params={"task_ids": ["task_1", "task_2"]},
+            headers=harness_headers,
         )
 
         assert response.status_code == 200
@@ -1997,6 +2026,7 @@ class TestTrackerAPI:
         monkeypatch: MonkeyPatch,
         database_session: Session,
         example_benchmark_object: Benchmark,
+        harness_headers: dict[str, str],
     ) -> None:
         """Never copy unsafe S3 key suffixes into a downloaded tar."""
         database_session.add(example_benchmark_object)
@@ -2019,7 +2049,10 @@ class TestTrackerAPI:
         monkeypatch.setattr("main.list_s3_objects", _mock_list_s3_objects)
         monkeypatch.setattr("main.download_many_from_s3", _mock_download_many_from_s3)
 
-        response = client.get(f"/fetch-run-outputs/{example_benchmark_object.id}")
+        response = client.get(
+            f"/fetch-run-outputs/{example_benchmark_object.id}",
+            headers=harness_headers,
+        )
 
         assert response.status_code == 200
         with tarfile.open(fileobj=io.BytesIO(response.content), mode="r:") as tar:
@@ -2030,6 +2063,7 @@ class TestTrackerAPI:
         monkeypatch: MonkeyPatch,
         database_session: Session,
         example_benchmark_object: Benchmark,
+        harness_headers: dict[str, str],
     ) -> None:
         """Do not download outputs when every listed tar member name is unsafe."""
         database_session.add(example_benchmark_object)
@@ -2043,7 +2077,10 @@ class TestTrackerAPI:
         monkeypatch.setattr("main.list_s3_objects", _mock_list_s3_objects)
         monkeypatch.setattr("main.download_many_from_s3", download_many_from_s3)
 
-        response = client.get(f"/fetch-run-outputs/{example_benchmark_object.id}")
+        response = client.get(
+            f"/fetch-run-outputs/{example_benchmark_object.id}",
+            headers=harness_headers,
+        )
 
         assert response.status_code == 404
         assert response.json() == {"detail": f"No outputs found for run '{example_benchmark_object.id}'"}
@@ -2054,6 +2091,7 @@ class TestTrackerAPI:
         monkeypatch: MonkeyPatch,
         database_session: Session,
         example_benchmark_object: Benchmark,
+        harness_headers: dict[str, str],
     ) -> None:
         database_session.add(example_benchmark_object)
         database_session.commit()
@@ -2063,7 +2101,10 @@ class TestTrackerAPI:
 
         monkeypatch.setattr("main.list_s3_objects", _mock_list_s3_objects)
 
-        response = client.get(f"/fetch-run-outputs/{example_benchmark_object.id}")
+        response = client.get(
+            f"/fetch-run-outputs/{example_benchmark_object.id}",
+            headers=harness_headers,
+        )
 
         assert response.status_code == 404
         assert response.json() == {"detail": f"No outputs found for run '{example_benchmark_object.id}'"}
@@ -2151,13 +2192,14 @@ class TestTrackerAPI:
 
     def test_fetch_benchmark_returns_400_when_harness_headers_missing(
         self,
-        harness_config: HarnessConfig,
+        database_session: Session,
+        example_benchmark_object: Benchmark,
     ) -> None:
         """Missing X-Harness-* headers should return 400, not 500 KeyError."""
-        app.dependency_overrides.pop(fetch_harness_config)
-        try:
-            response = client.get("/fetch-benchmark", params={"benchmark_id": str(uuid4())})
-            assert response.status_code == 400
-            assert "Missing harness config header" in response.json()["detail"]
-        finally:
-            app.dependency_overrides[fetch_harness_config] = lambda: harness_config
+        database_session.add(example_benchmark_object)
+        database_session.commit()
+
+        response = client.get("/fetch-benchmark", params={"benchmark_id": str(example_benchmark_object.id)})
+
+        assert response.status_code == 400
+        assert "Missing harness config header" in response.json()["detail"]

@@ -8,10 +8,9 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException
 from sqlmodel import Session, desc, select
 
-from tracker.api.dependencies import get_access_key_aws_runtime
+from tracker.api.dependencies import RunAWSDependency
 from tracker.auth import get_current_org
 from tracker.aws.cloudwatch_logs import get_benchmark_log_url
-from tracker.aws.runtime import AWSRuntime
 from tracker.aws.s3 import S3_BENCHMARKS_PREFIX, create_presigned_url, s3_object_exists
 from tracker.database.models import (
     Benchmark,
@@ -36,6 +35,11 @@ def _load_task_or_404(benchmark_id: UUID, task_id: str, org: Org, session: Sessi
     if benchmark is None:
         raise HTTPException(status_code=404, detail="Benchmark not found")
 
+    return benchmark, _load_task_for_benchmark_or_404(benchmark, task_id, org, session)
+
+
+def _load_task_for_benchmark_or_404(benchmark: Benchmark, task_id: str, org: Org, session: Session) -> Task:
+    """Return a task from an already organization-scoped benchmark."""
     task = session.exec(
         select(Task).where(Task.benchmark == benchmark.id).where(Task.org_id == org.id).where(Task.task_id == task_id)
     ).first()
@@ -43,7 +47,7 @@ def _load_task_or_404(benchmark_id: UUID, task_id: str, org: Org, session: Sessi
     if task is None:
         raise HTTPException(status_code=404, detail="Task not found")
 
-    return benchmark, task
+    return task
 
 
 def _task_prefix(benchmark_id: UUID, task_id: str) -> str:
@@ -112,12 +116,13 @@ def get_single_task(
 async def get_task_artifacts(
     benchmark_id: UUID,
     task_id: str,
+    run_context: RunAWSDependency,
     org: Org = Depends(get_current_org),
-    aws_runtime: AWSRuntime = Depends(get_access_key_aws_runtime),
     session: Session = Depends(get_session),
 ) -> TaskArtifactsResponse:
     """CloudWatch URL + presigned URL for the agent's output tarball, for the SingleTask page."""
-    _, task = _load_task_or_404(benchmark_id, task_id, org, session)
+    task = _load_task_for_benchmark_or_404(run_context.benchmark, task_id, org, session)
+    aws_runtime = run_context.aws_runtime
 
     cloudwatch_url: str | None = None
     if aws_runtime.resources.log_group and aws_runtime.resources.region:
@@ -132,7 +137,7 @@ async def get_task_artifacts(
     ttl_seconds: int | None = None
     key = f"{_task_prefix(benchmark_id, task_id)}agent_output.tar.gz"
     if await s3_object_exists(key, aws_runtime):
-        ttl_seconds = 300
+        ttl_seconds = aws_runtime.clients.maximum_presign_ttl(300)
         agent_output_url = await create_presigned_url(
             s3_key=key,
             runtime=aws_runtime,
