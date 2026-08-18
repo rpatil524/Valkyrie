@@ -5,7 +5,7 @@ import tarfile
 from collections.abc import AsyncGenerator, AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import datetime
-from typing import Annotated, Any
+from typing import Annotated, Any, cast
 from uuid import UUID, uuid4
 
 import httpx
@@ -39,17 +39,17 @@ from tracker.auth import (
 )
 from tracker.aws.cloudwatch_logs import get_benchmark_log_url
 from tracker.aws.resolver import (
-    fetch_harness_config,
     resolve_aws_runtime_metadata,
     resolve_run_aws_runtime,
     resolve_run_aws_runtime_and_access_key_config,
-    try_fetch_harness_config,
+    resolve_start_aws_runtime,
 )
 from tracker.aws.runtime import AWSRuntime
 from tracker.aws.secrets import resolve_secrets
 from tracker.agent.contract import get_contract_from_zip_bytes
 from tracker.aws.s3 import (
     S3_BENCHMARKS_PREFIX,
+    S3ObjectCopy,
     copy_agent_to_benchmark,
     create_benchmark_url,
     delete_from_s3,
@@ -88,6 +88,7 @@ from tracker.executor.dispatch_control import (
     admit_recovery_dispatch,
     admit_start_dispatch,
     resolve_enqueue_failure,
+    validate_managed_execution_release,
 )
 from tracker.database.session import check_database_connection, get_session
 from tracker.docent_analysis import (
@@ -110,6 +111,7 @@ from tracker.types import (
     FetchBenchmarksResponse,
     FetchBenchmarkTasksRequest,
     HarnessConfig,
+    ManagedExecutionContext,
     Order,
     RetrieveResultsResponse,
     RetryOrResumeBenchmarkResponse,
@@ -119,6 +121,7 @@ from tracker.types import (
     StopBenchmarkResponse,
     UpdateBenchmarkConcurrencyRequest,
     UpdateBenchmarkConcurrencyResponse,
+    validate_managed_execution_request,
 )
 from tracker.utils import (
     BenchmarkConcurrencyUpdate,
@@ -205,11 +208,32 @@ def _taskiq_labels() -> dict[str, str]:
     return {"request_id": request_id_var.get(), **trace_context}
 
 
+def _process_benchmark_kwargs(
+    benchmark_row: Benchmark,
+    request: StartBenchmarkRequest,
+    verified_task_ids: list[str],
+) -> dict[str, Any]:
+    if benchmark_row.aws_managed:
+        return {
+            "execution_context_json": ManagedExecutionContext(
+                version=2,
+                benchmark_id=benchmark_row.id,
+                verified_task_ids=verified_task_ids,
+                start_benchmark_request=request,
+            ).model_dump(mode="json")
+        }
+    return {
+        "start_benchmark_request_json": request.model_dump(),
+        "benchmark_id_str": str(benchmark_row.id),
+        "verified_task_ids": verified_task_ids,
+    }
+
+
 async def _enqueue_executor_dispatch(
     dispatch: ExecutorDispatch,
     *,
     session: Session,
-    start_benchmark_request_json: dict[str, Any],
+    payload: dict[str, Any],
     verified_task_ids: list[str],
 ) -> None:
     for attempt in range(3):
@@ -218,9 +242,7 @@ async def _enqueue_executor_dispatch(
                 process_benchmark.kicker()
                 .with_labels(**_taskiq_labels())
                 .kiq(
-                    start_benchmark_request_json=start_benchmark_request_json,
-                    benchmark_id_str=str(dispatch.benchmark_id),
-                    verified_task_ids=verified_task_ids,
+                    **payload,
                     executor_dispatch_id=str(dispatch.id),
                     executor_release_id=dispatch.executor_release_id,
                     executor_artifact_uri=dispatch.executor_artifact_uri,
@@ -262,23 +284,75 @@ async def _enqueue_executor_dispatch(
 
 async def _delete_uncommitted_agent_copy(
     *,
-    created: bool,
+    created_copy: S3ObjectCopy | None,
     benchmark_id: UUID,
     request: StartBenchmarkRequest,
     aws_runtime: AWSRuntime,
 ) -> None:
-    if not created:
+    if created_copy is None:
         return
     try:
         await delete_from_s3(
             get_benchmark_contract_s3_key(str(benchmark_id), request.contract.name),
             aws_runtime,
+            version_id=created_copy.version_id,
         )
     except Exception:
         logger.exception(
             "Failed to delete uncommitted benchmark agent copy",
             extra={"benchmark_id": str(benchmark_id)},
         )
+
+
+def _start_admission_is_absent(
+    session: Session,
+    *,
+    benchmark_id: UUID,
+    dispatch_id: UUID,
+) -> bool:
+    """Return whether a fresh database read proves the start admission was not committed."""
+    try:
+        with Session(bind=session.get_bind()) as verification_session:
+            benchmark = verification_session.get(Benchmark, benchmark_id)
+            dispatch = verification_session.get(ExecutorDispatch, dispatch_id)
+    except Exception:
+        logger.exception(
+            "Could not verify failed benchmark admission; retaining its agent copy",
+            extra={"benchmark_id": str(benchmark_id), "executor_dispatch_id": str(dispatch_id)},
+        )
+        return False
+    return benchmark is None and dispatch is None
+
+
+async def _rollback_failed_start_admission(
+    session: Session,
+    *,
+    benchmark_id: UUID,
+    dispatch_id: UUID,
+    created_copy: S3ObjectCopy | None,
+    request: StartBenchmarkRequest,
+    aws_runtime: AWSRuntime,
+) -> None:
+    try:
+        session.rollback()
+    except Exception:
+        logger.exception(
+            "Failed to roll back benchmark admission",
+            extra={"benchmark_id": str(benchmark_id), "executor_dispatch_id": str(dispatch_id)},
+        )
+        return
+    if not _start_admission_is_absent(
+        session,
+        benchmark_id=benchmark_id,
+        dispatch_id=dispatch_id,
+    ):
+        return
+    await _delete_uncommitted_agent_copy(
+        created_copy=created_copy,
+        benchmark_id=benchmark_id,
+        request=request,
+        aws_runtime=aws_runtime,
+    )
 
 
 @app.exception_handler(TrackerServiceError)
@@ -410,16 +484,39 @@ async def start_benchmark(
     if request.custom_benchmark_service is not None:
         _authorize_custom_benchmark_destination(request.custom_benchmark_service, run_starter.org)
 
-    # Prefer harness_config from X-Harness-* headers (web FE); fall back to request body (CLI).
-    header_harness_config = try_fetch_harness_config(http_request)
-    effective_harness_config = header_harness_config or request.harness_config
-    # TODO: Drop the top-level fallback after clients using that field have aged out.
-    provider_secret_name = request.harness_config.sandbox_provider_secret_name or request.sandbox_provider_secret_name
-    if provider_secret_name:
-        effective_harness_config = effective_harness_config.model_copy(
-            update={"sandbox_provider_secret_name": provider_secret_name}
+    runtime_resolution = resolve_start_aws_runtime(http_request, request.harness_config, run_starter.org.id)
+    aws_runtime = runtime_resolution.runtime
+    effective_harness_config = runtime_resolution.access_key_harness_config
+    aws_managed = runtime_resolution.aws_managed
+
+    if aws_managed:
+        if not request.sandbox_provider or not request.sandbox_provider_secret_name:
+            raise HTTPException(
+                status_code=400,
+                detail="Managed runs require a sandbox provider and sandbox provider secret name.",
+            )
+        try:
+            validate_managed_execution_request(request)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        try:
+            validate_managed_execution_release(session)
+        except ReleaseControlError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+    else:
+        effective_harness_config = cast(HarnessConfig, effective_harness_config)
+        body_provider_secret_name = (
+            request.harness_config.sandbox_provider_secret_name if request.harness_config is not None else None
         )
-    aws_runtime = AWSRuntime.from_harness_config(effective_harness_config)
+        provider_secret_name = (
+            body_provider_secret_name
+            or request.sandbox_provider_secret_name
+            or effective_harness_config.sandbox_provider_secret_name
+        )
+        if provider_secret_name:
+            effective_harness_config = effective_harness_config.model_copy(
+                update={"sandbox_provider_secret_name": provider_secret_name}
+            )
 
     service_headers = dict(request.service_headers)
     if request.service_auth_header_name and request.service_auth_secret_name:
@@ -443,8 +540,24 @@ async def start_benchmark(
         }
     )
 
+    if aws_managed:
+        try:
+            validate_managed_execution_request(request)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     if not request.contract.install_cmd and not request.contract.run_cmd:
         request = request.model_copy(update={"contract": await _resolve_contract_from_s3(request, aws_runtime)})
+        if aws_managed:
+            try:
+                validate_managed_execution_request(request)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+    elif aws_managed and not await s3_object_exists(get_contract_s3_key(request.contract.name), aws_runtime):
+        raise HTTPException(
+            status_code=404,
+            detail=f"Agent '{request.contract.name}' is not available in the deployment bucket.",
+        )
 
     logger.info(f"Starting benchmark run - contract: {request.contract.name}, benchmark: {request.benchmark_name}")
 
@@ -477,16 +590,18 @@ async def start_benchmark(
         except Exception:
             logger.exception("Failed to close benchmark service client for %s", request.benchmark_name)
 
-    benchmark_row = start_benchmark_request_to_benchmark(request, run_starter)
+    benchmark_row = start_benchmark_request_to_benchmark(
+        request,
+        run_starter,
+        aws_managed=aws_managed,
+    )
     dispatch_id = uuid4()
-    agent_copy_created = False
+    created_agent_copy: S3ObjectCopy | None = None
     try:
-        agent_copy_created = bool(
-            await copy_agent_to_benchmark(
-                str(benchmark_row.id),
-                request.contract.name,
-                aws_runtime,
-            )
+        created_agent_copy = await copy_agent_to_benchmark(
+            str(benchmark_row.id),
+            request.contract.name,
+            aws_runtime,
         )
         for task_id in verify_response.task_ids:
             session.add(Task(org_id=benchmark_row.org_id, benchmark=benchmark_row.id, task_id=task_id))
@@ -495,24 +610,19 @@ async def start_benchmark(
             benchmark=benchmark_row,
             dispatch_id=dispatch_id,
         )
+        executor_payload = _process_benchmark_kwargs(benchmark_row, request, verify_response.task_ids)
         session.commit()
-    except ReleaseControlError as exc:
-        session.rollback()
-        await _delete_uncommitted_agent_copy(
-            created=agent_copy_created,
-            benchmark_id=benchmark_row.id,
-            request=request,
-            aws_runtime=aws_runtime,
-        )
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
     except Exception as exc:
-        session.rollback()
-        await _delete_uncommitted_agent_copy(
-            created=agent_copy_created,
+        await _rollback_failed_start_admission(
+            session,
             benchmark_id=benchmark_row.id,
+            dispatch_id=dispatch_id,
+            created_copy=created_agent_copy,
             request=request,
             aws_runtime=aws_runtime,
         )
+        if isinstance(exc, ReleaseControlError):
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
         raise TrackerServiceError("Failed to admit benchmark execution") from exc
 
     benchmark_id_var.set(str(benchmark_row.id))
@@ -526,7 +636,7 @@ async def start_benchmark(
     await _enqueue_executor_dispatch(
         executor_dispatch,
         session=session,
-        start_benchmark_request_json=request.model_dump(),
+        payload=executor_payload,
         verified_task_ids=verify_response.task_ids,
     )
 
@@ -994,7 +1104,6 @@ async def retry_or_resume_benchmark(
     secrets: dict[str, str] = Body(default={}),
     benchmark_url: str | None = Body(default=None),
     session: Session = Depends(get_session),
-    harness_config: HarnessConfig = Depends(fetch_harness_config),
     org: Org = Depends(get_current_org),
 ) -> RetryOrResumeBenchmarkResponse:
     """
@@ -1016,11 +1125,22 @@ async def retry_or_resume_benchmark(
         RetryOrResumeBenchmarkResponse
     """
     benchmark_row = get_scoped(Benchmark, benchmark_id, session, org)
+    runtime_resolution = resolve_run_aws_runtime_and_access_key_config(
+        http_request,
+        aws_managed=benchmark_row.aws_managed,
+        org_id=org.id,
+    )
 
     if benchmark_row.status == BenchmarkStatus.STOPPING:
         raise HTTPException(
             status_code=400,
             detail=f"Run {benchmark_id} is in the {benchmark_row.status} state. Cannot continue a run that is stopping.",
+        )
+
+    if benchmark_row.status == BenchmarkStatus.IN_PROGRESS and not retry and secrets:
+        raise HTTPException(
+            status_code=409,
+            detail="Secret overrides require retry=true while a run is in progress.",
         )
 
     if benchmark_url is not None:
@@ -1075,6 +1195,20 @@ async def retry_or_resume_benchmark(
             )
         pre_action_status = benchmark_row.status
 
+        if benchmark_row.aws_managed:
+            prospective_request = benchmark_row.managed_start_benchmark_request(
+                service_headers=effective_service_headers,
+            )
+            if secrets:
+                prospective_contract = prospective_request.contract.model_copy(
+                    update={"secrets": {**prospective_request.contract.secrets, **secrets}}
+                )
+                prospective_request = prospective_request.model_copy(update={"contract": prospective_contract})
+            try:
+                validate_managed_execution_request(prospective_request)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+
         verified_task_ids = await reset_to_in_progress_status(
             benchmark_row=benchmark_row,
             session=session,
@@ -1113,10 +1247,16 @@ async def retry_or_resume_benchmark(
                 benchmark_url=benchmark_url,
             )
 
-        resume_request = benchmark_row.start_benchmark_request(
-            harness_config,
-            service_headers=effective_service_headers,
-        )
+        if benchmark_row.aws_managed:
+            resume_request = benchmark_row.managed_start_benchmark_request(
+                service_headers=effective_service_headers,
+            )
+        else:
+            access_key_harness_config = cast(HarnessConfig, runtime_resolution.access_key_harness_config)
+            resume_request = benchmark_row.access_key_start_benchmark_request(
+                access_key_harness_config,
+                service_headers=effective_service_headers,
+            )
         dispatch_kind = ExecutorDispatchKind.RETRY if retry else ExecutorDispatchKind.RESUME
         executor_dispatch = admit_recovery_dispatch(
             session,
@@ -1125,6 +1265,7 @@ async def retry_or_resume_benchmark(
             dispatch_id=dispatch_id,
             kind=dispatch_kind,
         )
+        executor_payload = _process_benchmark_kwargs(benchmark_row, resume_request, verified_task_ids)
         session.commit()
     except ReleaseControlError as exc:
         session.rollback()
@@ -1141,7 +1282,7 @@ async def retry_or_resume_benchmark(
     await _enqueue_executor_dispatch(
         executor_dispatch,
         session=session,
-        start_benchmark_request_json=resume_request.model_dump(),
+        payload=executor_payload,
         verified_task_ids=verified_task_ids,
     )
     return RetryOrResumeBenchmarkResponse(status="success")

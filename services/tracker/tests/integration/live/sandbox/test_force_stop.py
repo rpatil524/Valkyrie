@@ -335,7 +335,7 @@ class TestForceStop:
             authority_kwargs = executor_authority_kwargs(example_benchmark_object)
             benchmark_task = asyncio.create_task(
                 process_benchmark(
-                    start_benchmark_request_json=example_benchmark_object.start_benchmark_request(
+                    start_benchmark_request_json=example_benchmark_object.access_key_start_benchmark_request(
                         harness_config, service_headers=service_headers
                     ).model_dump(),
                     benchmark_id_str=str(example_benchmark_object.id),

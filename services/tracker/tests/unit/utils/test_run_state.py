@@ -5,6 +5,7 @@ Run: uv run pytest tests/unit/utils/test_run_state.py
 
 from datetime import datetime
 from typing import Any, Sequence
+from unittest.mock import AsyncMock
 from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
 
@@ -224,7 +225,12 @@ class TestRunState:
         response: Response = client.post(f"/stop-benchmark/{benchmark_row.id}?force=false")
         assert response.status_code == 400
 
-    def test_resume_benchmark(self, example_benchmark_object: Benchmark, database_session: Session) -> None:
+    def test_resume_benchmark(
+        self,
+        example_benchmark_object: Benchmark,
+        database_session: Session,
+        harness_headers: dict[str, str],
+    ) -> None:
         """Tests the flow of updating the benchmark related objects to the proper states when resuming a benchmark
 
         Test Cases:
@@ -261,7 +267,10 @@ class TestRunState:
         assert len(task_ids) == 5
 
         # Test request to resume the benchmark
-        response: Response = client.post(f"/retry-or-resume-benchmark/{benchmark_row.id}?retry=false")
+        response: Response = client.post(
+            f"/retry-or-resume-benchmark/{benchmark_row.id}?retry=false",
+            headers=harness_headers,
+        )
         assert response.status_code == 200, response.text
         assert response.json() == {"status": "success"}
 
@@ -296,7 +305,10 @@ class TestRunState:
         database_session.commit()
 
         # Call resume benchmark with retry enabled
-        response = client.post(f"/retry-or-resume-benchmark/{benchmark_row.id}?retry=true")
+        response = client.post(
+            f"/retry-or-resume-benchmark/{benchmark_row.id}?retry=true",
+            headers=harness_headers,
+        )
         assert response.status_code == 200
         assert response.json() == {"status": "success"}
 
@@ -311,6 +323,7 @@ class TestRunState:
         example_benchmark_object: Benchmark,
         database_session: Session,
         harness_config: HarnessConfig,
+        harness_headers: dict[str, str],
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """Tests edge cases for resuming a benchmark
@@ -328,7 +341,10 @@ class TestRunState:
         database_session.add(benchmark_row)
         database_session.commit()
 
-        response: Response = client.post(f"/retry-or-resume-benchmark/{benchmark_row.id}?retry=false")
+        response: Response = client.post(
+            f"/retry-or-resume-benchmark/{benchmark_row.id}?retry=false",
+            headers=harness_headers,
+        )
         assert response.status_code == 200
 
         # Set benchmark to stopped state but add only finished tasks
@@ -345,7 +361,10 @@ class TestRunState:
         database_session.commit()
 
         # No stopped tasks to resume, but this is allowed (re-runs post-task steps like lambda)
-        response = client.post(f"/retry-or-resume-benchmark/{benchmark_row.id}?retry=false")
+        response = client.post(
+            f"/retry-or-resume-benchmark/{benchmark_row.id}?retry=false",
+            headers=harness_headers,
+        )
         assert response.status_code == 200
 
         # Ensure that we can recreate the environment the benchmark was started in
@@ -359,10 +378,14 @@ class TestRunState:
             sandbox_provider="modal",
         )
 
-        benchmark_row = start_benchmark_request_to_benchmark(original_start_benchmark_request, self._test_starter)
+        benchmark_row = start_benchmark_request_to_benchmark(
+            original_start_benchmark_request,
+            self._test_starter,
+            aws_managed=False,
+        )
         assert benchmark_row.arguments.sandbox_provider_secret_name == "ModalSecrets"
 
-        recreated_start_benchmark_request = benchmark_row.start_benchmark_request(harness_config)
+        recreated_start_benchmark_request = benchmark_row.access_key_start_benchmark_request(harness_config)
         assert recreated_start_benchmark_request == original_start_benchmark_request.model_copy(
             update={
                 "harness_config": harness_config.model_copy(update={"sandbox_provider_secret_name": "ModalSecrets"}),
@@ -394,6 +417,7 @@ class TestRunState:
         response = client.post(
             f"/retry-or-resume-benchmark/{example_benchmark_object.id}?retry=false",
             json={"task_ids": ["task_5"]},
+            headers=harness_headers,
         )
         assert response.status_code == 500
         assert response.json() == {"detail": "Benchmark service request failed"}
@@ -413,6 +437,7 @@ class TestRunState:
         response = client.post(
             f"/retry-or-resume-benchmark/{example_benchmark_object.id}?retry=false",
             json={"task_ids": task_ids},
+            headers=harness_headers,
         )
         assert response.status_code == 200
         assert response.json() == {"status": "success"}
@@ -421,6 +446,33 @@ class TestRunState:
         task_rows = database_session.exec(select(Task).where(col(Task.benchmark) == example_benchmark_object.id)).all()
         assert len(task_rows) == 5
         assert all(task_row.status == TaskStatus.PENDING for task_row in task_rows)
+
+    def test_running_benchmark_rejects_secret_overrides_without_retry(
+        self,
+        example_benchmark_object: Benchmark,
+        database_session: Session,
+        harness_headers: dict[str, str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        benchmark_row = example_benchmark_object
+        database_session.add(benchmark_row)
+        database_session.commit()
+        original_arguments = benchmark_row.arguments.model_copy(deep=True)
+        enqueue = AsyncMock()
+        monkeypatch.setattr("main._enqueue_executor_dispatch", enqueue)
+
+        response = client.post(
+            f"/retry-or-resume-benchmark/{benchmark_row.id}?retry=false",
+            headers=harness_headers,
+            json={"secrets": {"MODEL_API_KEY": "replacement"}},
+        )
+
+        assert response.status_code == 409
+        assert response.json() == {"detail": "Secret overrides require retry=true while a run is in progress."}
+        database_session.refresh(benchmark_row)
+        assert benchmark_row.status == BenchmarkStatus.IN_PROGRESS
+        assert benchmark_row.arguments == original_arguments
+        enqueue.assert_not_awaited()
 
     def test_create_task_rows(
         self,

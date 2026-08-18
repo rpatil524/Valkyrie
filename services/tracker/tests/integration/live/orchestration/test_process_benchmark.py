@@ -73,6 +73,7 @@ async def _create_benchmark(
     benchmark = start_benchmark_request_to_benchmark(
         request,
         RequestIdentity(org=Org(id=TEST_ORG_ID, name="default"), access_key_id=None, email=None, name=None),
+        aws_managed=False,
     )
     copied = await copy_agent_to_benchmark(
         str(benchmark.id),
@@ -349,7 +350,10 @@ class TestProcessBenchmark:
         await gather(
             *[
                 process_benchmark(
-                    request.model_dump(),
+                    benchmark.access_key_start_benchmark_request(
+                        harness_config,
+                        service_headers=service_headers,
+                    ).model_dump(),
                     str(benchmark.id),
                     [_TASK_ID],
                     **authority_by_benchmark[benchmark.id],

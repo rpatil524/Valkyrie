@@ -30,10 +30,12 @@ from taskiq.message import BrokerMessage, TaskiqMessage
 
 import main as main_module
 import services.executor_host.supervisor as executor_host  # pyright: ignore[reportMissingImports]
+from executor_protocol import SUPPORTED_PROTOCOL_VERSION
 from main import app, tracker_service_error_handler
 from tests.utils import TEST_ORG_ID, async_iterator
 from tracker.auth import RequestIdentity, get_current_org, get_current_starter
 from tracker.aws.runtime import AWSRuntime
+from tracker.aws.s3 import S3ObjectCopy
 from tracker.database.models import (
     AgentContractRequest,
     Benchmark,
@@ -74,7 +76,7 @@ def active_executor_release(database_session: Session) -> None:
         id="test-release",
         artifact_uri="s3://artifacts/test-release.pex",
         artifact_digest="digest-test-release",
-        protocol_version="1",
+        protocol_version=SUPPORTED_PROTOCOL_VERSION,
         status=ExecutorReleaseStatus.ACTIVE,
         readiness_verified=True,
     )
@@ -544,7 +546,7 @@ class TestTrackerAPI:
         assert benchmark_row.current_execution_release_id == "test-release"
         assert benchmark_row.executor_artifact_uri == "s3://artifacts/test-release.pex"
         assert benchmark_row.executor_artifact_digest == "digest-test-release"
-        assert benchmark_row.executor_protocol_version == "1"
+        assert benchmark_row.executor_protocol_version == SUPPORTED_PROTOCOL_VERSION
         queued_call = mock_kicker.queued_calls[0]
         dispatch_id = UUID(queued_call["executor_dispatch_id"])
         dispatch = database_session.get(ExecutorDispatch, dispatch_id)
@@ -555,7 +557,7 @@ class TestTrackerAPI:
         assert dispatch.executor_release_id == "test-release"
         assert dispatch.executor_artifact_uri == "s3://artifacts/test-release.pex"
         assert dispatch.executor_artifact_digest == "digest-test-release"
-        assert dispatch.executor_protocol_version == "1"
+        assert dispatch.executor_protocol_version == SUPPORTED_PROTOCOL_VERSION
         assert queued_call["verified_task_ids"] == [f"task_{i}" for i in range(500)]
         task_rows = database_session.exec(select(Task).where(Task.benchmark == benchmark_row.id)).all()
         assert len(task_rows) == 500
@@ -567,15 +569,22 @@ class TestTrackerAPI:
         assert json_response["executor_release_id"] == "test-release"
         assert json_response["current_execution_release_id"] == "test-release"
         assert json_response["executor_artifact_digest"] == "digest-test-release"
-        assert json_response["executor_protocol_version"] == "1"
+        assert json_response["executor_protocol_version"] == SUPPORTED_PROTOCOL_VERSION
         assert json_response["concurrency"] == request.concurrency
 
+    @pytest.mark.parametrize(
+        ("protocol_version", "aws_managed"),
+        [("1", False), (SUPPORTED_PROTOCOL_VERSION, True)],
+        ids=["protocol-1-access-key", "protocol-2-managed"],
+    )
     async def test_start_benchmark_serializes_committed_dispatch_for_executor_host(
         self,
         contract: AgentContractRequest,
         monkeypatch: MonkeyPatch,
         database_session: Session,
         harness_config: HarnessConfig,
+        protocol_version: str,
+        aws_managed: bool,
     ) -> None:
         observed_at_enqueue: dict[str, Any] = {}
         taskiq_message: TaskiqMessage | None = None
@@ -587,7 +596,9 @@ class TestTrackerAPI:
             )
             kwargs = taskiq_message.kwargs
             with Session(database_session.get_bind()) as assertion_session:
-                benchmark_id = UUID(kwargs["benchmark_id_str"])
+                benchmark_id = UUID(
+                    kwargs["execution_context_json"]["benchmark_id"] if aws_managed else kwargs["benchmark_id_str"]
+                )
                 dispatch_id = UUID(kwargs["executor_dispatch_id"])
                 observed_at_enqueue["benchmark"] = assertion_session.get(Benchmark, benchmark_id)
                 observed_at_enqueue["dispatch"] = assertion_session.get(ExecutorDispatch, dispatch_id)
@@ -598,16 +609,34 @@ class TestTrackerAPI:
         active_release = database_session.get(ExecutorRelease, "test-release")
         assert active_release is not None
         active_release.artifact_digest = "a" * 64
+        active_release.protocol_version = protocol_version
         database_session.add(active_release)
         database_session.commit()
 
-        request = StartBenchmarkRequest(
-            contract=contract,
-            benchmark_name="swebench",
-            concurrency=1,
-            task_ids=["task_0"],
-            harness_config=harness_config,
-        )
+        if aws_managed:
+            monkeypatch.setattr("tracker.config.AWS_DEPLOYMENT_ROLE_ORG_IDS", str(TEST_ORG_ID))
+            monkeypatch.setattr("tracker.config.AWS_DEPLOYMENT_REGION", "deployment-region")
+            monkeypatch.setattr("tracker.config.AWS_DEPLOYMENT_S3_BUCKET", "deployment-bucket")
+            monkeypatch.setattr("tracker.config.AWS_DEPLOYMENT_LOG_GROUP", "deployment-log-group")
+            monkeypatch.setattr("tracker.config.AWS_DEPLOYMENT_LOG_RETENTION_DAYS", "30")
+            monkeypatch.setattr("tracker.config.AWS_MANAGED_SUBMISSIONS_ENABLED", True)
+            monkeypatch.setattr(main_module, "s3_object_exists", AsyncMock(return_value=True))
+            request = StartBenchmarkRequest(
+                contract=contract,
+                benchmark_name="swebench",
+                concurrency=1,
+                task_ids=["task_0"],
+                sandbox_provider="daytona",
+                sandbox_provider_secret_name="provider-secret",
+            )
+        else:
+            request = StartBenchmarkRequest(
+                contract=contract,
+                benchmark_name="swebench",
+                concurrency=1,
+                task_ids=["task_0"],
+                harness_config=harness_config,
+            )
         task = main_module.process_benchmark
         monkeypatch.setattr(task, "kicker", lambda: type(task).kicker(task))
         monkeypatch.setattr(task.broker, "kick", capture_message)
@@ -629,10 +658,12 @@ class TestTrackerAPI:
         assert dispatch.executor_release_id == benchmark.current_execution_release_id
         assert [task.task_id for task in tasks] == ["task_0"]
         assert taskiq_message.args == []
-        assert set(taskiq_message.kwargs) == {
-            "start_benchmark_request_json",
-            "benchmark_id_str",
-            "verified_task_ids",
+        execution_kwargs = (
+            {"execution_context_json"}
+            if aws_managed
+            else {"start_benchmark_request_json", "benchmark_id_str", "verified_task_ids"}
+        )
+        assert set(taskiq_message.kwargs) == execution_kwargs | {
             "executor_dispatch_id",
             "executor_release_id",
             "executor_artifact_uri",
@@ -648,16 +679,12 @@ class TestTrackerAPI:
             *,
             executor_dispatch_id: str,
             dispatch: executor_host.ArtifactDispatch,
-            start_benchmark_request_json: dict[str, object],
-            benchmark_id_str: str,
-            verified_task_ids: list[str],
+            process_payload: executor_host.ExecutorProcessPayload,
         ) -> None:
             observed_host.update(
                 executor_dispatch_id=executor_dispatch_id,
                 dispatch=dispatch,
-                start_benchmark_request_json=start_benchmark_request_json,
-                benchmark_id_str=benchmark_id_str,
-                verified_task_ids=verified_task_ids,
+                process_payload=process_payload,
             )
 
         monkeypatch.setattr(executor_host, "run_executor_dispatch", capture_dispatch)
@@ -665,11 +692,22 @@ class TestTrackerAPI:
 
         assert taskiq_message.task_name == executor_host.launch_executor.task_name
         assert STABLE_QUEUE_NAME == executor_host.QUEUE_NAME
-        assert taskiq_message.kwargs["executor_protocol_version"] == executor_host.SUPPORTED_PROTOCOL_VERSION
+        assert taskiq_message.kwargs["executor_protocol_version"] == protocol_version
         assert observed_host["executor_dispatch_id"] == str(dispatch.id)
-        assert observed_host["benchmark_id_str"] == str(benchmark.id)
-        assert observed_host["verified_task_ids"] == ["task_0"]
-        assert observed_host["start_benchmark_request_json"] == request.model_dump()
+        process_payload = observed_host["process_payload"]
+        assert isinstance(process_payload, executor_host.ExecutorProcessPayload)
+        assert process_payload.benchmark_id == str(benchmark.id)
+        assert process_payload.verified_task_ids == ["task_0"]
+        if aws_managed:
+            assert process_payload.arguments == {
+                "execution_context_json": taskiq_message.kwargs["execution_context_json"]
+            }
+        else:
+            assert process_payload.arguments == {
+                "start_benchmark_request_json": request.model_dump(),
+                "benchmark_id_str": str(benchmark.id),
+                "verified_task_ids": ["task_0"],
+            }
         host_dispatch = observed_host["dispatch"]
         assert isinstance(host_dispatch, executor_host.ArtifactDispatch)
         assert host_dispatch.release_id == dispatch.executor_release_id
@@ -729,7 +767,8 @@ class TestTrackerAPI:
         assert admission is not None
         database_session.delete(admission)
         database_session.commit()
-        copy_agent = AsyncMock(return_value=agent_copy_created)
+        created_copy = S3ObjectCopy(version_id="copy-version") if agent_copy_created else None
+        copy_agent = AsyncMock(return_value=created_copy)
         delete_agent_copy = AsyncMock()
         monkeypatch.setattr("main.copy_agent_to_benchmark", copy_agent)
         monkeypatch.setattr("main.delete_from_s3", delete_agent_copy)
@@ -754,28 +793,27 @@ class TestTrackerAPI:
             delete_agent_copy.assert_awaited_once_with(
                 f"benchmarks/{copied_benchmark_id}/{contract.name}.zip",
                 AWSRuntime.from_harness_config(harness_config),
+                version_id="copy-version",
             )
         else:
             delete_agent_copy.assert_not_awaited()
 
-    async def test_start_admission_failure_rolls_back_and_deletes_created_copy(
+    async def test_start_payload_failure_rolls_back_and_deletes_created_copy(
         self,
         contract: AgentContractRequest,
         database_session: Session,
         harness_config: HarnessConfig,
         monkeypatch: MonkeyPatch,
     ) -> None:
-        copy_agent = AsyncMock(return_value=True)
+        copy_agent = AsyncMock(return_value=S3ObjectCopy(version_id="copy-version"))
         delete_agent_copy = AsyncMock()
-        admit_start_dispatch = main_module.admit_start_dispatch
 
-        def fail_after_admission(*args: Any, **kwargs: Any) -> None:
-            admit_start_dispatch(*args, **kwargs)
-            raise RuntimeError("commit preparation failed")
+        def fail_payload_build(*_args: Any, **_kwargs: Any) -> None:
+            raise RuntimeError("payload validation failed")
 
         monkeypatch.setattr(main_module, "copy_agent_to_benchmark", copy_agent)
         monkeypatch.setattr(main_module, "delete_from_s3", delete_agent_copy)
-        monkeypatch.setattr(main_module, "admit_start_dispatch", fail_after_admission)
+        monkeypatch.setattr(main_module, "_process_benchmark_kwargs", fail_payload_build)
         monkeypatch.setattr(BenchmarkServiceClient, "verify_task_ids", _verify_single_task_id)
         request = StartBenchmarkRequest(
             contract=contract,
@@ -800,7 +838,78 @@ class TestTrackerAPI:
         delete_agent_copy.assert_awaited_once_with(
             f"benchmarks/{copied_benchmark_id}/{contract.name}.zip",
             AWSRuntime.from_harness_config(harness_config),
+            version_id="copy-version",
         )
+
+    async def test_start_commit_acknowledgement_failure_retains_durable_copy(
+        self,
+        contract: AgentContractRequest,
+        database_session: Session,
+        harness_config: HarnessConfig,
+        monkeypatch: MonkeyPatch,
+    ) -> None:
+        copy_agent = AsyncMock(return_value=S3ObjectCopy(version_id="copy-version"))
+        delete_agent_copy = AsyncMock()
+        commit = database_session.commit
+
+        def commit_then_fail() -> None:
+            commit()
+            raise RuntimeError("commit acknowledgement lost")
+
+        monkeypatch.setattr(main_module, "copy_agent_to_benchmark", copy_agent)
+        monkeypatch.setattr(main_module, "delete_from_s3", delete_agent_copy)
+        monkeypatch.setattr(database_session, "commit", commit_then_fail)
+        monkeypatch.setattr(BenchmarkServiceClient, "verify_task_ids", _verify_single_task_id)
+        request = StartBenchmarkRequest(
+            contract=contract,
+            benchmark_name="swebench",
+            concurrency=1,
+            task_ids=["task_0"],
+            harness_config=harness_config,
+        )
+
+        response = TestClient(app, raise_server_exceptions=False).post(
+            "/start-benchmark",
+            json=request.model_dump(),
+        )
+
+        assert response.status_code == 500
+        benchmark = database_session.exec(select(Benchmark)).one()
+        dispatch = database_session.exec(select(ExecutorDispatch)).one()
+        assert dispatch.benchmark_id == benchmark.id
+        assert dispatch.status == ExecutorDispatchStatus.QUEUED
+        delete_agent_copy.assert_not_awaited()
+
+    async def test_start_rollback_failure_retains_copy(
+        self,
+        contract: AgentContractRequest,
+        database_session: Session,
+        harness_config: HarnessConfig,
+        monkeypatch: MonkeyPatch,
+    ) -> None:
+        rollback = MagicMock(side_effect=RuntimeError("database connection lost"))
+        verify_absent = MagicMock(side_effect=AssertionError("must not read after an uncertain rollback"))
+        delete_agent_copy = AsyncMock()
+        monkeypatch.setattr(database_session, "rollback", rollback)
+        monkeypatch.setattr(main_module, "_start_admission_is_absent", verify_absent)
+        monkeypatch.setattr(main_module, "delete_from_s3", delete_agent_copy)
+
+        await main_module._rollback_failed_start_admission(
+            database_session,
+            benchmark_id=uuid4(),
+            dispatch_id=uuid4(),
+            created_copy=S3ObjectCopy(version_id="copy-version"),
+            request=StartBenchmarkRequest(
+                contract=contract,
+                benchmark_name="swebench",
+                harness_config=harness_config,
+            ),
+            aws_runtime=AWSRuntime.from_harness_config(harness_config),
+        )
+
+        rollback.assert_called_once_with()
+        verify_absent.assert_not_called()
+        delete_agent_copy.assert_not_awaited()
 
     async def test_start_benchmark_returns_502_when_benchmark_service_is_unreachable(
         self,
@@ -2115,6 +2224,7 @@ class TestTrackerAPI:
         monkeypatch: MonkeyPatch,
         database_session: Session,
         harness_config: HarnessConfig,
+        harness_headers: dict[str, str],
     ) -> None:
         """Test that BenchmarkServiceUnauthenticatedError returns 502 without capturing to Sentry.
 
@@ -2182,6 +2292,7 @@ class TestTrackerAPI:
             f"/retry-or-resume-benchmark/{benchmark.id}",
             json={"task_ids": [], "service_headers": {}},
             params={"retry": "true"},
+            headers=harness_headers,
         )
         assert response.status_code == 502
         assert response.json() == {"detail": "Benchmark service authentication failed"}

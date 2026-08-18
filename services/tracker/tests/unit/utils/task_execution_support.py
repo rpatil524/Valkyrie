@@ -77,7 +77,11 @@ def create_task_environment(
         task_ids=["task_0"],
         harness_config=harness_config,
     )
-    benchmark_row = start_benchmark_request_to_benchmark(start_benchmark_request, run_starter or _TEST_STARTER)
+    benchmark_row = start_benchmark_request_to_benchmark(
+        start_benchmark_request,
+        run_starter or _TEST_STARTER,
+        aws_managed=False,
+    )
     benchmark_row.status = BenchmarkStatus.IN_PROGRESS
     database_session.add(benchmark_row)
     database_session.commit()

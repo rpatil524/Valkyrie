@@ -26,6 +26,7 @@ from sqlmodel import Session, select
 
 import main as main_module
 from main import app
+from executor_protocol import SUPPORTED_PROTOCOL_VERSION
 import tracker.utils as tracker_utils
 from tests.factories import make_benchmark, make_error_result, make_evaluation_result
 from tests.unit.utils.task_execution_support import MockKicker, make_retrieve_task_response
@@ -83,7 +84,7 @@ def example_benchmark_object(contract: AgentContractRequest, database_session: S
         id="test-release",
         artifact_uri="s3://artifacts/test-release.pex",
         artifact_digest="digest-test-release",
-        protocol_version="1",
+        protocol_version=SUPPORTED_PROTOCOL_VERSION,
         readiness_verified=True,
     )
     database_session.add(release)
@@ -179,7 +180,7 @@ class TestRunRecovery:
             task_ids=task_ids,
             harness_config=harness_config,
         )
-        benchmark_row = start_benchmark_request_to_benchmark(request, self._test_starter)
+        benchmark_row = start_benchmark_request_to_benchmark(request, self._test_starter, aws_managed=False)
         benchmark_row.arguments = benchmark_row.arguments.model_copy(update={"concurrency": 1})
         database_session.add(benchmark_row)
         database_session.commit()
@@ -376,7 +377,11 @@ class TestRunRecovery:
             task_ids=["task_selected"],
             harness_config=harness_config,
         )
-        benchmark_row = start_benchmark_request_to_benchmark(start_request, self._test_starter)
+        benchmark_row = start_benchmark_request_to_benchmark(
+            start_request,
+            self._test_starter,
+            aws_managed=False,
+        )
         benchmark_row.executor_release_id = "test-release"
         benchmark_row.executor_artifact_uri = "s3://artifacts/test-release.pex"
         benchmark_row.executor_artifact_digest = "digest-test-release"
@@ -499,6 +504,7 @@ class TestRunRecovery:
             late_resume_response = client.post(
                 f"/retry-or-resume-benchmark/{benchmark_row.id}",
                 json={"task_ids": [selected_task.task_id]},
+                headers=harness_headers,
             )
             handle_early_exit(stale_task, stale_session, authority)
 
@@ -550,7 +556,11 @@ class TestRunRecovery:
             harness_config=harness_config,
         )
 
-        benchmark_row = start_benchmark_request_to_benchmark(start_benchmark_request, self._test_starter)
+        benchmark_row = start_benchmark_request_to_benchmark(
+            start_benchmark_request,
+            self._test_starter,
+            aws_managed=False,
+        )
         database_session.add(benchmark_row)
         database_session.commit()
 
@@ -616,7 +626,7 @@ class TestRunRecovery:
         # Run process_benchmark to complete the remaining tasks (the 3 tasks that are pending)
         authority_kwargs = executor_authority_kwargs(benchmark_row)
         await process_benchmark(
-            start_benchmark_request_json=benchmark_row.start_benchmark_request(harness_config).model_dump(),
+            start_benchmark_request_json=benchmark_row.access_key_start_benchmark_request(harness_config).model_dump(),
             benchmark_id_str=str(benchmark_row.id),
             verified_task_ids=verified_task_ids,
             **authority_kwargs,
@@ -870,7 +880,11 @@ class TestRunRecovery:
             task_ids=existing_task_ids,
             harness_config=harness_config,
         )
-        benchmark_row = start_benchmark_request_to_benchmark(start_benchmark_request, self._test_starter)
+        benchmark_row = start_benchmark_request_to_benchmark(
+            start_benchmark_request,
+            self._test_starter,
+            aws_managed=False,
+        )
         benchmark_row.status = BenchmarkStatus.FINISHED
         benchmark_row.finished_at = datetime.now(ZoneInfo("UTC"))
         database_session.add(benchmark_row)
@@ -930,7 +944,7 @@ class TestRunRecovery:
         # Run the worker — the new task should make it through evaluation
         authority_kwargs = executor_authority_kwargs(benchmark_row)
         await process_benchmark(
-            start_benchmark_request_json=benchmark_row.start_benchmark_request(harness_config).model_dump(),
+            start_benchmark_request_json=benchmark_row.access_key_start_benchmark_request(harness_config).model_dump(),
             benchmark_id_str=str(benchmark_row.id),
             verified_task_ids=verified_task_ids,
             **authority_kwargs,
@@ -965,7 +979,11 @@ class TestRunRecovery:
             task_ids=["task_0"],
             harness_config=harness_config,
         )
-        benchmark_row = start_benchmark_request_to_benchmark(request, self._test_starter)
+        benchmark_row = start_benchmark_request_to_benchmark(
+            request,
+            self._test_starter,
+            aws_managed=False,
+        )
         database_session.add(benchmark_row)
         database_session.commit()
 
@@ -1049,7 +1067,11 @@ class TestRunRecovery:
             task_ids=["task_0"],
             harness_config=harness_config,
         )
-        benchmark_row = start_benchmark_request_to_benchmark(request, self._test_starter)
+        benchmark_row = start_benchmark_request_to_benchmark(
+            request,
+            self._test_starter,
+            aws_managed=False,
+        )
         database_session.add(benchmark_row)
         database_session.commit()
 
@@ -1117,6 +1139,7 @@ class TestRunRecovery:
         example_benchmark_object: Benchmark,
         database_session: Session,
         monkeypatch: MonkeyPatch,
+        harness_headers: dict[str, str],
     ) -> None:
         benchmark_row = example_benchmark_object
         benchmark_row.status = BenchmarkStatus.STOPPED
@@ -1128,6 +1151,7 @@ class TestRunRecovery:
         response = client.post(
             f"/retry-or-resume-benchmark/{benchmark_row.id}",
             json={"task_ids": [], "service_headers": {}},
+            headers=harness_headers,
         )
 
         assert response.status_code == 403
@@ -1182,6 +1206,7 @@ class TestRunRecovery:
         database_session: Session,
         monkeypatch: MonkeyPatch,
         mock_kicker: Any,
+        harness_headers: dict[str, str],
     ) -> None:
         benchmark_row = example_benchmark_object
         benchmark_row.status = BenchmarkStatus.STOPPED
@@ -1204,7 +1229,7 @@ class TestRunRecovery:
         response = client.post(
             f"/retry-or-resume-benchmark/{benchmark_row.id}",
             json={"task_ids": [], "service_headers": {}},
-            headers={"X-Api-Key": "tracker-api-key"},
+            headers={**harness_headers, "X-Api-Key": "tracker-api-key"},
         )
 
         assert response.status_code == 200
@@ -1277,6 +1302,7 @@ class TestRunRecovery:
         example_benchmark_object: Benchmark,
         database_session: Session,
         monkeypatch: MonkeyPatch,
+        harness_headers: dict[str, str],
     ) -> None:
         """Reject an invalid managed force stop without changing run state."""
         benchmark_row = example_benchmark_object
@@ -1300,7 +1326,7 @@ class TestRunRecovery:
         force_stop = AsyncMock()
         monkeypatch.setattr("main.force_stop_sandboxes", force_stop)
 
-        response = client.post(f"/stop-benchmark/{benchmark_row.id}?force=true")
+        response = client.post(f"/stop-benchmark/{benchmark_row.id}?force=true", headers=harness_headers)
 
         assert response.status_code == 400
         detail = response.json()["detail"]
@@ -1320,7 +1346,8 @@ class TestRunRecovery:
         example_benchmark_object: Benchmark,
         database_session: Session,
         monkeypatch: MonkeyPatch,
-        mock_kicker: Any,
+        harness_headers: dict[str, str],
+        mock_kicker: MockKicker,
     ) -> None:
         """Resume secrets should update the contract used by resumed tasks.
 
@@ -1352,6 +1379,7 @@ class TestRunRecovery:
                     "GEMINI_API_KEY": "gemini-secret",
                 },
             },
+            headers=harness_headers,
         )
 
         assert response.status_code == 200
@@ -1371,6 +1399,7 @@ class TestRunRecovery:
         database_session: Session,
         monkeypatch: MonkeyPatch,
         mock_kicker: MockKicker,
+        harness_headers: dict[str, str],
     ) -> None:
         """A retry URL override should be validated, normalized, and persisted.
 
@@ -1378,7 +1407,8 @@ class TestRunRecovery:
         - Invalid overrides fail before task state changes.
         - Task verification uses the normalized replacement benchmark URL.
         - The queued request and stored run retain the replacement URL.
-        - An active resume stores URL and secret overrides without queueing duplicate work.
+        - An active resume stores a URL override without queueing duplicate work.
+        - Secret overrides on an active resume are rejected; retry=true is required.
         - An active retry with no retryable tasks still stores all request overrides.
         """
         benchmark_row = example_benchmark_object
@@ -1425,6 +1455,7 @@ class TestRunRecovery:
                 "service_headers": {},
                 "benchmark_url": "",
             },
+            headers=harness_headers,
         )
 
         assert invalid_response.status_code == 400
@@ -1442,7 +1473,7 @@ class TestRunRecovery:
                 "service_headers": {},
                 "benchmark_url": "https://new.example/",
             },
-            headers={"X-Api-Key": "tracker-api-key"},
+            headers={**harness_headers, "X-Api-Key": "tracker-api-key"},
         )
 
         assert response.status_code == 200
@@ -1461,19 +1492,30 @@ class TestRunRecovery:
             json={
                 "task_ids": [],
                 "service_headers": {},
-                "secrets": {"ACTIVE_API_KEY": "active-secret"},
                 "benchmark_url": "https://active.example/",
             },
+            headers=harness_headers,
         )
 
         assert active_response.status_code == 200
         assert len(mock_kicker.queued_calls) == 1
         database_session.refresh(benchmark_row)
         assert benchmark_row.custom_benchmark_service == "https://active.example"
-        assert benchmark_row.arguments.contract.secrets == {
-            "EXISTING_API_KEY": "existing-secret",
-            "ACTIVE_API_KEY": "active-secret",
-        }
+        assert benchmark_row.arguments.contract.secrets == {"EXISTING_API_KEY": "existing-secret"}
+
+        active_secret_response = client.post(
+            f"/retry-or-resume-benchmark/{benchmark_row.id}",
+            json={
+                "task_ids": [],
+                "service_headers": {},
+                "secrets": {"ACTIVE_API_KEY": "active-secret"},
+            },
+            headers=harness_headers,
+        )
+
+        assert active_secret_response.status_code == 409
+        database_session.refresh(benchmark_row)
+        assert benchmark_row.arguments.contract.secrets == {"EXISTING_API_KEY": "existing-secret"}
 
         active_retry_response = client.post(
             f"/retry-or-resume-benchmark/{benchmark_row.id}?retry=true&concurrency=10",
@@ -1483,6 +1525,7 @@ class TestRunRecovery:
                 "secrets": {"ACTIVE_API_KEY": "active-retry-secret"},
                 "benchmark_url": "https://active-retry.example/",
             },
+            headers=harness_headers,
         )
 
         assert active_retry_response.status_code == 200
@@ -1500,7 +1543,8 @@ class TestRunRecovery:
         example_benchmark_object: Benchmark,
         database_session: Session,
         monkeypatch: MonkeyPatch,
-        mock_kicker: Any,
+        harness_headers: dict[str, str],
+        mock_kicker: MockKicker,
     ) -> None:
         benchmark_row = example_benchmark_object
         benchmark_row.status = BenchmarkStatus.STOPPED
@@ -1527,6 +1571,7 @@ class TestRunRecovery:
                 "service_headers": {},
                 "secrets": {"ANTHROPIC_API_KEY": "new-secret"},
             },
+            headers=harness_headers,
         )
 
         assert response.status_code == 200
@@ -1545,7 +1590,7 @@ class TestRunRecovery:
         example_benchmark_object: Benchmark,
         database_session: Session,
         monkeypatch: MonkeyPatch,
-        mock_kicker: Any,
+        harness_headers: dict[str, str],
     ) -> None:
         benchmark_row = example_benchmark_object
         benchmark_row.status = BenchmarkStatus.IN_PROGRESS
@@ -1555,18 +1600,32 @@ class TestRunRecovery:
         )
         database_session.commit()
 
-        response = client.post(f"/retry-or-resume-benchmark/{benchmark_row.id}?retry=true")
+        def _unexpected_kicker() -> None:
+            raise AssertionError("running retry without error tasks should not enqueue work")
+
+        monkeypatch.setattr("main.process_benchmark.kicker", _unexpected_kicker)
+
+        response = client.post(
+            f"/retry-or-resume-benchmark/{benchmark_row.id}?retry=true&concurrency=7",
+            json={"secrets": {"MODEL_API_KEY": "rotated-secret"}},
+            headers=harness_headers,
+        )
 
         assert response.status_code == 200
         assert response.json() == {"status": "success"}
-        assert mock_kicker.queued_calls == []
+        database_session.expire_all()
+        persisted = database_session.get(Benchmark, benchmark_row.id)
+        assert persisted is not None
+        assert persisted.arguments.concurrency == 7
+        assert persisted.arguments.contract.secrets == {"MODEL_API_KEY": "rotated-secret"}
 
     async def test_running_resume_noops(
         self,
         example_benchmark_object: Benchmark,
         database_session: Session,
         monkeypatch: MonkeyPatch,
-        mock_kicker: Any,
+        harness_headers: dict[str, str],
+        mock_kicker: MockKicker,
     ) -> None:
         benchmark_row = example_benchmark_object
         benchmark_row.status = BenchmarkStatus.IN_PROGRESS
@@ -1581,7 +1640,10 @@ class TestRunRecovery:
 
         monkeypatch.setattr(BenchmarkServiceClient, "verify_task_ids", _unexpected_verify_task_ids)
 
-        response = client.post(f"/retry-or-resume-benchmark/{benchmark_row.id}")
+        response = client.post(
+            f"/retry-or-resume-benchmark/{benchmark_row.id}",
+            headers=harness_headers,
+        )
 
         assert response.status_code == 200
         assert response.json() == {"status": "success"}
@@ -1590,18 +1652,31 @@ class TestRunRecovery:
         task_row = database_session.exec(select(Task).where(Task.benchmark == benchmark_row.id)).one()
         assert task_row.status == TaskStatus.ERROR
 
+        response = client.post(
+            f"/retry-or-resume-benchmark/{benchmark_row.id}",
+            json={"secrets": {"MODEL_API_KEY": "rotated-secret"}},
+            headers=harness_headers,
+        )
+
+        assert response.status_code == 409
+        assert response.json()["detail"] == "Secret overrides require retry=true while a run is in progress."
+
     async def test_running_resume_updates_concurrency_without_enqueuing_work(
         self,
         example_benchmark_object: Benchmark,
         database_session: Session,
-        mock_kicker: Any,
+        harness_headers: dict[str, str],
+        mock_kicker: MockKicker,
     ) -> None:
         benchmark_row = example_benchmark_object
         benchmark_row.status = BenchmarkStatus.IN_PROGRESS
         database_session.add(benchmark_row)
         database_session.commit()
 
-        response = client.post(f"/retry-or-resume-benchmark/{benchmark_row.id}?concurrency=8")
+        response = client.post(
+            f"/retry-or-resume-benchmark/{benchmark_row.id}?concurrency=8",
+            headers=harness_headers,
+        )
 
         assert response.status_code == 200
         assert response.json() == {"status": "success"}
@@ -1616,7 +1691,8 @@ class TestRunRecovery:
         example_benchmark_object: Benchmark,
         database_session: Session,
         monkeypatch: MonkeyPatch,
-        mock_kicker: Any,
+        harness_headers: dict[str, str],
+        mock_kicker: MockKicker,
     ) -> None:
         benchmark_row = example_benchmark_object
         benchmark_row.status = BenchmarkStatus.IN_PROGRESS
@@ -1663,7 +1739,10 @@ class TestRunRecovery:
 
         monkeypatch.setattr(BenchmarkServiceClient, "verify_task_ids", _mock_request_verify_task_ids)
 
-        response = client.post(f"/retry-or-resume-benchmark/{benchmark_row.id}?retry=true")
+        response = client.post(
+            f"/retry-or-resume-benchmark/{benchmark_row.id}?retry=true",
+            headers=harness_headers,
+        )
 
         assert response.status_code == 200
         admitted_payload = mock_kicker.queued_calls[0]
@@ -1698,6 +1777,7 @@ class TestRunRecovery:
         example_benchmark_object: Benchmark,
         database_session: Session,
         monkeypatch: MonkeyPatch,
+        harness_headers: dict[str, str],
     ) -> None:
         benchmark_row = example_benchmark_object
         benchmark_row.status = BenchmarkStatus.IN_PROGRESS
@@ -1712,7 +1792,7 @@ class TestRunRecovery:
 
         monkeypatch.setattr(BenchmarkServiceClient, "verify_task_ids", _verify_error_task)
 
-        response = client.post(f"/retry-or-resume-benchmark/{benchmark_row.id}?retry=true")
+        response = client.post(f"/retry-or-resume-benchmark/{benchmark_row.id}?retry=true", headers=harness_headers)
 
         assert response.status_code == 409
         assert "no current executor release" in response.json()["detail"]
@@ -1727,6 +1807,7 @@ class TestRunRecovery:
         example_benchmark_object: Benchmark,
         database_session: Session,
         monkeypatch: MonkeyPatch,
+        harness_headers: dict[str, str],
     ) -> None:
         benchmark_row = example_benchmark_object
         benchmark_row.status = BenchmarkStatus.IN_PROGRESS
@@ -1750,7 +1831,7 @@ class TestRunRecovery:
             _fail_release_resolution,
         )
 
-        response = client.post(f"/retry-or-resume-benchmark/{benchmark_row.id}?retry=true")
+        response = client.post(f"/retry-or-resume-benchmark/{benchmark_row.id}?retry=true", headers=harness_headers)
 
         assert response.status_code == 409
         with Session(bind=database_session.get_bind()) as fresh_session:
@@ -1782,6 +1863,7 @@ class TestRunRecovery:
         database_session: Session,
         monkeypatch: MonkeyPatch,
         mock_kicker: Any,
+        harness_headers: dict[str, str],
     ) -> None:
         benchmark_row = example_benchmark_object
         benchmark_row.status = BenchmarkStatus.STOPPED
@@ -1801,7 +1883,8 @@ class TestRunRecovery:
         response = client.post(
             f"/retry-or-resume-benchmark/{benchmark_row.id}?retry=true"
             if retry
-            else f"/retry-or-resume-benchmark/{benchmark_row.id}"
+            else f"/retry-or-resume-benchmark/{benchmark_row.id}",
+            headers=harness_headers,
         )
 
         assert response.status_code == 200
@@ -1824,6 +1907,7 @@ class TestRunRecovery:
         example_benchmark_object: Benchmark,
         database_session: Session,
         monkeypatch: MonkeyPatch,
+        harness_headers: dict[str, str],
     ) -> None:
         benchmark_row = example_benchmark_object
         benchmark_row.status = BenchmarkStatus.STOPPED
@@ -1849,7 +1933,7 @@ class TestRunRecovery:
 
         monkeypatch.setattr(BenchmarkServiceClient, "verify_task_ids", _verify_stopped_task)
 
-        response = client.post(f"/retry-or-resume-benchmark/{benchmark_row.id}")
+        response = client.post(f"/retry-or-resume-benchmark/{benchmark_row.id}", headers=harness_headers)
 
         assert response.status_code == 503
         assert response.json()["detail"] == "No active executor release is configured"
@@ -1871,6 +1955,7 @@ class TestRunRecovery:
         database_session: Session,
         monkeypatch: MonkeyPatch,
         mock_kicker: Any,
+        harness_headers: dict[str, str],
     ) -> None:
         benchmark_row = example_benchmark_object
         benchmark_row.status = BenchmarkStatus.STOPPED
@@ -1895,7 +1980,7 @@ class TestRunRecovery:
 
         monkeypatch.setattr(BenchmarkServiceClient, "verify_task_ids", _verify_stopped_task)
 
-        response = client.post(f"/retry-or-resume-benchmark/{benchmark_row.id}")
+        response = client.post(f"/retry-or-resume-benchmark/{benchmark_row.id}", headers=harness_headers)
 
         assert response.status_code == 200
         database_session.refresh(benchmark_row)
@@ -1924,7 +2009,9 @@ class TestRunRecovery:
         database_session.add(task)
         database_session.commit()
 
-        retry_response = client.post(f"/retry-or-resume-benchmark/{benchmark_row.id}?retry=true")
+        retry_response = client.post(
+            f"/retry-or-resume-benchmark/{benchmark_row.id}?retry=true", headers=harness_headers
+        )
 
         assert retry_response.status_code == 200
         database_session.refresh(benchmark_row)
@@ -1942,7 +2029,7 @@ class TestRunRecovery:
         database_session.add(task)
         database_session.commit()
 
-        second_resume = client.post(f"/retry-or-resume-benchmark/{benchmark_row.id}")
+        second_resume = client.post(f"/retry-or-resume-benchmark/{benchmark_row.id}", headers=harness_headers)
 
         assert second_resume.status_code == 200
         database_session.refresh(benchmark_row)
@@ -1965,6 +2052,7 @@ class TestRunRecovery:
         database_session: Session,
         monkeypatch: MonkeyPatch,
         mock_kicker: Any,
+        harness_headers: dict[str, str],
     ) -> None:
         benchmark_row = example_benchmark_object
         benchmark_row.status = BenchmarkStatus.IN_PROGRESS
@@ -1990,7 +2078,7 @@ class TestRunRecovery:
 
         monkeypatch.setattr(BenchmarkServiceClient, "verify_task_ids", _verify_error_task)
 
-        response = client.post(f"/retry-or-resume-benchmark/{benchmark_row.id}?retry=true")
+        response = client.post(f"/retry-or-resume-benchmark/{benchmark_row.id}?retry=true", headers=harness_headers)
 
         assert response.status_code == 200
         dispatches = database_session.exec(select(ExecutorDispatch)).all()
@@ -2008,7 +2096,8 @@ class TestRunRecovery:
         database_session: Session,
         monkeypatch: MonkeyPatch,
         harness_config: HarnessConfig,
-        mock_kicker: Any,
+        harness_headers: dict[str, str],
+        mock_kicker: MockKicker,
         executor_authority_kwargs: Any,
     ) -> None:
         benchmark_row = example_benchmark_object
@@ -2071,7 +2160,10 @@ class TestRunRecovery:
         monkeypatch.setattr(BenchmarkServiceClient, "final_score", _mock_final_score)
 
         original_authority_kwargs = executor_authority_kwargs(benchmark_row)
-        response = client.post(f"/retry-or-resume-benchmark/{benchmark_row.id}?retry=true")
+        response = client.post(
+            f"/retry-or-resume-benchmark/{benchmark_row.id}?retry=true",
+            headers=harness_headers,
+        )
 
         assert response.status_code == 200
 
@@ -2116,6 +2208,7 @@ class TestRunRecovery:
         database_session: Session,
         monkeypatch: MonkeyPatch,
         executor_authority_kwargs: Any,
+        harness_headers: dict[str, str],
     ) -> None:
         benchmark_row = example_benchmark_object
         benchmark_row.status = BenchmarkStatus.IN_PROGRESS
@@ -2150,7 +2243,7 @@ class TestRunRecovery:
         monkeypatch.setattr(BenchmarkServiceClient, "verify_task_ids", _mock_verify_task_ids)
         monkeypatch.setattr("main.process_benchmark.kicker", lambda: FailingKicker())
 
-        response = client.post(f"/retry-or-resume-benchmark/{benchmark_row.id}?retry=true")
+        response = client.post(f"/retry-or-resume-benchmark/{benchmark_row.id}?retry=true", headers=harness_headers)
 
         assert response.status_code == 503
         database_session.refresh(benchmark_row)
