@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import socket
 import time
 import traceback
 from asyncio import Semaphore
@@ -22,13 +23,12 @@ from benchmark_service import (
     SandboxProviderConfig,
     SandboxRecoveryAttempt,
 )
-from benchmark_service.client import BenchmarkServiceClient, BenchmarkServiceError
-from opentelemetry import trace
+from benchmark_service.client import BenchmarkServiceClient, BenchmarkServiceError, BenchmarkServiceStreamError
 from pydantic import ValidationError
 from sqlmodel import Session, col, select, update
 from websockets.exceptions import ConnectionClosedError, InvalidStatus
 
-from tracker.aws.cloudwatch_logs import write_benchmark_log_event
+from tracker.aws.cloudwatch_logs import get_benchmark_log_url, write_benchmark_log_event
 from tracker.aws.runtime import AWSRuntime
 from tracker.aws.s3 import (
     get_agent_result_s3_key,
@@ -36,6 +36,7 @@ from tracker.aws.s3 import (
 from tracker.aws.secrets import resolve_secrets
 from tracker.config import ENVIRONMENT
 from tracker.database.models import (
+    AgentCausedExitReason,
     AgentContractRequest,
     BenchmarkStatus,
     ErrorResult,
@@ -56,7 +57,9 @@ from tracker.exceptions import (
 from tracker.executor.execution_authority import ExecutionAuthority, lock_execution_authority
 from tracker.logging import get_logger, task_id_var
 from tracker.notifications import NotificationContext, SlackNotifier
-from tracker.observability import elapsed_ms, incr
+from tracker.observability import elapsed_ms, error_span, incr
+from tracker.observability.sentry import capture_exception
+from tracker.observability.tracing import observability_span
 from tracker.sandbox import DependencySetupMode, create_sandbox, run_agent, upload_agent_artifacts
 from tracker.types import (
     StartBenchmarkRequest,
@@ -68,6 +71,18 @@ logger = get_logger(__name__)
 
 _PTY_TASK_RETRY_LIMIT: int = 1
 _SANDBOX_RETRY_DELAY_SECONDS: float = 2
+
+
+class BenchmarkServiceWebSocketDNSResolutionError(BenchmarkServiceError):
+    """A benchmark-service WebSocket could not resolve its destination host."""
+
+
+async def _run_benchmark_service_websocket(operation: Coroutine[Any, Any, Any]) -> Any:
+    """Translate DNS failures from benchmark-service WebSocket calls at the boundary."""
+    try:
+        return await operation
+    except socket.gaierror as exc:
+        raise BenchmarkServiceWebSocketDNSResolutionError(_exception_message(exc)) from exc
 
 
 @dataclass
@@ -146,17 +161,18 @@ def _observe_task_retry(attempt: SandboxRecoveryAttempt, exc: BaseException) -> 
     """Emit the retry telemetry the Tenacity before_sleep hook owned before recovery
     moved into the benchmark-service client."""
     error_class = type(exc).__name__
-    logger.warning(
-        "retry.before_sleep",
-        extra={
-            "metric": _TASK_RETRY_METRIC,
-            "fn": "_process_task_attempt",
-            "attempt": attempt.number,
-            "idle_for": _SANDBOX_RETRY_DELAY_SECONDS,
-            "error_class": error_class,
-        },
-    )
-    incr(f"{_TASK_RETRY_METRIC}.retry", tags={"error_class": error_class})
+    with observability_span("task.retry", attempt=attempt.number, error_class=error_class):
+        logger.warning(
+            "retry.before_sleep",
+            extra={
+                "metric": _TASK_RETRY_METRIC,
+                "fn": "_process_task_attempt",
+                "attempt": attempt.number,
+                "idle_for": _SANDBOX_RETRY_DELAY_SECONDS,
+                "error_class": error_class,
+            },
+        )
+        incr(f"{_TASK_RETRY_METRIC}.retry", tags={"error_class": error_class})
 
 
 class TrackedTaskStatus(str, Enum):
@@ -247,7 +263,7 @@ class TrackedTask:
             error_message = f"Task error was not handled: {_exception_message(e)}\n{traceback.format_exc()}"
             logger.error(error_message)
             logfire.exception("tracked_task_run failed")
-            sentry_sdk.capture_exception(e)
+            capture_exception(e)
             with Session(bind=engine) as session:
                 task = fetch_task_row(task_row.id, session, self._org)
                 commit_task_error(
@@ -464,7 +480,7 @@ def _commit_task_status(
     if error_message is not None:
         span_attributes["has_error_message"] = True
 
-    with logfire.span("task.status_transition", **span_attributes):  # pyright: ignore[reportArgumentType]
+    with observability_span("task.status_transition", **span_attributes):
         try:
             lock_execution_authority(session, authority)
         except ExecutionAuthorityRevoked:
@@ -510,7 +526,6 @@ def commit_task_status_transition(
     )
 
 
-@logfire.instrument("process_task", extract_args=("benchmark_id", "task_id"))
 async def process_task(
     task_row: Task,
     start_benchmark_request: StartBenchmarkRequest,
@@ -525,6 +540,15 @@ async def process_task(
 ) -> dict[str, dict[str, Any] | None]:
     """Process one task while retaining dependency recovery state across sandbox attempts."""
     dependency_setup_recovery = _DependencySetupRecoveryState()
+
+    with observability_span(
+        "task.started",
+        benchmark_id=str(benchmark_id),
+        task_id=task_id,
+        benchmark_name=start_benchmark_request.benchmark_name,
+        agent_name=start_benchmark_request.contract.name,
+    ):
+        pass
 
     async def run_attempt(
         recovery_attempt: SandboxRecoveryAttempt,
@@ -549,7 +573,7 @@ async def process_task(
         if isinstance(exc, SandboxSetupError):
             _record_failure_before_retry(task_row, authority, exc, attempt.number)
 
-    return await benchmark_service.run_with_sandbox_recovery(
+    result = await benchmark_service.run_with_sandbox_recovery(
         task_id=task_id,
         run_id=str(benchmark_id),
         operation=run_attempt,
@@ -559,6 +583,16 @@ async def process_task(
         retry_delay_s=_SANDBOX_RETRY_DELAY_SECONDS,
         on_retry=record_attempt_failure,
     )
+
+    if result.get(task_id) is not None:
+        with observability_span(
+            "task.completed",
+            benchmark_id=str(benchmark_id),
+            task_id=task_id,
+        ):
+            pass
+
+    return result
 
 
 async def _process_task_attempt(
@@ -584,14 +618,6 @@ async def _process_task_attempt(
     task_id_var.set(task_id)
     sentry_sdk.set_tag("benchmark_name", start_benchmark_request.benchmark_name)
     sentry_sdk.set_tag("agent_name", start_benchmark_request.contract.name)
-    trace.get_current_span().set_attributes(
-        {
-            "task_id": task_id,
-            "benchmark_id": str(benchmark_id),
-            "benchmark_name": start_benchmark_request.benchmark_name,
-            "agent_name": start_benchmark_request.contract.name,
-        }
-    )
 
     requested_attempt_started_at = task_row.started_at
     with Session(bind=engine) as task_session:
@@ -615,8 +641,22 @@ async def _process_task_attempt(
     # Setup logging infrastructure before try block so it's always available
     # Suffix is required to version control streams, never delete between retries
     stream_suffix = f"{int(task_row.started_at.timestamp() * 1_000_000):x}"
-    stream_key: str = f"{benchmark_id}:{task_id}_{stream_suffix}"
+    task_stream_name = f"{task_id}_{stream_suffix}"
+    stream_key: str = f"{benchmark_id}:{task_stream_name}"
     log_queue: asyncio.Queue[str] = asyncio.Queue(maxsize=20)
+
+    logger.info(
+        "Task output stream selected",
+        extra={
+            "benchmark_id": str(benchmark_id),
+            "task_id": task_id,
+            "cloudwatch_log_url": get_benchmark_log_url(
+                str(benchmark_id),
+                aws_runtime.resources,
+                task_stream_name,
+            ),
+        },
+    )
 
     last_log_time: float = time.monotonic()
 
@@ -637,7 +677,15 @@ async def _process_task_attempt(
 
     flush_task = asyncio.create_task(auto_flush_logs())
 
+    evaluation_resume_state = task_row.eval_resume_state
+    sandbox_id_for_recovery: str | None = None
+    exit_reason: AgentCausedExitReason | None = None
+    evaluation_start_time: float | None = None
+    start_sandbox_run_time: float | None = None
+
     def on_eval_resume_state(state: dict[str, Any]) -> None:
+        nonlocal evaluation_resume_state
+        evaluation_resume_state = state
         save_eval_resume_state(task_row.id, org, state, expected_started_at=attempt_started_at, authority=authority)
 
     def execution_is_current() -> bool:
@@ -663,6 +711,29 @@ async def _process_task_attempt(
         operation: str,
         cause_code: str | None = None,
     ) -> dict[str, dict[str, Any] | None]:
+        with error_span(
+            "task.error",
+            exc,
+            benchmark_id=str(benchmark_id),
+            task_id=task_id,
+            producer=producer,
+            operation=operation,
+            error_type=type(exc).__name__,
+            cause_code=cause_code or "",
+        ):
+            logger.error(
+                "Task execution failed",
+                exc_info=(type(exc), exc, exc.__traceback__),
+                extra={
+                    "benchmark_id": str(benchmark_id),
+                    "task_id": task_id,
+                    "producer": producer,
+                    "operation": operation,
+                    "error_type": type(exc).__name__,
+                    "cause_code": cause_code or "",
+                },
+            )
+            capture_exception(exc)
         with Session(bind=engine) as task_session:
             task = fetch_task_row(task_row.id, task_session, org)
             commit_task_error(
@@ -678,6 +749,90 @@ async def _process_task_attempt(
             )
         return {task_id: None}
 
+    async def recover_evaluation_stream_failure(error_message: str) -> dict[str, dict[str, Any] | None] | None:
+        """Resume an interrupted evaluation when the service has persisted continuation state."""
+        nonlocal last_log_time
+        if evaluation_resume_state is None:
+            return None
+        if task_is_stopped():
+            return {task_id: None}
+
+        recovery_message = f"{error_message}; resuming evaluation from durable benchmark state"
+        logger.warning(recovery_message)
+        log_output(f"\n[WARN] {recovery_message}\n")
+        resume_eval_start_time = time.perf_counter()
+        try:
+            last_log_time = time.monotonic()
+            evaluation_result = await _run_benchmark_service_websocket(
+                benchmark_service.resume_evaluation(
+                    task_row.task_id,
+                    eval_resume_state=evaluation_resume_state,
+                    on_message=log_output,
+                    on_eval_resume_state=on_eval_resume_state,
+                    dataset=start_benchmark_request.dataset,
+                    sandbox_provider=sandbox_provider_config,
+                )
+            )
+        except BenchmarkServiceWebSocketDNSResolutionError as resume_error:
+            if task_is_stopped():
+                return {task_id: None}
+            terminal_error = (
+                f"{recovery_message}; WebSocket DNS resolution failed during resume: {_exception_message(resume_error)}"
+            )
+            logger.warning(terminal_error)
+            log_output(f"\n[ERROR] {terminal_error}")
+            return commit_terminal_error(
+                resume_error,
+                terminal_error,
+                producer="benchmark_service",
+                operation="websocket_connect",
+                cause_code="websocket_dns_resolution",
+            )
+        except Exception as resume_error:
+            if task_is_stopped():
+                return {task_id: None}
+            terminal_error = f"{recovery_message}; resume failed: {_exception_message(resume_error)}"
+            logger.warning(terminal_error)
+            log_output(f"\n[ERROR] {terminal_error}")
+            return commit_terminal_error(
+                resume_error,
+                terminal_error,
+                producer="benchmark_service",
+                operation="resume_evaluation",
+            )
+
+        finished_at = time.perf_counter()
+        evaluation_run_duration = finished_at - (evaluation_start_time or resume_eval_start_time)
+        sandbox_run_duration = finished_at - start_sandbox_run_time if start_sandbox_run_time is not None else None
+        evaluation_result_value = cast(dict[str, Any], evaluation_result)
+        evaluation_result_row = EvaluationResult(
+            org_id=org.id,
+            task=task_row.id,
+            instance_id=sandbox_id_for_recovery,
+            result=evaluation_result_value,
+            agent_caused_exit_reason=exit_reason,
+        )
+        with Session(bind=engine) as task_session:
+            task_session.add(evaluation_result_row)
+            task_in_session = fetch_task_row(task_row.id, task_session, org)
+            if task_in_session.task_breakdown:
+                existing_breakdown = task_session.get(TaskBreakdown, task_in_session.task_breakdown)
+                assert existing_breakdown is not None
+                existing_breakdown.evaluation_run_duration = evaluation_run_duration
+                if sandbox_run_duration is not None:
+                    existing_breakdown.sandbox_run_duration = sandbox_run_duration
+            if not commit_task_status_transition(
+                task_row.id,
+                task_session,
+                org,
+                TaskStatus.FINISHED,
+                expected_started_at=attempt_started_at,
+                authority=authority,
+            ):
+                return {task_id: None}
+
+        return {task_id: evaluation_result_value}
+
     try:
         if task_row.status == TaskStatus.EVALUATING and task_row.eval_resume_state is not None:
             try:
@@ -685,13 +840,15 @@ async def _process_task_attempt(
                 resume_eval_start_time = time.perf_counter()
                 # Reset timer to keep the last received message from the benchmarks service accurate
                 last_log_time = time.monotonic()
-                evaluation_result = await benchmark_service.resume_evaluation(
-                    task_row.task_id,
-                    eval_resume_state=task_row.eval_resume_state,
-                    on_message=log_output,
-                    on_eval_resume_state=on_eval_resume_state,
-                    dataset=start_benchmark_request.dataset,
-                    sandbox_provider=sandbox_provider_config,
+                evaluation_result = await _run_benchmark_service_websocket(
+                    benchmark_service.resume_evaluation(
+                        task_row.task_id,
+                        eval_resume_state=task_row.eval_resume_state,
+                        on_message=log_output,
+                        on_eval_resume_state=on_eval_resume_state,
+                        dataset=start_benchmark_request.dataset,
+                        sandbox_provider=sandbox_provider_config,
+                    )
                 )
                 resume_eval_duration = time.perf_counter() - resume_eval_start_time
                 evaluation_result_row = EvaluationResult(
@@ -806,6 +963,7 @@ async def _process_task_attempt(
             volumes=task_data.volumes,
             creation_semaphore=creation_semaphore,
         ) as sandbox:
+            sandbox_id_for_recovery = sandbox.id
             task_breakdown.sandbox_build_duration = time.perf_counter() - start_sandbox_build_time
             start_sandbox_run_time = time.perf_counter()
 
@@ -831,12 +989,14 @@ async def _process_task_attempt(
 
                 # Reset timer to keep the last received message from the benchmarks service accurate
                 last_log_time = time.monotonic()
-                _ = await benchmark_service.setup_task(
-                    task_row.task_id,
-                    sandbox.id,
-                    on_message=log_output,
-                    dataset=start_benchmark_request.dataset,
-                    sandbox_provider=sandbox_provider_config,
+                _ = await _run_benchmark_service_websocket(
+                    benchmark_service.setup_task(
+                        task_row.task_id,
+                        sandbox.id,
+                        on_message=log_output,
+                        dataset=start_benchmark_request.dataset,
+                        sandbox_provider=sandbox_provider_config,
+                    )
                 )
                 # The benchmark has now had an opportunity to persist the
                 # outage metadata in its restored volume. A later loss is a
@@ -911,16 +1071,19 @@ async def _process_task_attempt(
                 logger.info(f"Evaluating agent {start_benchmark_request.contract.name} in sandbox {sandbox.name}")
                 # Reset timer to keep the last received message from the benchmarks service accurate
                 last_log_time = time.monotonic()
-                evaluation_result = await benchmark_service.evaluate_instance(
-                    task_row.task_id,
-                    sandbox.id,
-                    on_message=log_output,
-                    on_eval_resume_state=on_eval_resume_state,
-                    dataset=start_benchmark_request.dataset,
-                    sandbox_provider=sandbox_provider_config,
+                evaluation_result = await _run_benchmark_service_websocket(
+                    benchmark_service.evaluate_instance(
+                        task_row.task_id,
+                        sandbox.id,
+                        on_message=log_output,
+                        on_eval_resume_state=on_eval_resume_state,
+                        dataset=start_benchmark_request.dataset,
+                        sandbox_provider=sandbox_provider_config,
+                    )
                 )
                 task_breakdown.evaluation_run_duration = time.perf_counter() - evaluation_start_time
 
+                assert start_sandbox_run_time is not None
                 task_breakdown.sandbox_run_duration = time.perf_counter() - start_sandbox_run_time
 
                 # Force flush the logs, maybe redundant since we have the one in finally:
@@ -981,21 +1144,14 @@ async def _process_task_attempt(
             raise
 
         error_message = _exception_message(e)
-        logger.error(error_message)
         log_output(f"\n[ERROR] {error_message}")
-        with Session(bind=engine) as task_session:
-            task = fetch_task_row(task_row.id, task_session, org)
-            commit_task_error(
-                task,
-                task_session,
-                error_message,
-                producer="sandbox_provider",
-                operation="sandbox_recovery",
-                error_type=type(e).__name__,
-                expected_started_at=attempt_started_at,
-                authority=authority,
-            )
-        return {task_id: None}
+
+        return commit_terminal_error(
+            e,
+            error_message,
+            producer="sandbox_provider",
+            operation="sandbox_recovery",
+        )
     except OutputArtifactError as e:
         if task_is_stopped():
             return {task_id: None}
@@ -1009,6 +1165,20 @@ async def _process_task_attempt(
             producer="output_artifact",
             operation="upload_output_artifacts",
         )
+    except BenchmarkServiceWebSocketDNSResolutionError as e:
+        if task_is_stopped():
+            return {task_id: None}
+        error_message = f"Benchmark service WebSocket connection failed during DNS resolution: {_exception_message(e)}"
+        logger.warning(error_message)
+        log_output(f"\n[ERROR] {error_message}")
+
+        return commit_terminal_error(
+            e,
+            error_message,
+            producer="benchmark_service",
+            operation="websocket_connect",
+            cause_code="websocket_dns_resolution",
+        )
     except ConnectionClosedError as e:
         if task_is_stopped():
             return {task_id: None}
@@ -1016,6 +1186,26 @@ async def _process_task_attempt(
         error_message = (
             f"Benchmark service WebSocket disconnected: {e}; last application message received {seconds}s ago"
         )
+        recovered = await recover_evaluation_stream_failure(error_message)
+        if recovered is not None:
+            return recovered
+        logger.warning(error_message)
+        log_output(f"\n[ERROR] {error_message}")
+
+        return commit_terminal_error(
+            e,
+            error_message,
+            producer="benchmark_service",
+            operation="websocket",
+            cause_code="websocket_connection_closed",
+        )
+    except BenchmarkServiceStreamError as e:
+        if task_is_stopped():
+            return {task_id: None}
+        error_message = f"Benchmark service WebSocket stream failed: {_exception_message(e)}"
+        recovered = await recover_evaluation_stream_failure(error_message)
+        if recovered is not None:
+            return recovered
         logger.warning(error_message)
         log_output(f"\n[ERROR] {error_message}")
 
@@ -1072,9 +1262,6 @@ async def _process_task_attempt(
             return {task_id: None}
         logfire.exception("process_task failed")
         error_message = _exception_message(e)
-        logger.error(error_message, exc_info=True)
-
-        sentry_sdk.capture_exception(e)
 
         # include the error message
         log_output(f"\n[ERROR] {error_message}")
