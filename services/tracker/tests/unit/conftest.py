@@ -86,7 +86,7 @@ def empty_database_session() -> Generator[Session, None, None]:
 def mock_s3(monkeypatch: pytest.MonkeyPatch) -> None:
     """Replace S3 operations with deterministic in-process behavior."""
 
-    async def _mock_download_from_s3(*_args: Any, **_kwargs: Any) -> bytes:
+    async def _mock_get_bytes(*_args: Any, **_kwargs: Any) -> bytes:
         return b"mock-contract-content"
 
     def _mock_get_contract_s3_key(contract_name: str) -> str:
@@ -98,7 +98,7 @@ def mock_s3(monkeypatch: pytest.MonkeyPatch) -> None:
     async def _mock_copy_agent_to_benchmark(*_args: Any, **_kwargs: Any) -> None:
         return None
 
-    monkeypatch.setattr("tracker.aws.s3.download_from_s3", _mock_download_from_s3)
+    monkeypatch.setattr("tracker.aws.s3.S3ObjectStore.get_bytes", _mock_get_bytes)
     monkeypatch.setattr("tracker.aws.s3.get_contract_s3_key", _mock_get_contract_s3_key)
     monkeypatch.setattr("tracker.utils.reporting.upload_to_s3", _mock_upload_to_s3)
     monkeypatch.setattr("main.copy_agent_to_benchmark", _mock_copy_agent_to_benchmark)

@@ -30,9 +30,8 @@ from websockets.exceptions import ConnectionClosedError, InvalidStatus
 
 from tracker.aws.cloudwatch_logs import get_benchmark_log_url, write_benchmark_log_event
 from tracker.aws.runtime import AWSRuntime
-from tracker.aws.s3 import (
-    get_agent_result_s3_key,
-)
+from tracker.aws.s3 import S3ObjectStore
+from tracker.runtime.artifacts import task_artifact_key
 from tracker.aws.secrets import resolve_secrets
 from tracker.config import ENVIRONMENT
 from tracker.database.models import (
@@ -952,6 +951,7 @@ async def _process_task_attempt(
         task_breakdown = TaskBreakdown()
 
         start_sandbox_build_time = time.perf_counter()
+        object_store = S3ObjectStore(aws_runtime)
         async with create_sandbox(
             provider=sandbox_provider,
             sandbox_name=task_row.task_id,
@@ -984,7 +984,7 @@ async def _process_task_attempt(
                     sandbox,
                     start_benchmark_request.contract,
                     str(benchmark_id),
-                    aws_runtime,
+                    object_store,
                 )
 
                 # Reset timer to keep the last received message from the benchmarks service accurate
@@ -1009,7 +1009,7 @@ async def _process_task_attempt(
                 # Compute the S3 key for the agent's output archive
                 agent_output_s3_key = None
                 if start_benchmark_request.contract.final_output:
-                    agent_output_s3_key = get_agent_result_s3_key(str(benchmark_id), task_id, "agent_output.tar.gz")
+                    agent_output_s3_key = task_artifact_key(str(benchmark_id), task_id, "agent_output.tar.gz")
 
                 try:
                     exit_reason, agent_run_time = await run_agent(
@@ -1019,7 +1019,7 @@ async def _process_task_attempt(
                         task_id,
                         log_output,
                         task_data.cwd,
-                        aws_runtime=aws_runtime,
+                        object_store=object_store,
                         agent_output_s3_key=agent_output_s3_key,
                         agent_timeout=task_data.agent_timeout,
                         benchmark_id=str(benchmark_id),
