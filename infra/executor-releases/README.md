@@ -1,5 +1,7 @@
 # Executor releases
 
+Maintainer runbook for deploying, draining, recovering, and retiring Valkyrie executor releases.
+
 Valkyrie keeps executor releases immutable. PostgreSQL owns the admission pointer,
 each benchmark stores its initial release identity, and each executor dispatch
 stores the release and artifact selected for that invocation.

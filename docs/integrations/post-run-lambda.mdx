@@ -1,6 +1,9 @@
-# Lambda Usage
+---
+title: Invoke a post-run Lambda
+description: Run an AWS Lambda function after a benchmark finishes.
+---
 
-The `--lambda` flag on `run start` lets you invoke an AWS Lambda function after a run completes.
+The `--lambda` flag on [`valkyrie run start`](/reference/cli/run#start) invokes an AWS Lambda function after a run completes.
 
 ```bash
 valkyrie run start \
@@ -23,7 +26,7 @@ The tracker invokes your lambda with the full `BenchmarkArguments` plus the pers
     "run_cmd": "cat /tmp/problem_statement | claude -p ...",
     "final_output": "/logs",
     "secrets": {
-      "ANTHROPIC_API_KEY": "YourAnthropicKeySecret"
+      "ANTHROPIC_API_KEY": "AnthropicApiKey"
     }
   },
   "concurrency": 5,
@@ -47,9 +50,7 @@ The tracker invokes your lambda with the full `BenchmarkArguments` plus the pers
 
 ## Format required by AWS
 
-AWS Lambda expects a `lambda_function.py` with a `lambda_handler` entry point
-
-Example method:
+AWS Lambda expects a `lambda_function.py` with a `lambda_handler` entry point:
 
 ```python
 def lambda_handler(event, context):
