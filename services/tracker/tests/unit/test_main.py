@@ -10,6 +10,7 @@ import re
 import tarfile
 from collections.abc import AsyncIterator
 from datetime import timezone
+from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, Mock
 from uuid import UUID, uuid4
@@ -21,7 +22,7 @@ from benchmark_service.client import (
     BenchmarkServiceError,
     BenchmarkServiceUnauthenticatedError,
 )
-from benchmark_service.schemas import FinalScoreResponse, VerifyTaskIdsResponse
+from benchmark_service.schemas import DatasetVersion, FinalScoreResponse, VerifyTaskIdsResponse
 from dateutil.parser import isoparse
 from descope.descope_client import DescopeClient
 from fastapi import HTTPException
@@ -72,6 +73,7 @@ from tracker.types import (
     FetchBenchmarksRequest,
     FinalViewResponse,
     HarnessConfig,
+    RunExecutionRequest,
     StartBenchmarkRequest,
 )
 from tracker.utils import update_benchmark_concurrency
@@ -125,6 +127,262 @@ class TestTrackerAPI:
 
     async def _mock_verify_task_ids_error(self, *_args: Any, **_kwargs: Any) -> VerifyTaskIdsResponse:
         raise Exception("Error verifying task ids")
+
+    @pytest.mark.parametrize("selected_version", ["release-a", None])
+    async def test_dataset_version_survives_default_switch_and_retry(
+        self,
+        contract: AgentContractRequest,
+        database_session: Session,
+        harness_config: HarnessConfig,
+        harness_headers: dict[str, str],
+        mock_kicker: Any,
+        monkeypatch: MonkeyPatch,
+        selected_version: str | None,
+    ) -> None:
+        current_default = ["release-a"]
+        observed_versions: list[str] = []
+
+        async def version(_client: BenchmarkServiceClient, dataset: str | None = None) -> SimpleNamespace:
+            assert dataset == "default"
+
+            return SimpleNamespace(dataset_version_selection=True)
+
+        async def resolve_dataset(
+            _client: BenchmarkServiceClient, dataset: str, version: str | None = None
+        ) -> SimpleNamespace:
+            assert dataset == "default"
+            selected = version or current_default[0]
+
+            return SimpleNamespace(dataset=dataset, version=DatasetVersion(id=selected, label=selected))
+
+        async def verify_task_ids(
+            service: BenchmarkServiceClient,
+            task_ids: list[str] | None,
+            slice_str: str | None,
+            dataset: str | None = None,
+        ) -> VerifyTaskIdsResponse:
+            assert dataset == "default"
+            assert slice_str is None
+            selected = getattr(service, "_dataset_version") or current_default[0]
+            observed_versions.append(selected)
+
+            return VerifyTaskIdsResponse(task_ids=task_ids or [f"task-{selected}"])
+
+        monkeypatch.setattr(main_module.config, "DATASET_VERSION_PINNING_ENABLED", True)
+        monkeypatch.setattr(BenchmarkServiceClient, "version", version)
+        monkeypatch.setattr(BenchmarkServiceClient, "resolve_dataset", resolve_dataset)
+        monkeypatch.setattr(BenchmarkServiceClient, "verify_task_ids", verify_task_ids)
+        request = StartBenchmarkRequest(
+            contract=contract,
+            benchmark_name="swebench",
+            harness_config=harness_config,
+            dataset_version=selected_version,
+        )
+
+        started = client.post("/start-benchmark", json=request.model_dump(mode="json"))
+
+        assert started.status_code == 200, started.text
+        conflicting_secret_header = client.post(
+            "/start-benchmark",
+            json=request.model_copy(
+                update={
+                    "service_auth_header_name": "X-Benchmark-Dataset-Version",
+                    "service_auth_secret_name": "dataset-version-secret",
+                }
+            ).model_dump(mode="json"),
+        )
+        assert conflicting_secret_header.status_code == 400
+        first_run_id = UUID(started.json()["benchmark_id"])
+        assert started.json()["dataset_version"] == {"id": "release-a", "label": "release-a"}
+
+        first_run = database_session.get(Benchmark, first_run_id)
+        assert first_run is not None
+        assert first_run.arguments.dataset_version == DatasetVersion(id="release-a", label="release-a")
+        queued_payload = mock_kicker.queued_calls[0]["start_benchmark_request_json"]
+        assert queued_payload["dataset_version"] == selected_version
+        assert queued_payload["resolved_dataset_version"]["id"] == "release-a"
+
+        current_default[0] = "release-b"
+        queued_request = RunExecutionRequest.model_validate(mock_kicker.queued_calls[0]["start_benchmark_request_json"])
+        async with queued_request.benchmark_service as queued_service:
+            await queued_service.verify_task_ids(["task-release-a"], None, dataset=queued_request.dataset)
+        async with first_run.benchmark_service() as scoring_service:
+            await scoring_service.verify_task_ids(["task-release-a"], None, dataset=first_run.arguments.dataset)
+
+        first_run.status = BenchmarkStatus.STOPPED
+        task = database_session.exec(select(Task).where(Task.benchmark == first_run_id)).one()
+        task.status = TaskStatus.STOPPED
+        database_session.add_all([first_run, task])
+        database_session.commit()
+
+        conflicting_header = client.post(
+            f"/retry-or-resume-benchmark/{first_run_id}",
+            headers=harness_headers,
+            json={"service_headers": {"x-benchmark-dataset-version": "release-b"}},
+        )
+        replacement_url = client.post(
+            f"/retry-or-resume-benchmark/{first_run_id}",
+            headers=harness_headers,
+            json={"benchmark_url": "https://other.example"},
+        )
+
+        assert conflicting_header.status_code == 400
+        assert replacement_url.status_code == 400
+        assert task.status == TaskStatus.STOPPED
+
+        resumed = client.post(f"/retry-or-resume-benchmark/{first_run_id}", headers=harness_headers)
+
+        assert resumed.status_code == 200, resumed.text
+        assert observed_versions == ["release-a"] * 4
+        assert mock_kicker.queued_calls[1]["start_benchmark_request_json"]["resolved_dataset_version"]["id"] == (
+            "release-a"
+        )
+
+        active_release = database_session.get(ExecutorRelease, "test-release")
+        assert active_release is not None
+        active_release.protocol_version = "3"
+        database_session.add(active_release)
+        database_session.commit()
+
+        older_executor = client.post("/start-benchmark", json=request.model_dump(mode="json"))
+
+        assert older_executor.status_code == 503
+        active_release.protocol_version = SUPPORTED_PROTOCOL_VERSION
+        database_session.add(active_release)
+        database_session.commit()
+
+        default_request = request.model_copy(update={"dataset_version": None})
+        second = client.post("/start-benchmark", json=default_request.model_dump(mode="json"))
+
+        assert second.status_code == 200, second.text
+        assert observed_versions[-1] == "release-b"
+        assert second.json()["dataset_version"]["id"] == "release-b"
+
+    @pytest.mark.parametrize("missing_version_endpoint", [False, True])
+    async def test_unversioned_service_starts_with_consistency_warning(
+        self,
+        contract: AgentContractRequest,
+        harness_config: HarnessConfig,
+        monkeypatch: MonkeyPatch,
+        missing_version_endpoint: bool,
+    ) -> None:
+        async def version(_client: BenchmarkServiceClient, dataset: str | None = None) -> SimpleNamespace:
+            assert dataset == "default"
+            if missing_version_endpoint:
+                raise BenchmarkServiceError("Version endpoint is unavailable", status_code=404)
+
+            return SimpleNamespace(dataset_version_selection=False)
+
+        async def verify_task_ids(
+            _client: BenchmarkServiceClient,
+            task_ids: list[str] | None,
+            slice_str: str | None,
+            dataset: str | None = None,
+        ) -> VerifyTaskIdsResponse:
+            assert dataset is None
+            assert slice_str is None
+
+            return VerifyTaskIdsResponse(task_ids=task_ids or ["task-1"])
+
+        monkeypatch.setattr(main_module.config, "DATASET_VERSION_PINNING_ENABLED", True)
+        monkeypatch.setattr(BenchmarkServiceClient, "version", version)
+        monkeypatch.setattr(BenchmarkServiceClient, "verify_task_ids", verify_task_ids)
+        request = StartBenchmarkRequest(contract=contract, benchmark_name="swebench", harness_config=harness_config)
+
+        response = client.post("/start-benchmark", json=request.model_dump(mode="json"))
+
+        assert response.status_code == 200, response.text
+        assert response.json()["dataset_version"] is None
+        assert response.json()["dataset_version_warning"] == "Unversioned — dataset consistency is not guaranteed."
+
+    @pytest.mark.parametrize("missing_version_endpoint", [False, True])
+    async def test_explicit_dataset_version_requires_service_support(
+        self,
+        contract: AgentContractRequest,
+        harness_config: HarnessConfig,
+        database_session: Session,
+        monkeypatch: MonkeyPatch,
+        missing_version_endpoint: bool,
+    ) -> None:
+        async def version(_client: BenchmarkServiceClient, dataset: str | None = None) -> SimpleNamespace:
+            assert dataset == "default"
+            if missing_version_endpoint:
+                raise BenchmarkServiceError("Version endpoint is unavailable", status_code=404)
+
+            return SimpleNamespace(dataset_version_selection=False)
+
+        monkeypatch.setattr(main_module.config, "DATASET_VERSION_PINNING_ENABLED", True)
+        monkeypatch.setattr(BenchmarkServiceClient, "version", version)
+        request = StartBenchmarkRequest(
+            contract=contract,
+            benchmark_name="swebench",
+            harness_config=harness_config,
+            dataset_version="release-a",
+        )
+
+        response = client.post("/start-benchmark", json=request.model_dump(mode="json"))
+
+        assert response.status_code == 400
+        assert database_session.exec(select(Benchmark)).all() == []
+
+    @pytest.mark.parametrize("failure_mode", ["version_error", "wrong_dataset"])
+    async def test_invalid_dataset_resolution_rejects_run_before_creation(
+        self,
+        contract: AgentContractRequest,
+        harness_config: HarnessConfig,
+        database_session: Session,
+        monkeypatch: MonkeyPatch,
+        failure_mode: str,
+    ) -> None:
+        async def version(_client: BenchmarkServiceClient, dataset: str | None = None) -> SimpleNamespace:
+            assert dataset == "default"
+            if failure_mode == "version_error":
+                raise BenchmarkServiceError("Internal service host: benchmark.internal:8080", status_code=500)
+
+            return SimpleNamespace(dataset_version_selection=True)
+
+        async def resolve_dataset(
+            _client: BenchmarkServiceClient, dataset: str, version: str | None = None
+        ) -> SimpleNamespace:
+            assert dataset == "default"
+            assert version == "release-a"
+
+            raise BenchmarkServiceError("The service resolved a different dataset")
+
+        monkeypatch.setattr(main_module.config, "DATASET_VERSION_PINNING_ENABLED", True)
+        monkeypatch.setattr(BenchmarkServiceClient, "version", version)
+        monkeypatch.setattr(BenchmarkServiceClient, "resolve_dataset", resolve_dataset)
+        request = StartBenchmarkRequest(
+            contract=contract,
+            benchmark_name="swebench",
+            harness_config=harness_config,
+            dataset_version="release-a",
+        )
+
+        response = client.post("/start-benchmark", json=request.model_dump(mode="json"))
+
+        assert response.status_code == 502
+        assert response.json()["detail"] == "Failed to select dataset version"
+        assert database_session.exec(select(Benchmark)).all() == []
+
+    @pytest.mark.parametrize("dataset_version", ["", "x" * 1025])
+    async def test_invalid_dataset_version_length_is_rejected(
+        self,
+        contract: AgentContractRequest,
+        harness_config: HarnessConfig,
+        dataset_version: str,
+    ) -> None:
+        request = StartBenchmarkRequest(
+            contract=contract,
+            benchmark_name="swebench",
+            harness_config=harness_config,
+        )
+        payload = request.model_dump(mode="json")
+        payload["dataset_version"] = dataset_version
+
+        response = client.post("/start-benchmark", json=payload)
+
+        assert response.status_code == 422
 
     @pytest.mark.parametrize(
         ("owner_bucket", "expected_log_prefix"),
@@ -1155,10 +1413,11 @@ class TestTrackerAPI:
                 "telemetry_context_json": child_telemetry_context,
             }
         else:
+            expected_request = RunExecutionRequest.model_validate(
+                request.model_copy(update={"properties": benchmark.arguments.properties}).model_dump(mode="python")
+            )
             assert process_payload.arguments == {
-                "start_benchmark_request_json": request.model_copy(
-                    update={"properties": benchmark.arguments.properties}
-                ).model_dump(exclude={"managed_s3_bucket"}),
+                "start_benchmark_request_json": expected_request.model_dump(exclude={"managed_s3_bucket"}),
                 "benchmark_id_str": str(benchmark.id),
                 "verified_task_ids": ["task_0"],
                 "telemetry_context_json": child_telemetry_context,

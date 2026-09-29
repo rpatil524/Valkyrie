@@ -8,6 +8,7 @@ from typing import Annotated, Any, Literal, cast
 from uuid import UUID
 
 from benchmark_service.client import BenchmarkServiceClient
+from benchmark_service.schemas import DatasetVersion
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -94,6 +95,7 @@ class StartBenchmarkRequest(BaseModel):
     slice_str: str | None = None
     lambda_function: str | None = None
     dataset: str | None = None
+    dataset_version: str | None = Field(default=None, min_length=1, max_length=1024)
     harness_config: HarnessConfig | None = None
     custom_benchmark_service: str | None = None
     service_headers: dict[str, str] = Field(default_factory=dict, repr=False)
@@ -125,11 +127,27 @@ class StartBenchmarkRequest(BaseModel):
     def benchmark_service(self) -> BenchmarkServiceClient:
         from tracker.utils import create_benchmark_service_client
 
-        # Prioritize user defined benchmark service over hosted one
         benchmark_service_url = self.custom_benchmark_service or create_benchmark_service_url(self.benchmark_name)
         return create_benchmark_service_client(
             url=benchmark_service_url,
             service_headers=self.service_headers,
+        )
+
+
+class RunExecutionRequest(StartBenchmarkRequest):
+    """Internal request carrying the exact dataset version saved for a run."""
+
+    resolved_dataset_version: DatasetVersion | None = None
+
+    @property
+    def benchmark_service(self) -> BenchmarkServiceClient:
+        from tracker.utils import create_benchmark_service_client
+
+        benchmark_service_url = self.custom_benchmark_service or create_benchmark_service_url(self.benchmark_name)
+        return create_benchmark_service_client(
+            url=benchmark_service_url,
+            service_headers=self.service_headers,
+            dataset_version=self.resolved_dataset_version,
         )
 
 
@@ -171,6 +189,8 @@ class StartBenchmarkResponse(BaseModel):
     concurrency: int
     started_at: datetime
     task_count: int
+    dataset_version: DatasetVersion | None = None
+    dataset_version_warning: str | None = None
     cloudwatch_url: str
     s3_bucket_url: str
     storage_bucket: str | None = None
@@ -280,7 +300,7 @@ class ManagedExecutionContext(BaseModel):
     version: Literal[2, 3]
     benchmark_id: UUID
     verified_task_ids: list[str]
-    start_benchmark_request: StartBenchmarkRequest
+    start_benchmark_request: RunExecutionRequest
 
     @model_validator(mode="after")
     def validate_credential_free_request(self) -> "ManagedExecutionContext":

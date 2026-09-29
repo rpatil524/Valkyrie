@@ -15,6 +15,7 @@ import logfire
 import sentry_sdk
 from benchmark_service.client import BenchmarkServiceError, BenchmarkServiceUnauthenticatedError
 from benchmark_service.schemas import VerifyTaskIdsResponse
+from benchmark_service.schemas import DatasetVersion
 from botocore.config import Config
 from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
@@ -125,7 +126,11 @@ from tracker.executor.dispatch_recovery import AutomaticDispatchRecovery
 from tracker.executor.release_retirement import AutomaticReleaseRetirement
 from tracker.middleware import RequestContextMiddleware
 from tracker.observability import configure_observability
-from tracker.outbound_security import validate_custom_service_destination, validate_service_url_syntax
+from tracker.outbound_security import (
+    validate_custom_service_destination,
+    validate_service_headers,
+    validate_service_url_syntax,
+)
 from tracker.scheduler.store import queue_pool_id, try_task_evaluation_transaction_lock
 from tracker.types import (
     AnalyzeBenchmarkRequest,
@@ -141,6 +146,7 @@ from tracker.types import (
     ManagedStorageStartBenchmarkRequest,
     Order,
     RetrieveResultsResponse,
+    RunExecutionRequest,
     RetryOrResumeBenchmarkResponse,
     S3UploadResultsResponse,
     StartBenchmarkRequest,
@@ -244,7 +250,7 @@ def _executor_telemetry_context() -> ExecutorTelemetryContext:
 
 def _process_benchmark_kwargs(
     benchmark_row: Benchmark,
-    request: StartBenchmarkRequest,
+    request: RunExecutionRequest,
     verified_task_ids: list[str],
 ) -> dict[str, Any]:
     if benchmark_row.aws_managed:
@@ -545,7 +551,7 @@ def _validate_start_release(bind: Engine | Connection) -> None:
 def _commit_start(
     bind: Engine | Connection,
     benchmark_json: str,
-    request: StartBenchmarkRequest,
+    request: RunExecutionRequest,
     dispatch_id: UUID,
     task_ids: list[str],
     queue_pool_id: str | None,
@@ -631,6 +637,16 @@ async def _start_benchmark(
     """
     if request.custom_benchmark_service is not None:
         _authorize_custom_benchmark_destination(request.custom_benchmark_service, run_starter.org)
+    if request.dataset_version is not None and not config.DATASET_VERSION_PINNING_ENABLED:
+        raise HTTPException(status_code=503, detail="Dataset version selection is not enabled")
+    if request.service_auth_header_name is not None and request.service_auth_header_name.lower() == (
+        "x-benchmark-dataset-version"
+    ):
+        raise HTTPException(status_code=400, detail="Use dataset_version to select a dataset version")
+    try:
+        validate_service_headers(request.service_headers)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     bind = session.get_bind()
     session.close()
@@ -802,6 +818,7 @@ async def _start_benchmark(
     logger.info(f"Starting benchmark run - contract: {request.contract.name}, benchmark: {request.benchmark_name}")
 
     benchmark_service = request.benchmark_service
+    execution_request = RunExecutionRequest.model_validate(request.model_dump(mode="python"))
 
     # Validate benchmark service is reachable + tasks resolve BEFORE creating the DB row,
     # so failed auth / unreachable services don't pollute the benchmark list.
@@ -814,9 +831,43 @@ async def _start_benchmark(
                 detail=f"Benchmark service '{request.benchmark_name}' is not reachable",
             ) from exc
 
+        if config.DATASET_VERSION_PINNING_ENABLED:
+            selected_dataset = request.dataset or "default"
+            try:
+                try:
+                    version_metadata = await benchmark_service.version(dataset=selected_dataset)
+                except BenchmarkServiceError as exc:
+                    if exc.status_code not in {404, 405, 501}:
+                        raise
+                    if request.dataset_version is not None:
+                        raise HTTPException(
+                            status_code=400, detail="This benchmark service cannot select a dataset version"
+                        ) from exc
+                    logger.info(
+                        "Benchmark service does not expose version metadata; starting run without a pinned version"
+                    )
+                    version_metadata = None
+
+                if version_metadata is not None and version_metadata.dataset_version_selection:
+                    resolved = await benchmark_service.resolve_dataset(
+                        selected_dataset,
+                        version=request.dataset_version,
+                    )
+                    execution_request.dataset = resolved.dataset
+                    execution_request.resolved_dataset_version = resolved.version
+                    await benchmark_service.close()
+                    benchmark_service = execution_request.benchmark_service
+                elif version_metadata is not None and request.dataset_version is not None:
+                    raise HTTPException(
+                        status_code=400, detail="This benchmark service cannot select a dataset version"
+                    )
+            except (BenchmarkServiceError, httpx.HTTPError, ValueError) as exc:
+                logger.exception("Failed to select dataset version for %s", request.benchmark_name)
+                raise HTTPException(status_code=502, detail="Failed to select dataset version") from exc
+
         try:
             verify_response = await benchmark_service.verify_task_ids(
-                task_ids=request.task_ids, slice_str=request.slice_str, dataset=request.dataset
+                task_ids=request.task_ids, slice_str=request.slice_str, dataset=execution_request.dataset
             )
         except BenchmarkServiceUnauthenticatedError as exc:
             logger.warning("Benchmark service authentication failed for %s: %s", request.benchmark_name, exc)
@@ -831,7 +882,7 @@ async def _start_benchmark(
             logger.exception("Failed to close benchmark service client for %s", request.benchmark_name)
 
     benchmark_row = start_benchmark_request_to_benchmark(
-        request,
+        execution_request,
         run_starter,
         aws_managed=aws_managed,
         queue_pool_id=resolved_queue_pool_id,
@@ -850,7 +901,7 @@ async def _start_benchmark(
                 _commit_start,
                 bind,
                 benchmark_row.model_dump_json(),
-                request,
+                execution_request,
                 dispatch_id,
                 verify_response.task_ids,
                 resolved_queue_pool_id,
@@ -925,6 +976,12 @@ async def _start_benchmark(
         concurrency=request.concurrency,
         started_at=benchmark_row.started_at,
         task_count=len(verify_response.task_ids),
+        dataset_version=benchmark_row.arguments.dataset_version,
+        dataset_version_warning=(
+            "Unversioned — dataset consistency is not guaranteed."
+            if benchmark_row.arguments.dataset_version is None
+            else None
+        ),
         cloudwatch_url=CloudWatchBenchmarkLogLocations(aws_runtime.resources).benchmark_location(str(benchmark_row.id)),
         s3_bucket_url=create_benchmark_url(str(benchmark_row.id), aws_runtime.resources),
         storage_bucket=aws_runtime.resources.s3_bucket,
@@ -1480,6 +1537,7 @@ class RecoveryPreparation:
     benchmark_name: str
     benchmark_url: str
     dataset: str | None
+    dataset_version: DatasetVersion | None
     queued_recovery: bool
     properties: AWSResources | None = None
     resolved_properties: AWSResources | None = None
@@ -1499,6 +1557,8 @@ def _prepare_recovery(
         org = session.get(Org, org_id)
         assert org is not None
         benchmark = get_scoped(Benchmark, benchmark_id, session, org)
+        if benchmark.arguments.dataset_version is not None and benchmark_url is not None:
+            raise HTTPException(status_code=400, detail="A pinned run cannot change its benchmark service URL")
         if benchmark.status == BenchmarkStatus.STOPPING:
             raise HTTPException(
                 status_code=400,
@@ -1526,6 +1586,7 @@ def _prepare_recovery(
             benchmark.name,
             effective_url or create_benchmark_service_url(benchmark.name),
             benchmark.arguments.dataset,
+            benchmark.arguments.dataset_version,
             queued,
             benchmark.arguments.properties,
         )
@@ -1605,6 +1666,10 @@ async def retry_or_resume_benchmark(
         RetryOrResumeBenchmarkResponse
     """
     org_id, bind = org.id, session.get_bind()
+    try:
+        validate_service_headers(service_headers)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     # Authentication shares this dependency Session; end its read transaction too.
     session.close()
     if benchmark_url is not None:
@@ -1643,7 +1708,9 @@ async def retry_or_resume_benchmark(
     )
     verified_task_ids = list(preparation.state.task_ids) if preparation.state is not None else []
     if verified_task_ids and not preparation.queued_recovery:
-        service = create_benchmark_service_client(preparation.benchmark_url, effective_headers)
+        service = create_benchmark_service_client(
+            preparation.benchmark_url, effective_headers, preparation.dataset_version
+        )
         try:
             verified = await service.verify_task_ids(
                 task_ids=verified_task_ids, slice_str=None, dataset=preparation.dataset

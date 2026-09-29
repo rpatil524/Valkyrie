@@ -25,7 +25,7 @@ from tracker.aws.services import CloudRuntimeFactory
 from tracker.runtime.services import RuntimeServices
 from tracker.database.models import AgentContractRequest, Benchmark, BenchmarkStatus, Org
 from tracker.exceptions import TrackerServiceError
-from tracker.types import HarnessConfig, ManagedExecutionContext, StartBenchmarkRequest
+from tracker.types import HarnessConfig, ManagedExecutionContext, RunExecutionRequest, StartBenchmarkRequest
 from tracker.utils import process_benchmark, start_benchmark_request_to_benchmark
 from tracker.utils.run_orchestration import (
     _parse_queued_execution,  # pyright: ignore[reportPrivateUsage]
@@ -55,8 +55,8 @@ def _access_key_request(contract: AgentContractRequest, harness_config: HarnessC
     )
 
 
-def _managed_request(contract: AgentContractRequest) -> StartBenchmarkRequest:
-    return StartBenchmarkRequest(
+def _managed_request(contract: AgentContractRequest) -> RunExecutionRequest:
+    return RunExecutionRequest(
         contract=contract,
         benchmark_name="test-benchmark",
         task_ids=_TASK_IDS,
@@ -66,7 +66,7 @@ def _managed_request(contract: AgentContractRequest) -> StartBenchmarkRequest:
 
 
 def _execution_context(
-    request: StartBenchmarkRequest,
+    request: RunExecutionRequest,
     benchmark_id: UUID,
 ) -> dict[str, Any]:
     return ManagedExecutionContext(
@@ -164,7 +164,7 @@ def test_taskiq_adapter_accepts_exact_access_key_shape(
         None,
     )
 
-    assert execution.request == request
+    assert execution.request == RunExecutionRequest.model_validate(request.model_dump(mode="python"))
     assert execution.benchmark_id == benchmark_id
     assert execution.verified_task_ids == _TASK_IDS
     assert execution.aws_managed is False
@@ -181,7 +181,7 @@ def test_taskiq_adapter_accepts_v2_envelope_only(contract: AgentContractRequest)
         _execution_context(request, benchmark_id),
     )
 
-    assert execution.request == request
+    assert execution.request == RunExecutionRequest.model_validate(request.model_dump(mode="python"))
     assert execution.benchmark_id == benchmark_id
     assert execution.verified_task_ids == _TASK_IDS
     assert execution.aws_managed is True

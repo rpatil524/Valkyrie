@@ -45,7 +45,7 @@ from tracker.scheduler.admission import SandboxQueueContext, create_queue_contex
 from tracker.types import (
     FinalViewResponse,
     ManagedExecutionContext,
-    StartBenchmarkRequest,
+    RunExecutionRequest,
 )
 
 from tracker.utils.resources import (
@@ -67,7 +67,7 @@ async def _run_queued_tasks(
     *,
     benchmark_id: UUID,
     task_rows: Sequence[tuple[str, Task]],
-    start_benchmark_request: StartBenchmarkRequest,
+    start_benchmark_request: RunExecutionRequest,
     benchmark_service: BenchmarkServiceClient,
     runtime: RuntimeServices,
     org: Org,
@@ -538,11 +538,11 @@ async def finalize_all_error_run(
         return False
 
 
-def _parse_start_benchmark_request(payload: dict[str, Any]) -> StartBenchmarkRequest:
+def _parse_start_benchmark_request(payload: dict[str, Any]) -> RunExecutionRequest:
     """Validate a queued request without serializing credential-bearing input in errors."""
-    request: StartBenchmarkRequest | None
+    request: RunExecutionRequest | None
     try:
-        request = StartBenchmarkRequest.model_validate(payload)
+        request = RunExecutionRequest.model_validate(payload)
     except ValidationError as exc:
         # Log field locations only; rendering the full error would expose input
         # values, which include AWS credentials on this payload.
@@ -558,7 +558,7 @@ def _parse_start_benchmark_request(payload: dict[str, Any]) -> StartBenchmarkReq
 
 @dataclass(frozen=True)
 class _QueuedExecution:
-    request: StartBenchmarkRequest
+    request: RunExecutionRequest
     benchmark_id: UUID
     verified_task_ids: list[str]
     aws_managed: bool
@@ -727,6 +727,16 @@ async def _process_benchmark(
             raise TrackerServiceError(
                 f"Queued {queued_mode} execution does not match the stored {stored_mode} run mode"
             )
+
+        if start_benchmark_request.resolved_dataset_version != benchmark_row.arguments.dataset_version or (
+            benchmark_row.arguments.dataset_version is not None
+            and start_benchmark_request.dataset != benchmark_row.arguments.dataset
+        ):
+            raise TrackerServiceError("Queued dataset selection does not match the saved run")
+        if benchmark_row.arguments.dataset_version is not None and (
+            start_benchmark_request.custom_benchmark_service != benchmark_row.custom_benchmark_service
+        ):
+            raise TrackerServiceError("Queued benchmark service does not match the pinned run")
 
         if start_benchmark_request.custom_benchmark_service is not None:
             validate_custom_service_destination(
